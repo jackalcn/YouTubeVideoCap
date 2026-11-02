@@ -24,6 +24,8 @@ YouTube 常改版。如果開始下載失敗，先更新 yt-dlp：
 
 ## 部署
 
+線上版本：https://youtube-videocap.streamlit.app/
+
 推送到 `main` 分支後，Streamlit Community Cloud 會自動部署；系統套件列在 `packages.txt`。
 
 YouTube 常限制雲端主機的 IP。實測在 Streamlit Community Cloud 上，解析連結正常，但多數影片下載會被回 HTTP 403，所以要穩定下載請在本機執行。
