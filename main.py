@@ -29,11 +29,11 @@ from yt_dlp.utils import MaxDownloadsReached
 from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 
-APP_VERSION = "v2026.11.03.2"
+APP_VERSION = "v2026.11.03.3"
 APP_UPDATED_AT = "2026-11-03"
 DEPLOY_VERIFY_MIN_COMMIT = "7f71b98"
-DEPLOY_MARKER = "build-2026-11-03-02-youtube"
-LOCAL_RUN_GUIDE_URL = "https://github.com/jackalcn/TronClassVideoCap#在本機執行"
+DEPLOY_MARKER = "build-2026-11-03-03-youtube"
+LOCAL_RUN_GUIDE_URL = "https://github.com/jackalcn/YouTubeVideoCap#在本機執行"
 
 YOUTUBE_HOSTS = frozenset(
     {

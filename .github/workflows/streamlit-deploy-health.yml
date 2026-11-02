@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      APP_URL: https://tronclass-videocap.streamlit.app/
-      APP_HEALTH_URL: https://tronclass-videocap.streamlit.app/_stcore/health
-      LEGACY_SHARE_URL: https://share.streamlit.io/jackalcn/TronClassVideoCap/main/main.py
+      APP_URL: https://youtube-videocap.streamlit.app/
+      APP_HEALTH_URL: https://youtube-videocap.streamlit.app/_stcore/health
+      LEGACY_SHARE_URL: https://share.streamlit.io/jackalcn/YouTubeVideoCap/main/main.py
 
     steps:
       - name: Check deployed Streamlit endpoints
@@ -53,6 +53,16 @@ jobs:
               if "share.streamlit.io/-/auth/app" not in location:
                   raise SystemExit(f"Unexpected redirect target for {url}: {location}")
 
+          def assert_app_exists() -> None:
+              # A missing app answers the first request just like a real one, so follow the login redirect with cookies.
+              opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+              req = urllib.request.Request(app_url, headers={"User-Agent": "GitHubActions/StreamlitHealth"})
+              try:
+                  with opener.open(req, timeout=30) as resp:
+                      print(f"app probe status={resp.status} url={resp.geturl()}")
+              except urllib.error.URLError as exc:
+                  raise SystemExit(f"App not reachable at {app_url}: {exc}")
+
           def assert_share_entrypoint() -> None:
               status, headers, body = request(legacy_share_url)
               location = headers.get("Location", "")
@@ -72,6 +82,7 @@ jobs:
           last_error = None
           while time.time() < deadline:
               try:
+                  assert_app_exists()
                   assert_share_entrypoint()
                   assert_redirect(app_url)
                   assert_redirect(app_health_url)
