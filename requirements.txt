@@ -1,4 +1,4 @@
-streamlit
-playwright
-yt-dlp
-beautifulsoup4
+streamlit>=1.57
+# curl-cffi is left out on purpose: on Windows it made subtitle downloads fail (curl errors 7 and 77),
+# and it did not avoid YouTube's HTTP 429 on machine-translated tracks.
+yt-dlp[default,deno]

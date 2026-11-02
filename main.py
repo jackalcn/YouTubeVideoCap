@@ -1,76 +1,157 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping
+import html
+import mimetypes
 import os
 import re
 import shutil
-import sys
-import time
 import subprocess
+import sys
+import sysconfig
+import tempfile
+import time
+import uuid
 import zipfile
-from io import BytesIO
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
-from typing import Any, Iterable, Optional, Protocol, TypedDict, cast
-from urllib.parse import urljoin
+from typing import Any, Optional, Protocol, TypedDict, cast
+from urllib.parse import urlparse
 
 import streamlit as st
-import streamlit.components.v1 as components
 import yt_dlp
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import Browser, Page, Playwright, sync_playwright
+from yt_dlp.postprocessor import FFmpegEmbedSubtitlePP, PostProcessor
+from yt_dlp.utils import MaxDownloadsReached
+from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 
-USERNAME_SELECTORS = (
-    'input[name="username"]',
-    'input[name="account"]',
-    'input[name="email"]',
-    'input[type="email"]',
-    'input[autocomplete="username"]',
-    'input[id*="user" i]',
-)
-
-PASSWORD_SELECTORS = (
-    'input[name="password"]',
-    'input[type="password"]',
-    'input[autocomplete="current-password"]',
-    'input[id*="pass" i]',
-)
-
-SUBMIT_SELECTORS = (
-    'button[type="submit"]',
-    'input[type="submit"]',
-    'button:has-text("登入")',
-    'button:has-text("Log in")',
-    'button:has-text("Sign in")',
-)
-
-APP_VERSION = "v2026.06.01.1"
-APP_UPDATED_AT = "2026-06-01"
+APP_VERSION = "v2026.11.03.1"
+APP_UPDATED_AT = "2026-11-03"
 DEPLOY_VERIFY_MIN_COMMIT = "7f71b98"
-DEPLOY_MARKER = "build-2026-06-01-01-mac-fallback"
+DEPLOY_MARKER = "build-2026-11-03-01-youtube"
 
-SUBTITLE_EXTENSIONS = {
-    ".srt",
-    ".vtt",
-    ".ass",
-    ".ssa",
-    ".lrc",
-    ".ttml",
-    ".sbv",
-    ".dfxp",
-    ".xml",
+YOUTUBE_HOSTS = frozenset(
+    {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "www.youtube-nocookie.com",
+    }
+)
+YOUTUBE_EXTRACTORS = ["youtube", "youtube:.*"]
+
+VIDEO_QUALITY_OPTIONS: dict[str, Optional[int]] = {
+    "最佳畫質": None,
+    "2160p (4K)": 2160,
+    "1440p (2K)": 1440,
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+    "360p": 360,
 }
+DEFAULT_VIDEO_QUALITY = "1080p"
+AUDIO_FORMAT_OPTIONS = ["m4a", "mp3"]
+# Explicit codes, because with auto captions "zh.*" also matches tracks like zh-Hans-en, adding requests YouTube rejects.
+DEFAULT_SUBTITLE_LANGUAGES = "zh-TW,zh-Hant,zh-HK,zh-CN,zh-Hans,zh,en,en-US,en-GB"
+LIVE_CHAT_TRACK = "live_chat"
+DEFAULT_CUSTOM_NAME = "youtube_video"
+
+# Titles can reach 300 UTF-8 bytes, past the 255-byte filename limit of most filesystems.
+TITLE_TEMPLATE = "%(title).150B"
+PLAYLIST_INDEX_TEMPLATE = "%(playlist_index&{:02d} - |)s"
+
+PLAYLIST_PREVIEW_ITEMS = 10
+DEFAULT_PLAYLIST_LIMIT = 20
+LOCAL_MAX_PLAYLIST_LIMIT = 200
+
+# Streamlit serves downloads from memory, and a cloud host is shared by every visitor.
+CLOUD_MAX_PLAYLIST_LIMIT = 20
+CLOUD_MAX_BYTES = 1024**3
+CLOUD_RETENTION_SECONDS = 2 * 60 * 60
+CLOUD_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "youtube-downloader-files"
+
+POSTPROCESSOR_LABELS = {
+    "Merger": "正在合併影像與音訊...",
+    "ExtractAudio": "正在轉換音訊...",
+    "EmbedSubtitle": "正在嵌入字幕...",
+}
+
+YTDLP_ERROR_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("not a bot",),
+        "YouTube 要求驗證身分（判定為自動化流量）。雲端主機的 IP 常被封鎖，請改在本機執行，或在「進階」上傳 cookies.txt。",
+    ),
+    (("confirm your age", "inappropriate for some users"), "這是年齡限制影片，請在「進階」上傳已登入帳號的 cookies.txt。"),
+    (("private video",), "這是私人影片，需要有觀看權限帳號的 cookies.txt。"),
+    (("members-only", "join this channel"), "這是頻道會員專屬影片，需要會員帳號的 cookies.txt。"),
+    (("available in your country",), "此影片在目前所在地區無法觀看。"),
+    (("drm protected",), "此影片受 DRM 保護，無法下載。"),
+    (("rate-limited", "http error 429", "too many requests", "try again later"), "YouTube 暫時限制了請求頻率，請稍後再試（可能長達一小時）。"),
+    (("video unavailable", "video is unavailable"), "影片無法使用，可能已被移除或設為不公開。"),
+    (("will begin in", "premieres in"), "直播或首播尚未開始，開始後才能下載。"),
+    (("requested format is not available", "no video formats found"), "找不到符合條件的影片格式，請改選其他畫質。"),
+    (("netscape format", "failed to load cookies"), "cookies.txt 無法讀取，請確認是 Netscape 格式。"),
+    (("does not have a",), "此頻道沒有這個分頁，請改貼其他分頁的網址。"),
+    (("looks truncated",), "網址不完整，請重新複製完整網址。"),
+    (("wrong regex for subtitlelangs",), "字幕語言代碼不是有效的正規表示式，請修改後再試。"),
+    (("conversion failed", "postprocessing:"), "ffmpeg 後處理失敗（合併影音或嵌入字幕）。"),
+)
 
 SubtitleRow = dict[str, str]
 
 
-class SubtitleDebugReport(TypedDict):
+class DownloadedItem(TypedDict):
     title: str
-    extractor: str
+    path: str
+    subtitle_paths: list[str]
+
+
+class DownloadOutcome(TypedDict):
+    items: list[DownloadedItem]
+    errors: list[str]
+    skipped: list[str]
+    warnings: list[str]
+    subtitle_note: str
+
+
+class LinkReport(TypedDict, total=False):
+    url: str
+    error: str
+    title: str
+    channel: str
+    thumbnail: str
+    details: list[str]
+    is_live: bool
+    is_playlist: bool
+    resolutions: list[int]
     manual_rows: list[SubtitleRow]
     auto_rows: list[SubtitleRow]
-    inspection_error: str
+    entry_count: Optional[int]
+    entry_titles: list[str]
+
+
+@dataclass(frozen=True)
+class DownloadOptions:
+    output_dir: Path
+    output_template: str
+    audio_only: bool = False
+    max_height: Optional[int] = None
+    audio_format: str = AUDIO_FORMAT_OPTIONS[0]
+    download_subtitles: bool = False
+    subtitle_languages: tuple[str, ...] = ()
+    subtitle_format: str = "srt"
+    include_auto_subtitles: bool = False
+    embed_subtitles: bool = False
+    playlist_limit: int = DEFAULT_PLAYLIST_LIMIT
+    retry_count: int = 3
+    cookie_file: Optional[Path] = None
+    max_bytes: Optional[int] = None
 
 
 class StatusUI(Protocol):
@@ -81,422 +162,228 @@ class ProgressUI(Protocol):
     def progress(self, value: float, text: str = "") -> None: ...
 
 
-playwright_chromium_ready = False
-ffmpeg_status_cache: Optional[tuple[bool, str]] = None
+class YtDlpLogCollector:
+    """Keeps yt-dlp's messages for the UI instead of the server console."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    def debug(self, message: str) -> None:
+        pass
+
+    def info(self, message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        self.warnings.append(message)
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
 
 
-def get_ffmpeg_status() -> tuple[bool, str]:
-    global ffmpeg_status_cache
-    if ffmpeg_status_cache is not None:
-        return ffmpeg_status_cache
+class CollectDownloadedItemsPP(PostProcessor):
+    """Records each finished file. Runs before subtitle embedding, so a failed embed cannot lose the video."""
 
-    executable = shutil.which("ffmpeg")
+    def __init__(self, items: list[DownloadedItem]) -> None:
+        super().__init__()
+        self.items = items
+
+    def run(self, information: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+        requested_subtitles = information.get("requested_subtitles") or {}
+        # With ignoreerrors, yt-dlp sets a subtitle's filepath even when its download failed.
+        subtitle_paths = [str(track.get("filepath") or "") for track in requested_subtitles.values()]
+        self.items.append(
+            {
+                "title": str(information.get("title") or information.get("id") or ""),
+                "path": str(information["filepath"]),
+                "subtitle_paths": [path for path in subtitle_paths if path and Path(path).exists()],
+            }
+        )
+        return [], information
+
+
+def probe_executable(name: str, version_flag: str, search_path: Optional[str] = None) -> tuple[bool, str]:
+    executable = shutil.which(name, path=search_path)
     if not executable:
-        ffmpeg_status_cache = (False, "PATH 中找不到 ffmpeg")
-        return ffmpeg_status_cache
+        return False, f"PATH 中找不到 {name}"
 
     try:
         result = subprocess.run(
-            [executable, "-version"],
+            [executable, version_flag],
             capture_output=True,
             text=True,
             check=False,
-            timeout=3,
+            timeout=5,
         )
     except Exception as exc:
-        ffmpeg_status_cache = (False, f"ffmpeg 無法執行：{exc}")
-        return ffmpeg_status_cache
+        return False, f"{name} 無法執行：{exc}"
 
     if result.returncode != 0:
         stderr_text = (result.stderr or "").strip()
         stdout_text = (result.stdout or "").strip()
         details = stderr_text or stdout_text or "unknown error"
-        ffmpeg_status_cache = (False, f"ffmpeg 無法使用：{details}")
-        return ffmpeg_status_cache
+        return False, f"{name} 無法使用：{details}"
 
-    ffmpeg_status_cache = (True, executable)
-    return ffmpeg_status_cache
+    return True, executable
 
 
-def fill_first(page: Page, selectors: Iterable[str], value: str) -> Optional[str]:
-    for selector in selectors:
+@st.cache_resource(show_spinner=False)
+def get_ffmpeg_status() -> tuple[bool, str]:
+    return probe_executable("ffmpeg", "-version")
+
+
+@st.cache_resource(show_spinner=False)
+def get_js_runtime_status() -> tuple[bool, str]:
+    # yt-dlp checks Python's scripts directory before PATH, so a pip-installed Deno works without an activated venv.
+    search_path = os.pathsep.join([sysconfig.get_path("scripts"), os.environ.get("PATH", "")])
+    return probe_executable("deno", "--version", search_path)
+
+
+def parse_youtube_urls(raw: str) -> tuple[list[str], list[str]]:
+    """Splits pasted text into YouTube URLs and rejected entries, dropping duplicates."""
+    urls: list[str] = []
+    rejected: list[str] = []
+
+    for token in raw.split():
+        candidate = token if "://" in token else f"https://{token}"
         try:
-            page.locator(selector).first.fill(value, timeout=1200)
-            return selector
-        except Exception:
-            continue
-    return None
-
-
-def click_first(page: Page, selectors: Iterable[str]) -> Optional[str]:
-    for selector in selectors:
-        try:
-            page.locator(selector).first.click(timeout=1200)
-            return selector
-        except Exception:
-            continue
-    return None
-
-
-def normalize_url(src: str, base_url: str) -> str:
-    if src.startswith("//"):
-        return f"https:{src}"
-    if src.startswith("http://") or src.startswith("https://"):
-        return src
-    return urljoin(base_url, src)
-
-
-def find_vimeo_player_url(page: Page, timeout_ms: int = 25000) -> Optional[str]:
-    patterns = (
-        r"https?://player\\.vimeo\\.com/video/\\d+[^\"'\\s<]*",
-        r"//player\\.vimeo\\.com/video/\\d+[^\"'\\s<]*",
-        r"https?://vimeo\\.com/\\d+",
-    )
-
-    deadline = time.time() + max(timeout_ms, 1000) / 1000.0
-    while time.time() < deadline:
-        for attr in ("src", "data-src"):
-            locator = page.locator(f'iframe[{attr}*="player.vimeo.com/video/"]')
-            if locator.count() > 0:
-                raw = locator.first.get_attribute(attr)
-                if raw:
-                    return normalize_url(raw, page.url)
-
-        for frame in page.frames:
-            frame_url = (frame.url or "").strip()
-            if "player.vimeo.com/video/" in frame_url or re.search(r"https?://vimeo\\.com/\\d+", frame_url):
-                return normalize_url(frame_url, page.url)
-
-        html_sources: list[str] = []
-        try:
-            html_sources.append(page.content())
-        except Exception:
-            pass
-
-        for frame in page.frames:
-            try:
-                html_sources.append(frame.content())
-            except Exception:
-                continue
-
-        for html in html_sources:
-            for pattern in patterns:
-                match = re.search(pattern, html)
-                if match:
-                    return normalize_url(match.group(0), page.url)
-
-        page.wait_for_timeout(1000)
-
-    return None
-
-
-def write_netscape_cookie_file(cookies: Sequence[Mapping[str, object]], target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = [
-        "# Netscape HTTP Cookie File",
-        "# Generated by TronClass Vimeo Downloader",
-    ]
-
-    for cookie in cookies:
-        domain_value = cookie.get("domain", "")
-        if not isinstance(domain_value, str) or not domain_value:
+            parsed = urlparse(candidate)
+        except ValueError:
+            rejected.append(token)
             continue
 
-        include_subdomains = "TRUE" if domain_value.startswith(".") else "FALSE"
-        path_value = cookie.get("path", "/")
-        path = path_value if isinstance(path_value, str) and path_value else "/"
-        secure = "TRUE" if cookie.get("secure") else "FALSE"
-
-        expires_value = cookie.get("expires", 0)
-        if isinstance(expires_value, (int, float)):
-            expires = int(expires_value)
+        host = (parsed.hostname or "").lower()
+        has_tricky_authority = "@" in parsed.netloc or "\\" in candidate
+        if parsed.scheme in {"http", "https"} and host in YOUTUBE_HOSTS and not has_tricky_authority:
+            urls.append(candidate)
         else:
-            expires = 0
-        if expires < 0:
-            expires = 0
+            rejected.append(token)
 
-        name_value = cookie.get("name", "")
-        name = name_value if isinstance(name_value, str) else ""
-        stored_value = cookie.get("value", "")
-        value = stored_value if isinstance(stored_value, str) else ""
-
-        line = f"{domain_value}\t{include_subdomains}\t{path}\t{secure}\t{expires}\t{name}\t{value}"
-        lines.append(line)
-
-    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return list(dict.fromkeys(urls)), rejected
 
 
-def flatten_subtitle_tracks(track_map: Mapping[str, object] | None, source: str) -> list[SubtitleRow]:
-    rows: list[SubtitleRow] = []
-    if not isinstance(track_map, dict):
-        return rows
-
-    for lang in sorted(track_map.keys()):
-        tracks = track_map.get(lang)
-        if not isinstance(tracks, list):
-            continue
-        track_items = cast(list[object], tracks)
-        for raw_track in track_items:
-            if not isinstance(raw_track, Mapping):
-                continue
-            track_data = cast(Mapping[str, object], raw_track)
-            rows.append(
-                {
-                    "來源": source,
-                    "語言": str(lang),
-                    "格式": str(track_data.get("ext") or ""),
-                    "名稱": str(track_data.get("name") or ""),
-                    "協定": str(track_data.get("protocol") or ""),
-                    "有 URL": "yes" if track_data.get("url") else "no",
-                }
-            )
-
-    return rows
-
-
-def collect_subtitle_languages(manual_rows: list[SubtitleRow], auto_rows: list[SubtitleRow]) -> list[str]:
-    languages = {
-        row.get("語言", "").strip()
-        for row in [*manual_rows, *auto_rows]
-        if row.get("語言", "").strip()
-    }
-    return sorted(languages)
-
-
-def render_copy_languages_widget(languages: list[str]) -> None:
+def parse_subtitle_languages(raw: str) -> tuple[str, ...]:
+    languages = [part.strip() for part in raw.split(",") if part.strip()]
     if not languages:
-        return
-
-    joined_codes = ",".join(languages)
-    st.text_input("可用字幕語言代碼", value=joined_codes, key="subtitle_language_codes", disabled=True)
-
-    escaped_codes = joined_codes.replace("\\", "\\\\").replace("'", "\\'")
-    components.html(
-        f"""
-        <button id=\"copy-lang-btn\" style=\"padding:8px 12px;border:1px solid #bbb;border-radius:8px;background:#fff;cursor:pointer;\">一鍵複製語言代碼</button>
-        <span id=\"copy-lang-status\" style=\"margin-left:8px;color:#2c7a2c;\"></span>
-        <script>
-            const btn = document.getElementById('copy-lang-btn');
-            const status = document.getElementById('copy-lang-status');
-            btn.addEventListener('click', async () => {{
-                try {{
-                    await navigator.clipboard.writeText('{escaped_codes}');
-                    status.textContent = '已複製';
-                }} catch (err) {{
-                    status.textContent = '複製失敗，請手動複製';
-                }}
-            }});
-        </script>
-        """,
-        height=48,
-    )
+        languages = DEFAULT_SUBTITLE_LANGUAGES.split(",")
+    return tuple(languages)
 
 
-def inspect_subtitle_tracks(vimeo_url: str, cookie_file: Path, referer_url: str, retry_count: int) -> SubtitleDebugReport:
-    opts: dict[str, Any] = {
-        "cookiefile": str(cookie_file),
-        "skip_download": True,
+def build_output_template(naming_rule: str, custom_name: str, multiple_links: bool) -> str:
+    if naming_rule == "自訂名稱":
+        safe_name = re.sub(r"[^\w\-.]+", "_", custom_name.strip()).strip("._") or DEFAULT_CUSTOM_NAME
+        return f"{safe_name}_%(id)s.%(ext)s"
+
+    # Same-titled videos from different links would overwrite each other, so batch names keep the video ID.
+    id_suffix = " [%(id)s]" if multiple_links else ""
+    date_suffix = "_%(upload_date)s" if naming_rule == "原始檔名加日期" else ""
+    return f"{PLAYLIST_INDEX_TEMPLATE}{TITLE_TEMPLATE}{date_suffix}{id_suffix}.%(ext)s"
+
+
+def humanize_ytdlp_error(message: str) -> str:
+    cleaned = message.removeprefix("ERROR: ").strip()
+    lowered = cleaned.lower()
+    for markers, hint in YTDLP_ERROR_HINTS:
+        if any(marker in lowered for marker in markers):
+            return f"{hint}（原始訊息：{cleaned[:200]}）"
+    return cleaned
+
+
+def build_base_options(logger: YtDlpLogCollector, retry_count: int, cookie_file: Optional[Path]) -> dict[str, Any]:
+    base_opts: dict[str, Any] = {
+        "logger": logger,
         "quiet": True,
-        "no_warnings": True,
+        "color": "no_color",
+        # Without this, yt-dlp's generic extractor would fetch any URL the server can reach.
+        "allowed_extractors": YOUTUBE_EXTRACTORS,
+        "noplaylist": True,
         "retries": retry_count,
-        "http_headers": {
-            "Referer": referer_url,
-        },
     }
-
-    with yt_dlp.YoutubeDL(cast(Any, opts)) as ydl:
-        info = cast(dict[str, Any], ydl.extract_info(vimeo_url, download=False))
-
-    manual_rows = flatten_subtitle_tracks(info.get("subtitles"), source="manual")
-    auto_rows = flatten_subtitle_tracks(info.get("automatic_captions"), source="auto")
-
-    return {
-        "title": str(info.get("title") or ""),
-        "extractor": str(info.get("extractor_key") or ""),
-        "manual_rows": manual_rows,
-        "auto_rows": auto_rows,
-        "inspection_error": "",
-    }
+    if cookie_file:
+        base_opts["cookiefile"] = str(cookie_file)
+    return base_opts
 
 
-def render_subtitle_debug_report(debug_report: SubtitleDebugReport) -> None:
-    st.markdown("### 字幕除錯資訊")
-
-    inspection_error = debug_report["inspection_error"]
-    if inspection_error:
-        st.error(f"無法取得字幕軌清單：{inspection_error}")
-        st.warning("這通常代表權限不足、cookie 失效，或影片提供方封鎖了字幕清單。")
-        return
-
-    title = debug_report["title"]
-    extractor = debug_report["extractor"]
-    if title or extractor:
-        st.caption(f"yt-dlp 解析來源: {extractor} | 標題: {title}")
-
-    manual_rows = debug_report["manual_rows"]
-    auto_rows = debug_report["auto_rows"]
-
-    if manual_rows:
-        st.write("手動字幕軌")
-        st.dataframe(manual_rows, use_container_width=True)
-    else:
-        st.write("手動字幕軌：無")
-
-    if auto_rows:
-        st.write("自動字幕軌")
-        st.dataframe(auto_rows, use_container_width=True)
-    else:
-        st.write("自動字幕軌：無")
-
-    languages = collect_subtitle_languages(manual_rows, auto_rows)
-    if languages:
-        render_copy_languages_widget(languages)
-
-    if not manual_rows and not auto_rows:
-        st.warning("yt-dlp 未回報任何字幕軌。可能是影片本身無字幕，或當前帳號沒有字幕存取權。")
-
-
-def resolve_vimeo_and_cookies(
-    login_url: str,
-    username: str,
-    password: str,
-    video_page_url: str,
-    output_dir: Path,
-    headless: bool,
-    status_ui: StatusUI,
-) -> tuple[str, Path]:
-    cookies_file = output_dir / "tronclass_cookies.txt"
-
-    with sync_playwright() as playwright:
-        browser = launch_chromium_with_bootstrap(playwright, headless=headless, status_ui=status_ui)
-        context = browser.new_context()
-        page = context.new_page()
-
-        status_ui.info("1/4 開啟 TronClass 登入頁")
-        page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-
-        selected_user = fill_first(page, USERNAME_SELECTORS, username)
-        selected_pass = fill_first(page, PASSWORD_SELECTORS, password)
-
-        if not selected_user or not selected_pass:
-            raise RuntimeError("找不到登入欄位，請改用更精準的登入網址，或關閉無頭模式觀察實際欄位。")
-
-        if not click_first(page, SUBMIT_SELECTORS):
-            page.keyboard.press("Enter")
-
-        page.wait_for_load_state("networkidle", timeout=30000)
-
-        status_ui.info("2/4 前往含影片的課程頁面")
-        page.goto(video_page_url, wait_until="domcontentloaded", timeout=30000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            # Some SPA pages keep long-lived requests; continue with URL probing.
-            pass
-
-        vimeo_url = find_vimeo_player_url(page)
-        if not vimeo_url:
-            raise RuntimeError("找不到 Vimeo 播放器連結。請確認頁面可播放，且影片不是 DRM 保護內容。")
-
-        status_ui.info("3/4 匯出登入 cookies")
-        write_netscape_cookie_file(context.cookies(), cookies_file)
-
-        browser.close()
-
-    return vimeo_url, cookies_file
-
-
-def is_missing_playwright_executable_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    markers = [
-        "executable doesn't exist",
-        "please run the following command to download new browsers",
-        "playwright install",
-    ]
-    return any(marker in message for marker in markers)
-
-
-def get_missing_playwright_linux_shared_library(exc: Exception) -> str | None:
-    message = str(exc)
-    if "error while loading shared libraries:" not in message.lower():
-        return None
-
-    match = re.search(r"error while loading shared libraries:\s*([^:\s]+)", message, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return "unknown shared library"
-
-
-def ensure_playwright_chromium_installed(status_ui: StatusUI) -> None:
-    global playwright_chromium_ready
-    if playwright_chromium_ready:
-        return
-
-    status_ui.info("0/4 偵測到 Playwright Chromium 缺失，正在安裝（首次可能需要 1-3 分鐘）")
-    install_cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
-    result = subprocess.run(
-        install_cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=900,
+def build_ydl_options(options: DownloadOptions, ffmpeg_available: bool, logger: YtDlpLogCollector) -> dict[str, Any]:
+    ydl_opts = build_base_options(logger, options.retry_count, options.cookie_file)
+    ydl_opts.update(
+        {
+            "paths": {"home": str(options.output_dir)},
+            "outtmpl": options.output_template,
+            # Otherwise re-downloading at another quality silently keeps the old file.
+            "overwrites": True,
+            # A failed subtitle or playlist entry should not abort the remaining downloads.
+            "ignoreerrors": True,
+            # playlistend stops listing early; max_downloads caps the total across a channel's nested tabs.
+            "playlistend": options.playlist_limit,
+            "max_downloads": options.playlist_limit,
+        }
     )
-    if result.returncode != 0:
-        stderr_text = (result.stderr or "").strip()
-        stdout_text = (result.stdout or "").strip()
-        details = stderr_text or stdout_text or "unknown error"
-        raise RuntimeError(f"Playwright Chromium 安裝失敗：{details}")
 
-    playwright_chromium_ready = True
-    status_ui.info("0/4 Playwright Chromium 安裝完成，繼續執行登入流程")
+    if options.audio_only:
+        ydl_opts["format"] = "ba[ext=m4a]/ba/b"
+        if ffmpeg_available:
+            ydl_opts["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": options.audio_format,
+                    "preferredquality": "192",
+                }
+            ]
+        return ydl_opts
+
+    resolution = f"res:{options.max_height}" if options.max_height else "res"
+    # YouTube offers H.264 up to 1080p; preferring it keeps the MP4 playable on every device.
+    ydl_opts["format_sort"] = [resolution, "fps", "vcodec:h264", "acodec:aac"]
+    if ffmpeg_available:
+        ydl_opts["format"] = "bv*+ba/b"
+        ydl_opts["merge_output_format"] = "mp4"
+    else:
+        ydl_opts["format"] = "b[ext=mp4]/b"
+
+    if options.download_subtitles:
+        ydl_opts["writesubtitles"] = True
+        # "all" plus auto captions means ~160 machine-translated tracks, which YouTube answers with HTTP 429.
+        ydl_opts["writeautomaticsub"] = options.include_auto_subtitles and "all" not in options.subtitle_languages
+        # A past live stream lists its chat replay as a subtitle track, and "all" would download it.
+        ydl_opts["subtitleslangs"] = [*options.subtitle_languages, f"-{LIVE_CHAT_TRACK}"]
+        ydl_opts["subtitlesformat"] = f"{options.subtitle_format}/best"
+
+    return ydl_opts
 
 
-def launch_chromium_with_bootstrap(playwright: Playwright, headless: bool, status_ui: StatusUI) -> Browser:
-    for attempt in range(2):
-        try:
-            return playwright.chromium.launch(headless=headless)
-        except Exception as exc:
-            missing_library = get_missing_playwright_linux_shared_library(exc)
-            if missing_library is not None:
-                raise RuntimeError(
-                    f"Playwright Chromium 啟動失敗：缺少 Linux 系統函式庫 {missing_library}。"
-                    "若為 Streamlit Cloud，請在 packages.txt 安裝 libnspr4 與 libnss3 後重新部署。"
-                ) from exc
-            if attempt == 0 and is_missing_playwright_executable_error(exc):
-                ensure_playwright_chromium_installed(status_ui)
-                continue
-            raise
-    raise RuntimeError("無法啟動 Playwright Chromium")
-
-
-def download_with_ytdlp(
-    vimeo_url: str,
-    output_dir: Path,
-    output_template: str,
-    cookie_file: Path,
-    referer_url: str,
-    download_subtitles: bool,
-    subtitle_languages: list[str],
-    subtitle_format: str,
-    embed_subtitles: bool,
-    subtitle_debug_mode: bool,
-    retry_count: int,
-    progress_ui: ProgressUI,
-) -> tuple[Path, bool, bool, SubtitleDebugReport]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def download_with_ytdlp(url: str, options: DownloadOptions, progress_ui: ProgressUI) -> DownloadOutcome:
+    options.output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_available, _ = get_ffmpeg_status()
 
-    result: dict[str, str] = {}
-    subtitle_debug_report: SubtitleDebugReport = {
-        "title": "",
-        "extractor": "",
-        "manual_rows": [],
-        "auto_rows": [],
-        "inspection_error": "",
-    }
+    logger = YtDlpLogCollector()
+    items: list[DownloadedItem] = []
+    skipped: list[str] = []
 
-    def hook(data: dict[str, Any]) -> None:
+    def filter_entry(info: dict[str, Any], *, incomplete: Any) -> Optional[str]:
+        title = info.get("title") or info.get("id") or url
+        reason = None
+        if info.get("live_status") == "is_live":
+            reason = f"{title}：直播進行中，結束後才能下載。"
+        elif options.max_bytes and not incomplete:
+            size = info.get("filesize") or info.get("filesize_approx")
+            if size and size > options.max_bytes:
+                reason = (
+                    f"{title}：檔案約 {format_bytes(size)}，超過雲端模式上限 {format_bytes(options.max_bytes)}，"
+                    "請改選較低畫質或在本機執行。"
+                )
+        if reason:
+            skipped.append(reason)
+        return reason
+
+    def progress_hook(data: dict[str, Any]) -> None:
+        info = data.get("info_dict") or {}
+        index, count = info.get("playlist_index"), info.get("n_entries")
+        prefix = f"[{index}/{count}] " if index and count else ""
+        # Subtitle tracks also pass through this hook, and they are the only downloads without a vcodec.
+        stream = {"none": "音訊", None: "字幕"}.get(info.get("vcodec"), "影像")
+
         status = data.get("status")
         if status == "downloading":
             total = data.get("total_bytes") or data.get("total_bytes_estimate")
@@ -507,146 +394,226 @@ def download_with_ytdlp(
                 speed_text = ""
                 if speed:
                     speed_text = f" | {speed / (1024 * 1024):.2f} MB/s"
-                progress_ui.progress(fraction, text=f"下載中 {fraction * 100:.1f}%{speed_text}")
+                progress_ui.progress(fraction, text=f"{prefix}下載{stream} {fraction * 100:.1f}%{speed_text}")
         elif status == "finished":
-            progress_ui.progress(1.0, text="下載完成，正在封裝檔案...")
+            progress_ui.progress(1.0, text=f"{prefix}{stream}下載完成")
 
-    ydl_opts: dict[str, Any] = {
-        "outtmpl": str(output_dir / output_template),
-        "cookiefile": str(cookie_file),
-        "format": "bestvideo+bestaudio/best" if ffmpeg_available else "best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": retry_count,
-        "http_headers": {
-            "Referer": referer_url,
-        },
-        "progress_hooks": [hook],
-    }
-    if ffmpeg_available:
-        ydl_opts["merge_output_format"] = "mp4"
+    def postprocessor_hook(data: dict[str, Any]) -> None:
+        label = POSTPROCESSOR_LABELS.get(str(data.get("postprocessor")))
+        if label and data.get("status") == "started":
+            progress_ui.progress(1.0, text=label)
 
-    if download_subtitles:
-        ydl_opts["writesubtitles"] = True
-        ydl_opts["writeautomaticsub"] = True
-        ydl_opts["subtitleslangs"] = subtitle_languages
-        ydl_opts["subtitlesformat"] = subtitle_format
-        if ffmpeg_available and subtitle_format in {"srt", "vtt"}:
-            ydl_opts["convertsubtitles"] = subtitle_format
-        if ffmpeg_available and embed_subtitles:
-            ydl_opts["embedsubtitles"] = True
+    ydl_opts = build_ydl_options(options, ffmpeg_available, logger)
+    ydl_opts["match_filter"] = filter_entry
+    ydl_opts["progress_hooks"] = [progress_hook]
+    ydl_opts["postprocessor_hooks"] = [postprocessor_hook]
 
-    if subtitle_debug_mode:
-        try:
-            subtitle_debug_report = inspect_subtitle_tracks(
-                vimeo_url=vimeo_url,
-                cookie_file=cookie_file,
-                referer_url=referer_url,
-                retry_count=retry_count,
-            )
-        except Exception as exc:
-            subtitle_debug_report["inspection_error"] = str(exc)
+    wants_embedding = (
+        ffmpeg_available and options.download_subtitles and options.embed_subtitles and not options.audio_only
+    )
 
     with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
-        info = cast(dict[str, Any], ydl.extract_info(vimeo_url, download=True))
-        filename = str(ydl.prepare_filename(cast(Any, info)))
-        has_available_subs = bool(info.get("subtitles") or info.get("automatic_captions"))
-        has_requested_subs = bool(info.get("requested_subtitles"))
+        ydl.add_post_processor(CollectDownloadedItemsPP(items))
+        if wants_embedding:
+            # Keep the sidecar files so they stay available as separate downloads.
+            ydl.add_post_processor(FFmpegEmbedSubtitlePP(ydl, already_have_subtitle=True))
+        try:
+            ydl.extract_info(url, download=True)
+        except MaxDownloadsReached:
+            pass
 
-        requested = info.get("requested_downloads")
-        if requested and isinstance(requested, list):
-            requested_items = cast(list[object], requested)
-            if requested_items and isinstance(requested_items[0], Mapping):
-                first_request = cast(Mapping[str, object], requested_items[0])
-                filepath = first_request.get("filepath")
-                if isinstance(filepath, str) and filepath:
-                    filename = filepath
-
-        result["path"] = filename
-
-    return Path(result["path"]).resolve(), has_available_subs, has_requested_subs, subtitle_debug_report
+    return {
+        "items": items,
+        "errors": [humanize_ytdlp_error(message) for message in dict.fromkeys(logger.errors)],
+        "skipped": skipped,
+        "warnings": list(dict.fromkeys(logger.warnings)),
+        "subtitle_note": "",
+    }
 
 
 def run_download(
-    login_url: str,
-    username: str,
-    password: str,
-    video_page_url: str,
-    output_dir: Path,
-    output_template: str,
-    headless: bool,
-    download_subtitles: bool,
-    subtitle_languages: list[str],
-    subtitle_format: str,
-    embed_subtitles: bool,
-    subtitle_debug_mode: bool,
-    retry_count: int,
+    urls: list[str],
+    options: DownloadOptions,
     status_ui: StatusUI,
     progress_ui: ProgressUI,
-) -> tuple[Path, bool, bool, SubtitleDebugReport]:
-    vimeo_url, cookies_file = resolve_vimeo_and_cookies(
-        login_url=login_url,
-        username=username,
-        password=password,
-        video_page_url=video_page_url,
-        output_dir=output_dir,
-        headless=headless,
-        status_ui=status_ui,
-    )
+) -> DownloadOutcome:
+    combined: DownloadOutcome = {"items": [], "errors": [], "skipped": [], "warnings": [], "subtitle_note": ""}
 
-    status_ui.info("4/4 使用 yt-dlp 下載 Vimeo 影片")
-    return download_with_ytdlp(
-        vimeo_url=vimeo_url,
-        output_dir=output_dir,
-        output_template=output_template,
-        cookie_file=cookies_file,
-        referer_url=video_page_url,
-        download_subtitles=download_subtitles,
-        subtitle_languages=subtitle_languages,
-        subtitle_format=subtitle_format,
-        embed_subtitles=embed_subtitles,
-        subtitle_debug_mode=subtitle_debug_mode,
-        retry_count=retry_count,
-        progress_ui=progress_ui,
-    )
+    for index, url in enumerate(urls, start=1):
+        status_ui.info(f"{index}/{len(urls)} 下載連結：{url}")
+        try:
+            outcome = download_with_ytdlp(url, options, progress_ui)
+        except Exception as exc:
+            combined["errors"].append(humanize_ytdlp_error(str(exc)))
+            continue
+        combined["items"].extend(outcome["items"])
+        combined["errors"].extend(outcome["errors"])
+        combined["skipped"].extend(outcome["skipped"])
+        combined["warnings"].extend(outcome["warnings"])
+
+    # The same video can arrive through two different links, and both then point at one file.
+    combined["items"] = list({item["path"]: item for item in combined["items"]}.values())
+
+    if options.download_subtitles:
+        combined["subtitle_note"] = describe_subtitle_shortfall(combined)
+    return combined
 
 
-def run_subtitle_inspection(
-    login_url: str,
-    username: str,
-    password: str,
-    video_page_url: str,
-    output_dir: Path,
-    headless: bool,
+def describe_subtitle_shortfall(outcome: DownloadOutcome) -> str:
+    matches = [re.search(r"Unable to download video subtitles for '([^']+)'", message) for message in outcome["warnings"]]
+    failed_languages = list(dict.fromkeys(match.group(1) for match in matches if match))
+    if failed_languages:
+        return (
+            f"字幕語言 {'、'.join(failed_languages)} 下載失敗。"
+            "YouTube 常以 HTTP 429 拒絕機器翻譯的字幕；影片與其他字幕不受影響。"
+        )
+
+    missing_subtitles = sum(1 for item in outcome["items"] if not item["subtitle_paths"])
+    if missing_subtitles:
+        return f"{missing_subtitles} 部影片沒有取得字幕。可用「解析連結」查看可用語言，或勾選「包含自動產生字幕」。"
+    return ""
+
+
+def flatten_subtitle_tracks(track_map: Mapping[str, object] | None) -> list[SubtitleRow]:
+    rows: list[SubtitleRow] = []
+    if not isinstance(track_map, dict):
+        return rows
+
+    for lang in sorted(track_map.keys()):
+        tracks = track_map.get(lang)
+        if lang == LIVE_CHAT_TRACK or not isinstance(tracks, list) or not tracks:
+            continue
+        track_items = [track for track in cast(list[object], tracks) if isinstance(track, Mapping)]
+        names = [str(track.get("name")) for track in track_items if track.get("name")]
+        formats = [str(track.get("ext")) for track in track_items if track.get("ext")]
+        rows.append({"語言": str(lang), "名稱": names[0] if names else "", "格式": ", ".join(formats)})
+
+    return rows
+
+
+def iter_video_entries(info: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
+    entries = info.get("entries")
+    if entries is None:
+        yield info
+        return
+    for entry in entries:
+        if entry:
+            yield from iter_video_entries(entry)
+
+
+def get_thumbnail_url(info: Mapping[str, Any]) -> str:
+    thumbnails = info.get("thumbnails") or []
+    fallback = thumbnails[-1].get("url") if thumbnails else ""
+    return str(info.get("thumbnail") or fallback or "")
+
+
+def collect_resolutions(formats: list[dict[str, Any]] | None) -> list[int]:
+    resolutions: set[int] = set()
+    for fmt in formats or []:
+        if fmt.get("vcodec") in (None, "none"):
+            continue
+        # YouTube names a quality after the shorter side, which matters for vertical videos.
+        sides =[side for side in (fmt.get("width"), fmt.get("height")) if side]
+        if sides:
+            resolutions.add(int(min(sides)))
+    return sorted(resolutions, reverse=True)
+
+
+def format_video_details(info: Mapping[str, Any]) -> list[str]:
+    details: list[str] = []
+    duration = str(info.get("duration_string") or "")
+    if duration:
+        # yt-dlp renders videos under a minute as bare seconds.
+        details.append(f"長度 {duration if ':' in duration else f'0:{duration.zfill(2)}'}")
+    upload_date = str(info.get("upload_date") or "")
+    if len(upload_date) == 8:
+        details.append(f"上傳於 {upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}")
+    if info.get("view_count") is not None:
+        details.append(f"{info['view_count']:,} 次觀看")
+    return details
+
+
+def inspect_link(url: str, retry_count: int, cookie_file: Optional[Path]) -> LinkReport:
+    opts = build_base_options(YtDlpLogCollector(), retry_count, cookie_file)
+    opts.update({"skip_download": True, "extract_flat": "in_playlist", "playlistend": PLAYLIST_PREVIEW_ITEMS})
+
+    try:
+        with yt_dlp.YoutubeDL(cast(Any, opts)) as ydl:
+            info = cast(dict[str, Any], ydl.extract_info(url, download=False))
+    except Exception as exc:
+        return {"url": url, "error": humanize_ytdlp_error(str(exc))}
+
+    report: LinkReport = {
+        "url": url,
+        "error": "",
+        "title": str(info.get("title") or info.get("id") or url),
+        "channel": str(info.get("channel") or info.get("uploader") or ""),
+        "thumbnail": get_thumbnail_url(info),
+    }
+
+    if "entries" in info:
+        raw_entries = list(info.get("entries") or [])
+        # A channel's root URL lists its tabs, so its playlist_count is not a number of videos.
+        is_nested = any(entry and "entries" in entry for entry in raw_entries)
+        report["is_playlist"] = True
+        report["entry_count"] = None if is_nested else info.get("playlist_count")
+        report["entry_titles"] = [
+            str(entry.get("title") or entry.get("id") or "") for entry in iter_video_entries(info)
+        ][:PLAYLIST_PREVIEW_ITEMS]
+        return report
+
+    report["is_playlist"] = False
+    report["is_live"] = info.get("live_status") == "is_live"
+    report["details"] = format_video_details(info)
+    report["resolutions"] = collect_resolutions(info.get("formats"))
+    report["manual_rows"] = flatten_subtitle_tracks(info.get("subtitles"))
+    report["auto_rows"] = flatten_subtitle_tracks(info.get("automatic_captions"))
+    return report
+
+
+def run_link_inspection(
+    urls: list[str],
     retry_count: int,
+    cookie_file: Optional[Path],
     status_ui: StatusUI,
-) -> tuple[str, SubtitleDebugReport]:
-    vimeo_url, cookies_file = resolve_vimeo_and_cookies(
-        login_url=login_url,
-        username=username,
-        password=password,
-        video_page_url=video_page_url,
-        output_dir=output_dir,
-        headless=headless,
-        status_ui=status_ui,
-    )
-
-    status_ui.info("4/4 只檢查字幕軌 (不下載影片)")
-    debug_report = inspect_subtitle_tracks(
-        vimeo_url=vimeo_url,
-        cookie_file=cookies_file,
-        referer_url=video_page_url,
-        retry_count=retry_count,
-    )
-    return vimeo_url, debug_report
+) -> list[LinkReport]:
+    reports: list[LinkReport] = []
+    for index, url in enumerate(urls, start=1):
+        status_ui.info(f"{index}/{len(urls)} 解析連結：{url}")
+        reports.append(inspect_link(url, retry_count, cookie_file))
+    return reports
 
 
-def parse_subtitle_languages(raw: str) -> list[str]:
-    langs = [part.strip() for part in raw.split(",") if part.strip()]
-    if not langs:
-        return ["all"]
-    return langs
+def summarize_reports(reports: list[LinkReport]) -> tuple[str, str]:
+    if not reports:
+        return "", "尚未執行健康檢查"
+
+    failed = [report for report in reports if report.get("error")]
+    if failed:
+        return "red", f"{len(failed)}/{len(reports)} 個連結無法解析：{failed[0].get('error')}"
+    if any(report.get("is_live") for report in reports):
+        return "yellow", "連結可用，但有影片正在直播，結束後才能下載。"
+
+    videos = [report for report in reports if not report.get("is_playlist")]
+    if any(not report.get("manual_rows") and not report.get("auto_rows") for report in videos):
+        return "yellow", "連結可用，但部分影片未偵測到字幕軌。"
+    return "green", "連結可用，且可讀取字幕軌。" if videos else "連結可用。"
+
+
+@contextmanager
+def temporary_cookie_file(uploaded: Any) -> Iterator[Optional[Path]]:
+    if uploaded is None:
+        yield None
+        return
+
+    # Cookies are login credentials: keep them in a private directory only while the task runs.
+    workdir = Path(tempfile.mkdtemp(prefix="youtube-downloader-cookies-"))
+    try:
+        cookie_file = workdir / "cookies.txt"
+        cookie_file.write_bytes(uploaded.getvalue())
+        yield cookie_file
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def is_streamlit_cloud_environment() -> bool:
@@ -675,22 +642,24 @@ def is_streamlit_cloud_environment() -> bool:
     return cwd_text.startswith("/mount/src")
 
 
-def get_server_output_presets() -> list[str]:
-    candidates = [
-        (Path.cwd() / "downloads").resolve(),
-        Path.cwd().resolve(),
-        Path("/tmp/videocap-downloads"),
-        Path("/tmp"),
-    ]
+def get_session_output_dir() -> Path:
+    # A cloud host is shared by every visitor, so each session gets its own folder.
+    if not st.session_state.get("session_output_dir"):
+        st.session_state["session_output_dir"] = str(CLOUD_OUTPUT_ROOT / uuid.uuid4().hex)
+    return Path(st.session_state["session_output_dir"])
 
-    unique: list[str] = []
-    seen: set[str] = set()
-    for path in candidates:
-        text = str(path)
-        if text not in seen:
-            seen.add(text)
-            unique.append(text)
-    return unique
+
+def purge_stale_output_dirs() -> None:
+    if not CLOUD_OUTPUT_ROOT.exists():
+        return
+
+    cutoff = time.time() - CLOUD_RETENTION_SECONDS
+    for session_dir in CLOUD_OUTPUT_ROOT.iterdir():
+        try:
+            if session_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(session_dir, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def detect_runtime_commit_short() -> str:
@@ -724,62 +693,27 @@ def detect_runtime_commit_short() -> str:
     return DEPLOY_VERIFY_MIN_COMMIT
 
 
-def collect_video_and_subtitle_files(video_file: Path) -> list[Path]:
-    if not video_file.exists():
-        return []
-
-    files = [video_file]
-    base_name = video_file.stem
-    directory = video_file.parent
-
-    for candidate in directory.iterdir():
-        if not candidate.is_file() or candidate == video_file:
-            continue
-        if candidate.suffix.lower() not in SUBTITLE_EXTENSIONS:
-            continue
-
-        candidate_name = candidate.name
-        if candidate_name.startswith(f"{base_name}.") or candidate_name.startswith(f"{base_name}_"):
-            files.append(candidate)
-
-    files.sort(key=lambda path: (path.suffix.lower(), path.name.lower()))
-    return files
+def format_bytes(size: float) -> str:
+    for unit in ("B", "KB", "MB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size:.2f} GB"
 
 
-def build_video_subtitle_zip(video_file: Path) -> tuple[Optional[bytes], str, list[str]]:
-    files = collect_video_and_subtitle_files(video_file)
-    if not files:
-        return None, "", []
-
-    zip_name = f"{video_file.stem}_bundle.zip"
-    buffer = BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        for path in files:
-            bundle.write(path, arcname=path.name)
-
-    subtitle_names = [path.name for path in files if path != video_file]
-    return buffer.getvalue(), zip_name, subtitle_names
+def escape_markdown(text: str) -> str:
+    # Video titles often contain characters Streamlit would render as formatting, such as "$" as LaTeX.
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!:$~|<>])", r"\\\1", text)
 
 
-def select_output_directory(initial_dir: str) -> tuple[Optional[str], Optional[str]]:
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception as exc:
-        return None, f"無法開啟資料夾選擇器：{exc}"
-
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        cast(Any, root).attributes("-topmost", True)
-        selected = filedialog.askdirectory(initialdir=initial_dir or str(Path.cwd()))
-        root.destroy()
-    except Exception as exc:
-        return None, f"開啟資料夾選擇器失敗：{exc}"
-
-    if selected:
-        return selected, None
-    return None, None
+def build_zip_bytes(paths: list[Path]) -> bytes:
+    # Video is already compressed, so storing it keeps this fast even for large files.
+    with tempfile.TemporaryFile() as spool:
+        with zipfile.ZipFile(spool, mode="w", compression=zipfile.ZIP_STORED) as bundle:
+            for path in paths:
+                bundle.write(path, arcname=path.name)
+        spool.seek(0)
+        return spool.read()
 
 
 def append_task_log(message: str) -> None:
@@ -821,12 +755,17 @@ def apply_custom_style() -> None:
                 box-shadow: 0 0 0 2px rgba(14, 106, 119, 0.18);
             }
             [data-testid="stSidebar"] div[data-baseweb="select"] > div,
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] [role="group"],
             [data-testid="stSidebar"] [data-baseweb="base-input"] > div {
                 background: #ffffff;
                 border: 1px solid #93abc1;
                 color: #0f2238;
             }
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] [role="group"] {
+                border-radius: 10px;
+            }
             [data-testid="stSidebar"] div[data-baseweb="select"] > div:hover,
+            [data-testid="stSidebar"] [data-testid="stSelectbox"] [role="group"]:hover,
             [data-testid="stSidebar"] [data-baseweb="base-input"] > div:hover {
                 border-color: #6f8ea9;
             }
@@ -966,19 +905,12 @@ def apply_custom_style() -> None:
                     grid-template-columns: 1fr;
                 }
             }
-            .step-box {
-                border-left: 4px solid #0a7b88;
-                background: #f8fbfd;
-                border-radius: 10px;
-                padding: 14px 16px;
-                min-height: 64px;
-                color: #35465d;
-                box-shadow: 0 8px 24px rgba(11, 36, 71, 0.05);
-            }
-            .step-box.active {
-                background: #e8f6f8;
-                border-left-color: #0b5f6c;
-                color: #0d4f59;
+            .video-title {
+                color: #17314d;
+                font-size: 20px;
+                font-weight: 700;
+                line-height: 1.35;
+                margin-bottom: 6px;
             }
             .status-card {
                 background: #ffffff;
@@ -1056,17 +988,6 @@ def apply_custom_style() -> None:
     )
 
 
-def render_workflow_steps(active_step: int) -> None:
-    labels = ["解析連結", "下載影片", "處理字幕", "完成交付"]
-    cols = st.columns(4)
-    for idx, label in enumerate(labels, start=1):
-        css_class = "step-box active" if idx == active_step else "step-box"
-        cols[idx - 1].markdown(
-            f"<div class='{css_class}'><strong>{idx}. {label}</strong></div>",
-            unsafe_allow_html=True,
-        )
-
-
 def render_meta_badges(
     version: str,
     updated_at: str,
@@ -1074,6 +995,7 @@ def render_meta_badges(
     runtime_commit: str,
     min_commit: str,
     deploy_marker: str,
+    ytdlp_version: str,
 ) -> None:
     st.markdown(
         (
@@ -1109,6 +1031,10 @@ def render_meta_badges(
             "<div class='meta-card-label'>Deploy Marker</div>"
             f"<div class='meta-card-value mono'>{deploy_marker}</div>"
             "</div>"
+            "<div class='meta-card'>"
+            "<div class='meta-card-label'>yt-dlp</div>"
+            f"<div class='meta-card-value mono'>{ytdlp_version}</div>"
+            "</div>"
             "</div>"
             "</div>"
         ),
@@ -1116,13 +1042,14 @@ def render_meta_badges(
     )
 
 
+def status_card_html(message: str) -> str:
+    return f"<div class='status-card'><strong>{html.escape(message)}</strong></div>"
+
+
 def health_panel_html(status: str, message: str) -> str:
     green_class = "light-dot on green" if status == "green" else "light-dot"
     yellow_class = "light-dot on yellow" if status == "yellow" else "light-dot"
     red_class = "light-dot on red" if status == "red" else "light-dot"
-    safe_message = (
-        message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") if message else "尚未執行健康檢查"
-    )
     return (
         "<div class='health-card'>"
         "<div class='health-title'>連結健康狀態</div>"
@@ -1131,91 +1058,169 @@ def health_panel_html(status: str, message: str) -> str:
         f"<div class='light-item'><span class='{yellow_class}'></span><span>警告</span></div>"
         f"<div class='light-item'><span class='{red_class}'></span><span>失敗</span></div>"
         "</div>"
-        f"<div class='health-message'>{safe_message}</div>"
+        f"<div class='health-message'>{html.escape(message)}</div>"
         "</div>"
     )
 
 
-def render_final_download_actions(output_file: Path, is_cloud: bool) -> None:
-    if not output_file.exists():
-        st.warning("找不到影片檔，請重試下載。")
+def render_subtitle_tracks(report: LinkReport) -> None:
+    manual_rows = report.get("manual_rows") or []
+    auto_rows = report.get("auto_rows") or []
+
+    if manual_rows:
+        st.write("上傳者字幕軌")
+        st.dataframe(manual_rows, width="stretch", hide_index=True)
+        st.caption("可用字幕語言代碼")
+        st.code(",".join(row["語言"] for row in manual_rows), language=None, wrap_lines=True)
+    else:
+        st.write("上傳者字幕軌：無")
+
+    if auto_rows:
+        with st.expander(f"自動產生字幕軌（{len(auto_rows)} 種語言）"):
+            st.dataframe(auto_rows, width="stretch", hide_index=True)
+    else:
+        st.write("自動產生字幕軌：無")
+
+
+def render_link_report(report: LinkReport) -> None:
+    with st.container(border=True):
+        if report.get("error"):
+            st.error(f"{escape_markdown(report.get('url', ''))}\n\n{escape_markdown(report.get('error', ''))}")
+            return
+
+        thumbnail_col, info_col = st.columns([1, 2])
+        if report.get("thumbnail"):
+            thumbnail_col.image(report.get("thumbnail", ""), width="stretch")
+
+        with info_col:
+            st.markdown(
+                f"<div class='video-title'>{html.escape(report.get('title', ''))}</div>",
+                unsafe_allow_html=True,
+            )
+            meta = [report.get("channel", ""), *(report.get("details") or [])]
+            st.markdown(
+                f"<div class='meta-line'>{html.escape(' · '.join(part for part in meta if part))}</div>",
+                unsafe_allow_html=True,
+            )
+
+            if report.get("is_playlist"):
+                entry_count = report.get("entry_count")
+                entry_titles = report.get("entry_titles") or []
+                count_text = f"共 {entry_count} 部，" if entry_count else ""
+                st.write(f"播放清單／頻道：{count_text}預覽前 {len(entry_titles)} 部")
+                st.markdown("\n".join(f"- {escape_markdown(title)}" for title in entry_titles))
+                return
+
+            if report.get("is_live"):
+                st.warning("這部影片正在直播，結束後才能下載。")
+
+            resolutions = report.get("resolutions") or []
+            if resolutions:
+                st.write("可用畫質：" + "、".join(f"{height}p" for height in resolutions))
+
+        render_subtitle_tracks(report)
+
+
+def render_file_download_button(path: Path, key: str) -> None:
+    st.download_button(
+        label=f"下載 {escape_markdown(path.name)}（{format_bytes(path.stat().st_size)}）",
+        # Passing the method defers reading the file until the button is clicked.
+        data=path.read_bytes,
+        file_name=path.name,
+        mime=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        width="stretch",
+        key=key,
+        on_click="ignore",
+    )
+
+
+def render_bundle_download_button(paths: list[Path], label: str, file_name: str, key: str, is_cloud: bool) -> None:
+    total_size = sum(path.stat().st_size for path in paths)
+    if is_cloud and total_size > CLOUD_MAX_BYTES:
+        st.caption(f"{label}：總大小 {format_bytes(total_size)} 超過雲端模式上限，請逐一下載檔案。")
         return
 
-    zip_data, zip_name, subtitle_names = build_video_subtitle_zip(output_file)
-    bundled_files = collect_video_and_subtitle_files(output_file)
-    subtitle_files = [path for path in bundled_files if path != output_file]
-    key_base = re.sub(r"[^A-Za-z0-9_]+", "_", output_file.stem).strip("_") or "video"
+    st.download_button(
+        label=f"{label}（{format_bytes(total_size)}）",
+        data=partial(build_zip_bytes, paths),
+        file_name=file_name,
+        mime="application/zip",
+        width="stretch",
+        key=key,
+        on_click="ignore",
+    )
 
+
+def render_item_downloads(item: DownloadedItem, key_base: str, is_cloud: bool) -> None:
+    media_path = Path(item["path"])
+    subtitle_paths = [Path(path) for path in item["subtitle_paths"] if Path(path).exists()]
+
+    render_file_download_button(media_path, f"{key_base}_media")
+    for index, subtitle_path in enumerate(subtitle_paths, start=1):
+        render_file_download_button(subtitle_path, f"{key_base}_subtitle_{index}")
+    if subtitle_paths:
+        render_bundle_download_button(
+            [media_path, *subtitle_paths],
+            label="下載影片+字幕.zip",
+            file_name=f"{media_path.stem}_bundle.zip",
+            key=f"{key_base}_bundle",
+            is_cloud=is_cloud,
+        )
+
+
+def render_final_download_actions(items: list[DownloadedItem], is_cloud: bool) -> None:
     st.markdown("完成後下載選項")
 
-    if zip_data:
-        st.download_button(
-            label="下載影片+字幕.zip",
-            data=zip_data,
-            file_name=zip_name,
-            mime="application/zip",
-            use_container_width=True,
-            key=f"download_zip_{key_base}",
-        )
-        if subtitle_names:
-            st.caption(f"壓縮檔已包含影片與 {len(subtitle_names)} 個字幕檔。")
-        else:
-            st.caption("未偵測到字幕檔，壓縮檔目前僅包含影片。")
+    if len(items) == 1:
+        render_item_downloads(items[0], "download_item_0", is_cloud)
     else:
-        st.button(
-            "下載影片+字幕.zip",
-            use_container_width=True,
-            disabled=True,
-            key=f"download_zip_disabled_{key_base}",
+        all_paths: list[Path] = []
+        for item in items:
+            all_paths.append(Path(item["path"]))
+            all_paths.extend(Path(path) for path in item["subtitle_paths"] if Path(path).exists())
+        render_bundle_download_button(
+            all_paths,
+            label=f"全部打包下載.zip（{len(items)} 部）",
+            file_name="youtube_downloads.zip",
+            key="download_all_bundle",
+            is_cloud=is_cloud,
         )
-        st.caption("目前無法建立影片+字幕壓縮檔。")
+        for index, item in enumerate(items):
+            with st.expander(escape_markdown(item["title"])):
+                render_item_downloads(item, f"download_item_{index}", is_cloud)
 
-    show_separate_key = f"show_separate_downloads_{key_base}"
-    open_separate = st.button(
-        "下載影片+字幕(影片及字幕檔案分別下載)",
-        use_container_width=True,
-        key=f"show_separate_btn_{key_base}",
-    )
-    if open_separate:
-        st.session_state[show_separate_key] = not st.session_state.get(show_separate_key, False)
-
-    if st.session_state.get(show_separate_key, False):
-        st.download_button(
-            label=f"下載影片 ({output_file.name})",
-            data=output_file.read_bytes(),
-            file_name=output_file.name,
-            mime="video/mp4",
-            use_container_width=True,
-            key=f"download_video_separate_{key_base}",
-        )
-        if subtitle_files:
-            for idx, subtitle_path in enumerate(subtitle_files, start=1):
-                st.download_button(
-                    label=f"下載字幕 {idx}: {subtitle_path.name}",
-                    data=subtitle_path.read_bytes(),
-                    file_name=subtitle_path.name,
-                    mime="text/plain",
-                    use_container_width=True,
-                    key=f"download_subtitle_{key_base}_{idx}",
-                )
-        else:
-            st.info("未偵測到可下載字幕檔。")
-
-    st.download_button(
-        label="下載影片",
-        data=output_file.read_bytes(),
-        file_name=output_file.name,
-        mime="video/mp4",
-        use_container_width=True,
-        key=f"download_video_only_{key_base}",
-    )
     if is_cloud:
-        st.caption("部署環境無法直接寫入你的電腦資料夾，請使用上方按鈕下載。")
+        st.caption("部署環境無法直接寫入你的電腦資料夾，請使用上方按鈕下載。檔案只會暫存約兩小時。")
+
+
+def render_download_outcome(outcome: DownloadOutcome, is_cloud: bool) -> None:
+    for message in outcome["errors"]:
+        st.error(escape_markdown(message))
+    for message in outcome["skipped"]:
+        st.warning(escape_markdown(message))
+
+    items = [item for item in outcome["items"] if Path(item["path"]).exists()]
+    if not items:
+        if outcome["items"]:
+            st.warning("暫存檔案已過期，請重新下載。")
+        elif not outcome["errors"] and not outcome["skipped"]:
+            st.warning("沒有下載到任何檔案，請確認連結內容或使用「解析連結」檢查。")
+        return
+
+    if len(items) == 1:
+        st.success(f"下載完成：{escape_markdown(items[0]['path'])}")
+    else:
+        st.success(f"下載完成：共 {len(items)} 部，存放於 {escape_markdown(str(Path(items[0]['path']).parent))}")
+
+    if outcome["subtitle_note"]:
+        st.warning(outcome["subtitle_note"])
+
+    render_final_download_actions(items, is_cloud)
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="TronClass 影片下載平台",
+        page_title="YouTube影片下載平台",
         page_icon="🎬",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -1224,84 +1229,128 @@ def main() -> None:
 
     st.session_state.setdefault("output_dir_raw", str(Path.cwd() / "downloads"))
     st.session_state.setdefault("task_logs", [])
-    st.session_state.setdefault("active_step", 1)
     st.session_state.setdefault("stage_progress", 0.0)
     st.session_state.setdefault("download_progress", 0.0)
     st.session_state.setdefault("last_status", "等待任務開始")
-    st.session_state.setdefault("health_status", "")
-    st.session_state.setdefault("health_message", "尚未執行健康檢查")
-    st.session_state.setdefault("last_output_file", "")
+    st.session_state.setdefault("last_reports", [])
+    st.session_state.setdefault("last_outcome", None)
+
+    # Changing a widget stops a running script, and a stopped script can no longer write session state.
+    # So if this flag is still set, the previous run never finished its task.
+    if st.session_state.get("task_running"):
+        st.session_state["task_running"] = False
+        st.session_state["last_status"] = "任務已中斷：執行中變更設定或按下停止都會中斷任務，請重新開始。"
+        st.session_state["stage_progress"] = 0.0
+        st.session_state["download_progress"] = 0.0
+        append_task_log(st.session_state["last_status"])
+
     is_cloud = is_streamlit_cloud_environment()
     ffmpeg_available, ffmpeg_status = get_ffmpeg_status()
+    js_runtime_available, js_runtime_status = get_js_runtime_status()
 
     with st.sidebar:
         st.markdown("## 任務設定")
         work_mode = st.radio("作業模式", options=["單一連結", "批次連結"], index=0)
         if work_mode == "批次連結":
-            st.caption("批次模式即將推出，現階段先使用單一連結流程。")
+            raw_urls = st.text_area(
+                "YouTube 網址（每行一個）",
+                placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/playlist?list=...",
+                height=140,
+            )
+        else:
+            raw_urls = st.text_input("YouTube 網址", placeholder="https://www.youtube.com/watch?v=...")
+        st.caption("支援影片、Shorts、播放清單與頻道連結。影片網址帶有 list 參數時，只下載該部影片。")
 
-        login_url = st.text_input(
-            "TronClass 登入網址",
-            value="https://dstar.tronclass.com/login?next=/user/index#/",
-            placeholder="https://dstar.tronclass.com/login?next=/user/index#/",
+        max_playlist_limit = CLOUD_MAX_PLAYLIST_LIMIT if is_cloud else LOCAL_MAX_PLAYLIST_LIMIT
+        playlist_limit = st.number_input(
+            "每個播放清單／頻道最多下載幾部",
+            min_value=1,
+            max_value=max_playlist_limit,
+            value=min(DEFAULT_PLAYLIST_LIMIT, max_playlist_limit),
         )
-        username = st.text_input("TronClass 帳號")
-        password = st.text_input("TronClass 密碼", type="password")
-        video_page_url = st.text_input("課程影片頁網址", placeholder="https://...")
 
+        st.markdown("### 下載內容")
+        media_type = st.radio("類型", options=["影片", "僅音訊"], index=0, horizontal=True)
+        audio_only = media_type == "僅音訊"
+        quality_label = DEFAULT_VIDEO_QUALITY
+        audio_format = AUDIO_FORMAT_OPTIONS[0]
+        if audio_only:
+            audio_format = st.selectbox(
+                "音訊格式",
+                options=AUDIO_FORMAT_OPTIONS if ffmpeg_available else AUDIO_FORMAT_OPTIONS[:1],
+                index=0,
+            )
+        else:
+            quality_options = list(VIDEO_QUALITY_OPTIONS)
+            quality_label = st.selectbox(
+                "畫質上限",
+                options=quality_options,
+                index=quality_options.index(DEFAULT_VIDEO_QUALITY),
+            )
+            st.caption("1080p 以下優先選 H.264，相容性最好。1440p 以上只有 VP9／AV1，部分播放器可能無法播放。")
+
+        st.markdown("### 輸出設定")
         naming_rule = st.radio("輸出檔名規則", options=["沿用原始檔名", "原始檔名加日期", "自訂名稱"], index=0)
         custom_name = ""
         if naming_rule == "自訂名稱":
-            custom_name = st.text_input("自訂檔名", value="lesson_video")
+            custom_name = st.text_input("自訂檔名", value=DEFAULT_CUSTOM_NAME)
 
         if is_cloud:
-            server_presets = get_server_output_presets()
-            _cur = st.session_state.get("output_dir_raw", server_presets[0] if server_presets else "")
-            _def_idx = server_presets.index(_cur) if _cur in server_presets else 0
-            selected_server_dir = st.selectbox(
-                "伺服器暫存目錄",
-                options=server_presets,
-                index=_def_idx,
-                key="server_output_dir_select",
-            )
-
-            st.text_input("下載資料夾", value=selected_server_dir, disabled=True, key="cloud_output_dir_display")
-            st.caption("雲端模式：下載完成後請使用下方下載按鈕存到本機。")
-
-            output_dir_raw = selected_server_dir
+            st.caption("雲端模式：檔案暫存於伺服器，下載完成後請使用下方按鈕存到本機。")
+            output_dir_raw = ""
         else:
             output_dir_raw = st.text_input("下載資料夾", key="output_dir_raw")
 
-        st.selectbox("輸出格式", options=["MP4"], index=0, disabled=True)
         retry_count = st.slider("重試次數", min_value=1, max_value=10, value=3)
-        save_in_server_dir = st.checkbox("另存至伺服器工作目錄", value=True)
 
-        st.markdown("### 字幕設定")
-        headless = st.checkbox("無頭模式", value=True)
-        download_subtitles = st.checkbox("下載字幕", value=True)
-        subtitle_languages_raw = st.text_input("字幕語言代碼", value="all")
-        subtitle_format = st.selectbox("字幕格式", options=["srt", "vtt", "best"], index=0)
-        embed_subtitles = st.checkbox("嵌入字幕到 mp4", value=True)
-        if not is_cloud and sys.platform == "darwin":
-            if ffmpeg_available:
-                st.info("macOS 已偵測到 ffmpeg，會使用最佳畫質流程；若勾選字幕嵌入，會直接封裝進 mp4。")
-            else:
-                st.info("macOS 目前會走相容模式：仍可下載影片與外掛字幕檔，但不會做高畫質合併或字幕嵌入。")
-        if not is_cloud and not ffmpeg_available:
-            if sys.platform == "darwin":
-                st.warning(
-                    "未偵測到 ffmpeg。macOS 本機仍可下載，但會改用相容模式，只抓單一影片檔並略過字幕嵌入。若要最佳畫質或嵌入字幕，請先執行 brew install ffmpeg。下載完成後仍可用下方按鈕把影片與字幕存到本機。"
-                )
-            else:
-                st.warning(
-                    "未偵測到 ffmpeg。本機仍可下載，但會改用相容模式，只抓單一影片檔並略過字幕嵌入。若要最佳畫質或嵌入字幕，請先安裝 ffmpeg。"
-                )
+        download_subtitles = False
+        subtitle_languages_raw = ""
+        subtitle_format = "srt"
+        include_auto_subtitles = False
+        embed_subtitles = False
+        if not audio_only:
+            st.markdown("### 字幕設定")
+            download_subtitles = st.checkbox("下載字幕", value=True)
+            subtitle_languages_raw = st.text_input(
+                "字幕語言代碼",
+                value=DEFAULT_SUBTITLE_LANGUAGES,
+                help="以逗號分隔，支援正規表示式，例如 ja,ko 或 zh.*；填 all 代表全部上傳者字幕。",
+            )
+            subtitle_format = st.selectbox("字幕格式", options=["srt", "vtt"], index=0)
+            include_auto_subtitles = st.checkbox(
+                "包含自動產生字幕",
+                value=False,
+                help="包含語音辨識與機器翻譯的字幕。YouTube 常以 HTTP 429 拒絕機器翻譯字幕，此時只會取得原語言字幕。",
+            )
+            if include_auto_subtitles and "all" in parse_subtitle_languages(subtitle_languages_raw):
+                st.caption("語言填 all 時不會抓自動產生字幕，以免觸發 YouTube 限流。")
+            embed_subtitles = st.checkbox("嵌入字幕到 mp4", value=True, disabled=not ffmpeg_available)
+
+        if not ffmpeg_available:
+            install_hints = {"darwin": "brew install ffmpeg", "win32": "winget install Gyan.FFmpeg"}
+            install_hint = install_hints.get(sys.platform, "apt install ffmpeg")
+            st.warning(
+                "未偵測到 ffmpeg。仍可下載，但 YouTube 的單檔格式通常只有 360p，且無法轉成 MP3 或嵌入字幕。"
+                f"若要高畫質，請先安裝 ffmpeg（例如 {install_hint}）。"
+            )
             st.caption(f"ffmpeg 狀態：{ffmpeg_status}")
-        subtitle_debug_mode = st.checkbox("除錯模式：顯示字幕軌", value=False)
+        if not js_runtime_available:
+            st.warning(
+                "未偵測到 Deno。YouTube 需要 JavaScript runtime 才能取得完整畫質，目前可用格式可能受限。"
+                "請執行 pip install -r requirements.txt。"
+            )
+            st.caption(f"Deno 狀態：{js_runtime_status}")
 
-        start_download = st.button("開始下載", type="primary", use_container_width=True)
-        inspect_only = st.button("連結健康檢查", use_container_width=True)
-        clear_logs = st.button("清除任務歷程", use_container_width=True)
+        with st.expander("進階：需要登入的影片"):
+            cookies_upload = st.file_uploader("cookies.txt（Netscape 格式）", type=["txt"])
+            st.caption(
+                "用於年齡限制、會員或私人影片，或雲端主機遇到 YouTube 機器人驗證時。"
+                "cookies 等同登入憑證，請只上傳到你信任的部署環境；伺服器上的暫存檔會在任務結束時刪除。"
+            )
+
+        start_download = st.button("開始下載", type="primary", width="stretch")
+        inspect_only = st.button("解析連結（不下載）", width="stretch")
+        clear_logs = st.button("清除任務歷程", width="stretch")
 
         st.markdown("---")
         st.caption("部署維運")
@@ -1309,20 +1358,22 @@ def main() -> None:
 
     if clear_logs:
         st.session_state["task_logs"] = []
-        st.session_state["active_step"] = 1
         st.session_state["stage_progress"] = 0.0
         st.session_state["download_progress"] = 0.0
         st.session_state["last_status"] = "等待任務開始"
-        st.session_state["health_status"] = ""
-        st.session_state["health_message"] = "尚未執行健康檢查"
-        st.session_state["last_output_file"] = ""
-        for key in list(st.session_state.keys()):
-            if isinstance(key, str) and key.startswith("show_separate_downloads_"):
-                st.session_state.pop(key, None)
+        st.session_state["last_reports"] = []
+        st.session_state["last_outcome"] = None
         st.success("任務歷程已清除。")
 
-    st.markdown("<div class='hero-title'>TronClass 影片下載平台</div>", unsafe_allow_html=True)
-    st.markdown("<div class='hero-subtitle'>課程頁面內嵌 Vimeo 影片與字幕一站式下載</div>", unsafe_allow_html=True)
+    st.markdown("<div class='hero-title'>YouTube影片下載平台</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='hero-subtitle'>貼上影片、播放清單或頻道連結，一站式下載影片、音訊與字幕</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "請僅下載你擁有權利或已獲授權的內容（例如自己上傳的影片、Creative Commons 授權內容），"
+        "並遵守 YouTube 服務條款與當地著作權法。"
+    )
     runtime_commit = detect_runtime_commit_short()
     render_meta_badges(
         version=APP_VERSION,
@@ -1331,21 +1382,22 @@ def main() -> None:
         runtime_commit=runtime_commit,
         min_commit=DEPLOY_VERIFY_MIN_COMMIT,
         deploy_marker=DEPLOY_MARKER,
+        ytdlp_version=YT_DLP_VERSION,
     )
+
+    urls, rejected_urls = parse_youtube_urls(raw_urls)
+
+    def current_reports() -> list[LinkReport]:
+        # Reports for links no longer in the input are stale.
+        return [report for report in st.session_state["last_reports"] if report.get("url") in urls]
 
     status_placeholder = st.empty()
     health_placeholder = st.empty()
     status_placeholder.markdown(
-        f"<div class='status-card'><strong>{st.session_state.get('last_status', '等待任務開始')}</strong></div>",
+        status_card_html(st.session_state.get("last_status", "等待任務開始")),
         unsafe_allow_html=True,
     )
-    health_placeholder.markdown(
-        health_panel_html(
-            st.session_state.get("health_status", ""),
-            st.session_state.get("health_message", "尚未執行健康檢查"),
-        ),
-        unsafe_allow_html=True,
-    )
+    health_placeholder.markdown(health_panel_html(*summarize_reports(current_reports())), unsafe_allow_html=True)
     stage_progress_ui = st.progress(
         st.session_state.get("stage_progress", 0.0),
         text=f"流程進度: {int(st.session_state.get('stage_progress', 0.0) * 100)}%",
@@ -1355,13 +1407,10 @@ def main() -> None:
         text=f"下載進度: {int(st.session_state.get('download_progress', 0.0) * 100)}%",
     )
 
-    with st.expander("作業說明", expanded=False):
+    with st.expander("任務歷程", expanded=False):
         logs = st.session_state.get("task_logs", [])
         if logs:
-            escaped_logs = "<br>".join(
-                line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                for line in logs[-80:]
-            )
+            escaped_logs = "<br>".join(html.escape(line) for line in logs[-80:])
             st.markdown(f"<div class='log-box'>{escaped_logs}</div>", unsafe_allow_html=True)
         else:
             st.caption("尚無任務紀錄。")
@@ -1374,18 +1423,14 @@ def main() -> None:
         def info(self, message: str) -> None:
             st.session_state["last_status"] = message
             append_task_log(message)
-            step_match = re.match(r"(\d)/(\d)\s+(.+)", message)
+            step_match = re.match(r"(\d+)/(\d+)\s+(.+)", message)
             if step_match:
                 current = int(step_match.group(1))
                 total = max(int(step_match.group(2)), 1)
-                stage_fraction = min(max(current / total, 0.0), 1.0)
-                st.session_state["active_step"] = min(max(current, 1), 4)
+                stage_fraction = min(max((current - 1) / total, 0.0), 1.0)
                 st.session_state["stage_progress"] = stage_fraction
                 self.stage_ui.progress(stage_fraction, text=f"流程進度: {int(stage_fraction * 100)}%")
-            self.placeholder.markdown(
-                f"<div class='status-card'><strong>{message}</strong></div>",
-                unsafe_allow_html=True,
-            )
+            self.placeholder.markdown(status_card_html(message), unsafe_allow_html=True)
 
     class DownloadProgressBridge:
         def __init__(self, progress_ui: Any) -> None:
@@ -1396,146 +1441,93 @@ def main() -> None:
             st.session_state["download_progress"] = clamped
             self.progress_ui.progress(clamped, text=text or f"下載進度: {int(clamped * 100)}%")
 
-    if naming_rule == "沿用原始檔名":
-        output_template = "%(title)s.%(ext)s"
-    elif naming_rule == "原始檔名加日期":
-        output_template = "%(title)s_%(upload_date)s.%(ext)s"
-    else:
-        safe_name = re.sub(r"[^A-Za-z0-9_\-.]+", "_", custom_name.strip())
-        if not safe_name:
-            safe_name = "lesson_video"
-        output_template = f"{safe_name}_%(id)s.%(ext)s"
-
-    output_dir_candidate = output_dir_raw.strip() if output_dir_raw.strip() else str(Path.cwd() / "downloads")
-    output_dir = Path(output_dir_candidate).expanduser().resolve()
-    if save_in_server_dir and not output_dir_candidate:
-        output_dir = (Path.cwd() / "downloads").resolve()
-
     if start_download or inspect_only:
-        if not all([login_url.strip(), username.strip(), password.strip(), video_page_url.strip()]):
-            st.error("請填寫所有必填欄位。")
+        if rejected_urls:
+            st.error("以下內容不是 YouTube 網址：" + "、".join(escape_markdown(entry) for entry in rejected_urls))
+            return
+        if not urls:
+            st.error("請輸入至少一個 YouTube 網址。")
             return
 
-        st.session_state["active_step"] = 1
         st.session_state["stage_progress"] = 0.0
         st.session_state["download_progress"] = 0.0
         st.session_state["last_status"] = "任務啟動中..."
+        st.session_state["task_running"] = True
         append_task_log("任務啟動")
 
         status_ui = StatusBridge(status_placeholder, stage_progress_ui)
         progress_ui = DownloadProgressBridge(download_progress_ui)
 
         try:
-            if inspect_only:
-                _, subtitle_debug_report = run_subtitle_inspection(
-                    login_url=login_url.strip(),
-                    username=username.strip(),
-                    password=password,
-                    video_page_url=video_page_url.strip(),
-                    output_dir=output_dir,
-                    headless=headless,
-                    retry_count=retry_count,
-                    status_ui=status_ui,
-                )
-                manual_rows = subtitle_debug_report.get("manual_rows") or []
-                auto_rows = subtitle_debug_report.get("auto_rows") or []
-                inspection_error = str(subtitle_debug_report.get("inspection_error") or "")
-                if inspection_error:
-                    st.session_state["health_status"] = "red"
-                    st.session_state["health_message"] = f"健康檢查失敗：{inspection_error}"
-                elif manual_rows or auto_rows:
-                    st.session_state["health_status"] = "green"
-                    st.session_state["health_message"] = "連結可用，且可讀取字幕軌。"
+            with temporary_cookie_file(cookies_upload) as cookie_file:
+                if inspect_only:
+                    st.session_state["last_reports"] = run_link_inspection(urls, retry_count, cookie_file, status_ui)
+                    status_ui.info("連結解析完成，未下載影片。")
                 else:
-                    st.session_state["health_status"] = "yellow"
-                    st.session_state["health_message"] = "連結可用，但未偵測到字幕軌或權限受限。"
+                    st.session_state["last_outcome"] = None
 
-                health_placeholder.markdown(
-                    health_panel_html(st.session_state["health_status"], st.session_state["health_message"]),
-                    unsafe_allow_html=True,
-                )
-                st.session_state["stage_progress"] = 1.0
-                st.session_state["active_step"] = 4
-                stage_progress_ui.progress(1.0, text="流程進度: 100%")
-                st.success("連結健康檢查完成，未下載影片。")
-                render_subtitle_debug_report(subtitle_debug_report)
-            else:
-                st.session_state["health_status"] = ""
-                st.session_state["health_message"] = "尚未執行健康檢查"
-                health_placeholder.markdown(
-                    health_panel_html(st.session_state["health_status"], st.session_state["health_message"]),
-                    unsafe_allow_html=True,
-                )
-                output_file, has_available_subs, has_requested_subs, subtitle_debug_report = run_download(
-                    login_url=login_url.strip(),
-                    username=username.strip(),
-                    password=password,
-                    video_page_url=video_page_url.strip(),
-                    output_dir=output_dir,
-                    output_template=output_template,
-                    headless=headless,
-                    download_subtitles=download_subtitles,
-                    subtitle_languages=parse_subtitle_languages(subtitle_languages_raw),
-                    subtitle_format=subtitle_format,
-                    embed_subtitles=embed_subtitles,
-                    subtitle_debug_mode=subtitle_debug_mode,
-                    retry_count=retry_count,
-                    status_ui=status_ui,
-                    progress_ui=progress_ui,
-                )
-
-                progress_ui.progress(1.0, text="下載進度: 100%")
-                st.session_state["stage_progress"] = 1.0
-                st.session_state["active_step"] = 4
-                stage_progress_ui.progress(1.0, text="流程進度: 100%")
-
-                st.success(f"下載完成：{output_file}")
-                append_task_log(f"下載完成: {output_file}")
-                st.session_state["last_output_file"] = str(output_file)
-                render_final_download_actions(output_file, is_cloud)
-
-                if download_subtitles:
-                    if has_requested_subs:
-                        st.info("字幕已下載。若未嵌入，字幕檔會與影片放在同資料夾。")
-                    elif has_available_subs:
-                        st.warning("偵測到字幕軌，但未成功取得字幕檔，請改用 best 或 vtt 再試。")
+                    if is_cloud:
+                        output_dir = get_session_output_dir()
+                        purge_stale_output_dirs()
+                        shutil.rmtree(output_dir, ignore_errors=True)
                     else:
-                        st.warning("此影片來源未提供可下載字幕 (或權限不足)。")
+                        output_dir = Path(output_dir_raw.strip() or Path.cwd() / "downloads").expanduser().resolve()
 
-                if subtitle_debug_mode:
-                    render_subtitle_debug_report(subtitle_debug_report)
-        except PlaywrightTimeoutError:
-            error_message = "網頁操作逾時，請確認網址正確與網路連線。"
-            append_task_log(error_message)
-            if inspect_only:
-                st.session_state["health_status"] = "red"
-                st.session_state["health_message"] = error_message
-                health_placeholder.markdown(
-                    health_panel_html(st.session_state["health_status"], st.session_state["health_message"]),
-                    unsafe_allow_html=True,
-                )
-            st.error(error_message)
+                    outcome = run_download(
+                        urls,
+                        DownloadOptions(
+                            output_dir=output_dir,
+                            output_template=build_output_template(naming_rule, custom_name, len(urls) > 1),
+                            audio_only=audio_only,
+                            max_height=VIDEO_QUALITY_OPTIONS[quality_label],
+                            audio_format=audio_format,
+                            download_subtitles=download_subtitles,
+                            subtitle_languages=parse_subtitle_languages(subtitle_languages_raw),
+                            subtitle_format=subtitle_format,
+                            include_auto_subtitles=include_auto_subtitles,
+                            embed_subtitles=embed_subtitles,
+                            playlist_limit=int(playlist_limit),
+                            retry_count=retry_count,
+                            cookie_file=cookie_file,
+                            max_bytes=CLOUD_MAX_BYTES if is_cloud else None,
+                        ),
+                        status_ui,
+                        progress_ui,
+                    )
+                    st.session_state["last_outcome"] = outcome
+
+                    for message in [*outcome["warnings"], *outcome["skipped"], *outcome["errors"]]:
+                        append_task_log(message)
+                    for item in outcome["items"]:
+                        append_task_log(f"下載完成: {item['path']}")
+
+                    if outcome["items"]:
+                        progress_ui.progress(1.0, text="下載進度: 100%")
+                        status_ui.info("下載完成")
+                    else:
+                        status_ui.info("下載失敗")
+
+            st.session_state["stage_progress"] = 1.0
+            stage_progress_ui.progress(1.0, text="流程進度: 100%")
+            health_placeholder.markdown(
+                health_panel_html(*summarize_reports(current_reports())),
+                unsafe_allow_html=True,
+            )
         except Exception as exc:
-            error_message = f"下載失敗：{exc}"
+            error_message = f"任務失敗：{exc}"
             append_task_log(error_message)
-            if inspect_only:
-                st.session_state["health_status"] = "red"
-                st.session_state["health_message"] = str(exc)
-                health_placeholder.markdown(
-                    health_panel_html(st.session_state["health_status"], st.session_state["health_message"]),
-                    unsafe_allow_html=True,
-                )
-            st.error(error_message)
+            st.error(escape_markdown(error_message))
+        finally:
+            st.session_state["task_running"] = False
 
-    if not (start_download or inspect_only):
-        saved_output_file = str(st.session_state.get("last_output_file", "")).strip()
-        if saved_output_file:
-            saved_path = Path(saved_output_file)
-            if saved_path.exists():
-                st.success(f"下載完成：{saved_path}")
-                render_final_download_actions(saved_path, is_cloud)
-            else:
-                st.session_state["last_output_file"] = ""
+    if st.session_state["last_outcome"]:
+        render_download_outcome(st.session_state["last_outcome"], is_cloud)
+
+    reports_to_show = current_reports()
+    if reports_to_show:
+        st.markdown("### 連結解析結果")
+        for report in reports_to_show:
+            render_link_report(report)
 
 
 if __name__ == "__main__":

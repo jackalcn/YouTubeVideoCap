@@ -37,7 +37,19 @@ jobs:
 
           assert sys.platform == "darwin", sys.platform
 
+          js_runtime_available, js_runtime_status = main.get_js_runtime_status()
+          assert js_runtime_available, js_runtime_status
+
+          urls, rejected = main.parse_youtube_urls(
+              "https://youtu.be/jNQXAC9IVRw youtube.com/watch?v=jNQXAC9IVRw "
+              "https://example.com/v.mp4 https://youtube.com@example.com/ https://youtu.be/jNQXAC9IVRw"
+          )
+          assert urls == ["https://youtu.be/jNQXAC9IVRw", "https://youtube.com/watch?v=jNQXAC9IVRw"], urls
+          assert len(rejected) == 2, rejected
+
           captured = {}
+          post_processors = []
+          dummy_output = Path("downloads") / "dummy.mp4"
 
           class DummyProgress:
               def progress(self, value, text=""):
@@ -53,17 +65,14 @@ jobs:
               def __exit__(self, exc_type, exc, tb):
                   return False
 
-              def extract_info(self, url, download=True):
-                  dummy_path = str((Path("downloads") / "dummy.mp4").resolve())
-                  return {
-                      "subtitles": {},
-                      "automatic_captions": {},
-                      "requested_subtitles": {},
-                      "requested_downloads": [{"filepath": dummy_path}],
-                  }
+              def add_post_processor(self, pp, when="post_process"):
+                  post_processors.append(pp)
 
-              def prepare_filename(self, info):
-                  return str((Path("downloads") / "dummy.mp4").resolve())
+              def extract_info(self, url, download=True):
+                  info = {"title": "dummy", "filepath": str(dummy_output.resolve()), "requested_subtitles": {}}
+                  for pp in post_processors:
+                      pp.run(info)
+                  return info
 
           orig_status = main.get_ffmpeg_status
           orig_ydl = main.yt_dlp.YoutubeDL
@@ -72,39 +81,41 @@ jobs:
               main.get_ffmpeg_status = lambda: (False, "mock missing")
               main.yt_dlp.YoutubeDL = DummyYDL
 
-              dummy_output = Path("downloads") / "dummy.mp4"
               dummy_output.parent.mkdir(parents=True, exist_ok=True)
               dummy_output.write_bytes(b"0")
-              cookie_file = Path("downloads") / "dummy_cookies.txt"
-              cookie_file.write_text("cookie", encoding="utf-8")
 
-              output_path, _, _, _ = main.download_with_ytdlp(
-                  vimeo_url="https://player.vimeo.com/video/1",
-                  output_dir=Path("downloads"),
-                  output_template="%(title)s.%(ext)s",
-                  cookie_file=cookie_file,
-                  referer_url="https://example.com",
-                  download_subtitles=True,
-                  subtitle_languages=["all"],
-                  subtitle_format="srt",
-                  embed_subtitles=True,
-                  subtitle_debug_mode=False,
-                  retry_count=1,
-                  progress_ui=DummyProgress(),
+              outcome = main.download_with_ytdlp(
+                  "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                  main.DownloadOptions(
+                      output_dir=Path("downloads"),
+                      output_template="%(title)s.%(ext)s",
+                      max_height=1080,
+                      download_subtitles=True,
+                      subtitle_languages=("all",),
+                      subtitle_format="srt",
+                      include_auto_subtitles=True,
+                      embed_subtitles=True,
+                      retry_count=1,
+                  ),
+                  DummyProgress(),
               )
 
-              assert output_path.name == "dummy.mp4", output_path
-              assert captured.get("format") == "best", captured
+              assert Path(outcome["items"][0]["path"]).name == "dummy.mp4", outcome
+              assert captured.get("format") == "b[ext=mp4]/b", captured
               assert "merge_output_format" not in captured, captured
-              assert "embedsubtitles" not in captured, captured
-              assert "convertsubtitles" not in captured, captured
+              assert "postprocessors" not in captured, captured
+              assert len(post_processors) == 1, post_processors
+              assert captured.get("subtitlesformat") == "srt/best", captured
+              assert captured.get("writeautomaticsub") is False, captured
               print("macOS fallback smoke passed")
           finally:
               main.get_ffmpeg_status = orig_status
               main.yt_dlp.YoutubeDL = orig_ydl
           PY
 
-      - name: macOS public Vimeo download smoke
+      # GitHub-hosted runner IPs are often challenged by YouTube's bot check, so a failure here only warns.
+      - name: macOS public YouTube download smoke
+        continue-on-error: true
         run: |
           python - <<'PY'
           import shutil
@@ -120,36 +131,28 @@ jobs:
               def progress(self, value, text=""):
                   pass
 
-          workdir = Path(tempfile.mkdtemp(prefix="videocap-macos-public-"))
-          output_dir = workdir / "downloads"
-          output_dir.mkdir(parents=True, exist_ok=True)
-          cookie_file = workdir / "cookies.txt"
-          main.write_netscape_cookie_file([], cookie_file)
+          workdir = Path(tempfile.mkdtemp(prefix="youtube-downloader-macos-public-"))
 
           orig_status = main.get_ffmpeg_status
 
           try:
               main.get_ffmpeg_status = lambda: (False, "mock missing")
-              output_path, has_available_subs, _, _ = main.download_with_ytdlp(
-                  vimeo_url="https://player.vimeo.com/video/76979871",
-                  output_dir=output_dir,
-                  output_template="%(title)s.%(ext)s",
-                  cookie_file=cookie_file,
-                  referer_url="https://vimeo.com/76979871",
-                  download_subtitles=False,
-                  subtitle_languages=["all"],
-                  subtitle_format="srt",
-                  embed_subtitles=False,
-                  subtitle_debug_mode=False,
-                  retry_count=1,
-                  progress_ui=DummyProgress(),
+              outcome = main.download_with_ytdlp(
+                  "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                  main.DownloadOptions(
+                      output_dir=workdir / "downloads",
+                      output_template="%(title)s.%(ext)s",
+                      retry_count=1,
+                  ),
+                  DummyProgress(),
               )
 
+              assert outcome["items"], outcome["errors"]
+              output_path = Path(outcome["items"][0]["path"])
               assert output_path.exists(), output_path
               assert output_path.suffix.lower() == ".mp4", output_path
-              assert output_path.stat().st_size > 1_000_000, output_path.stat().st_size
-              assert has_available_subs is True
-              print(f"macOS public Vimeo download passed: {output_path.name} ({output_path.stat().st_size} bytes)")
+              assert output_path.stat().st_size > 100_000, output_path.stat().st_size
+              print(f"macOS public YouTube download passed: {output_path.name} ({output_path.stat().st_size} bytes)")
           finally:
               main.get_ffmpeg_status = orig_status
               shutil.rmtree(workdir, ignore_errors=True)
