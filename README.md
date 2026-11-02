@@ -26,4 +26,6 @@ YouTube 常改版。如果開始下載失敗，先更新 yt-dlp：
 
 推送到 `main` 分支後，Streamlit Community Cloud 會自動部署；系統套件列在 `packages.txt`。
 
-YouTube 常封鎖雲端主機的 IP。遇到「不是機器人」的驗證時，請改在本機執行，或在 App 的「進階」區塊上傳 `cookies.txt`。cookies 等同登入憑證，請只上傳到你信任的部署環境。
+YouTube 常限制雲端主機的 IP。實測在 Streamlit Community Cloud 上，解析連結正常，但多數影片下載會被回 HTTP 403，所以要穩定下載請在本機執行。
+
+也可以試著在 App 的「進階」區塊上傳 `cookies.txt`，但這個做法尚未實測。cookies 等同登入憑證，請只上傳到你信任的部署環境。

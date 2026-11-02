@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping
 import html
 import mimetypes
 import os
@@ -23,15 +23,17 @@ from urllib.parse import urlparse
 
 import streamlit as st
 import yt_dlp
-from yt_dlp.postprocessor import FFmpegEmbedSubtitlePP, PostProcessor
+from yt_dlp.postprocessor.common import PostProcessor
+from yt_dlp.postprocessor.ffmpeg import FFmpegEmbedSubtitlePP  # pyright: ignore[reportMissingTypeStubs]
 from yt_dlp.utils import MaxDownloadsReached
 from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 
-APP_VERSION = "v2026.11.03.1"
+APP_VERSION = "v2026.11.03.2"
 APP_UPDATED_AT = "2026-11-03"
 DEPLOY_VERIFY_MIN_COMMIT = "7f71b98"
-DEPLOY_MARKER = "build-2026-11-03-01-youtube"
+DEPLOY_MARKER = "build-2026-11-03-02-youtube"
+LOCAL_RUN_GUIDE_URL = "https://github.com/jackalcn/TronClassVideoCap#在本機執行"
 
 YOUTUBE_HOSTS = frozenset(
     {
@@ -76,6 +78,8 @@ CLOUD_MAX_BYTES = 1024**3
 CLOUD_RETENTION_SECONDS = 2 * 60 * 60
 CLOUD_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "youtube-downloader-files"
 
+# Subtitle tracks also reach the progress hook, and they are the only downloads without a vcodec.
+STREAM_LABELS: dict[Optional[str], str] = {"none": "音訊", None: "字幕"}
 POSTPROCESSOR_LABELS = {
     "Merger": "正在合併影像與音訊...",
     "ExtractAudio": "正在轉換音訊...",
@@ -93,7 +97,11 @@ YTDLP_ERROR_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("available in your country",), "此影片在目前所在地區無法觀看。"),
     (("drm protected",), "此影片受 DRM 保護，無法下載。"),
     (("rate-limited", "http error 429", "too many requests", "try again later"), "YouTube 暫時限制了請求頻率，請稍後再試（可能長達一小時）。"),
-    (("video unavailable", "video is unavailable"), "影片無法使用，可能已被移除或設為不公開。"),
+    (
+        ("http error 403",),
+        "YouTube 拒絕了這台主機的下載請求（雲端主機的 IP 常被限制）。請改在自己的電腦上執行，也可以試著在「進階」上傳 cookies.txt。",
+    ),
+    (("video unavailable", "video is unavailable"), "影片無法使用，可能已被移除、設為不公開，或在主機所在地區無法觀看。"),
     (("will begin in", "premieres in"), "直播或首播尚未開始，開始後才能下載。"),
     (("requested format is not available", "no video formats found"), "找不到符合條件的影片格式，請改選其他畫質。"),
     (("netscape format", "failed to load cookies"), "cookies.txt 無法讀取，請確認是 Netscape 格式。"),
@@ -189,8 +197,8 @@ class CollectDownloadedItemsPP(PostProcessor):
         super().__init__()
         self.items = items
 
-    def run(self, information: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
-        requested_subtitles = information.get("requested_subtitles") or {}
+    def run(self, information: Any) -> tuple[list[str], Any]:
+        requested_subtitles = cast(dict[str, dict[str, Any]], information.get("requested_subtitles") or {})
         # With ignoreerrors, yt-dlp sets a subtitle's filepath even when its download failed.
         subtitle_paths = [str(track.get("filepath") or "") for track in requested_subtitles.values()]
         self.items.append(
@@ -378,11 +386,10 @@ def download_with_ytdlp(url: str, options: DownloadOptions, progress_ui: Progres
         return reason
 
     def progress_hook(data: dict[str, Any]) -> None:
-        info = data.get("info_dict") or {}
+        info = cast(dict[str, Any], data.get("info_dict") or {})
         index, count = info.get("playlist_index"), info.get("n_entries")
         prefix = f"[{index}/{count}] " if index and count else ""
-        # Subtitle tracks also pass through this hook, and they are the only downloads without a vcodec.
-        stream = {"none": "音訊", None: "字幕"}.get(info.get("vcodec"), "影像")
+        stream = STREAM_LABELS.get(info.get("vcodec"), "影像")
 
         status = data.get("status")
         if status == "downloading":
@@ -416,7 +423,7 @@ def download_with_ytdlp(url: str, options: DownloadOptions, progress_ui: Progres
         ydl.add_post_processor(CollectDownloadedItemsPP(items))
         if wants_embedding:
             # Keep the sidecar files so they stay available as separate downloads.
-            ydl.add_post_processor(FFmpegEmbedSubtitlePP(ydl, already_have_subtitle=True))
+            ydl.add_post_processor(cast(Any, FFmpegEmbedSubtitlePP(ydl, already_have_subtitle=True)))
         try:
             ydl.extract_info(url, download=True)
         except MaxDownloadsReached:
@@ -483,7 +490,9 @@ def flatten_subtitle_tracks(track_map: Mapping[str, object] | None) -> list[Subt
         tracks = track_map.get(lang)
         if lang == LIVE_CHAT_TRACK or not isinstance(tracks, list) or not tracks:
             continue
-        track_items = [track for track in cast(list[object], tracks) if isinstance(track, Mapping)]
+        track_items = [
+            cast(Mapping[str, object], track) for track in cast(list[object], tracks) if isinstance(track, Mapping)
+        ]
         names = [str(track.get("name")) for track in track_items if track.get("name")]
         formats = [str(track.get("ext")) for track in track_items if track.get("ext")]
         rows.append({"語言": str(lang), "名稱": names[0] if names else "", "格式": ", ".join(formats)})
@@ -502,7 +511,7 @@ def iter_video_entries(info: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
 
 
 def get_thumbnail_url(info: Mapping[str, Any]) -> str:
-    thumbnails = info.get("thumbnails") or []
+    thumbnails = cast(list[dict[str, Any]], info.get("thumbnails") or [])
     fallback = thumbnails[-1].get("url") if thumbnails else ""
     return str(info.get("thumbnail") or fallback or "")
 
@@ -601,7 +610,7 @@ def summarize_reports(reports: list[LinkReport]) -> tuple[str, str]:
 
 
 @contextmanager
-def temporary_cookie_file(uploaded: Any) -> Iterator[Optional[Path]]:
+def temporary_cookie_file(uploaded: Any) -> Generator[Optional[Path], None, None]:
     if uploaded is None:
         yield None
         return
@@ -1374,6 +1383,11 @@ def main() -> None:
         "請僅下載你擁有權利或已獲授權的內容（例如自己上傳的影片、Creative Commons 授權內容），"
         "並遵守 YouTube 服務條款與當地著作權法。"
     )
+    if is_cloud:
+        st.warning(
+            "這個雲端版本的下載成功率很低：YouTube 常拒絕雲端主機 IP 的影片下載（HTTP 403），解析連結則不受影響。"
+            f"要穩定下載，請[在自己的電腦上執行]({LOCAL_RUN_GUIDE_URL})。"
+        )
     runtime_commit = detect_runtime_commit_short()
     render_meta_badges(
         version=APP_VERSION,
