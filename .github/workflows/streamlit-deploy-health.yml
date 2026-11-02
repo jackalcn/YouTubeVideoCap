@@ -75,12 +75,14 @@ jobs:
                   assert_share_entrypoint()
                   assert_redirect(app_url)
                   assert_redirect(app_health_url)
-                  print("Streamlit deployment health check passed")
-                  sys.exit(0)
               except SystemExit as exc:
                   last_error = str(exc)
                   print(f"retrying after probe failure: {last_error}")
                   time.sleep(15)
+                  continue
+
+              print("Streamlit deployment health check passed")
+              sys.exit(0)
 
           raise SystemExit(last_error or "Streamlit deployment health check failed")
           PY
