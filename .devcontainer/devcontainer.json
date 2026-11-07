@@ -18,8 +18,10 @@
     }
   },
   "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && pip3 install --user -r requirements.txt; pip3 install --user streamlit; echo '✅ Packages installed and Requirements met'",
+  // Streamlit's cross-site protection stays on: without it any web page could drive the app as its trusted owner.
+  // Codespaces serves the app from its own address, so only that address is added to the allowed list.
   "postAttachCommand": {
-    "server": "streamlit run main.py --server.enableCORS false --server.enableXsrfProtection false"
+    "server": "if [ -n \"$CODESPACE_NAME\" ]; then streamlit run main.py --server.corsAllowedOrigins \"https://$CODESPACE_NAME-8501.$GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN\"; else streamlit run main.py; fi"
   },
   "portsAttributes": {
     "8501": {

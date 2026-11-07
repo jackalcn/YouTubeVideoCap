@@ -3,16 +3,28 @@ gatherUsageStats = false
 
 [client]
 showSidebarNavigation = true
+toolbarMode = "minimal"
 
 [server]
 headless = true
+# The launchers open the browser (headless false), and on a new computer Streamlit would otherwise stop and ask for an email first.
+showEmailPrompt = false
 runOnSave = true
-maxUploadSize = 200
+# Uploads are small: cookies, link and subscription lists, settings, subtitles, download records and backups.
+# They stay in memory for the session, and anyone who can open a public host can upload, so the cap stays low.
+maxUploadSize = 10
 
 [theme]
-base = "light"
+font = "sans serif"
+
+[theme.light]
 primaryColor = "#0E6A77"
 backgroundColor = "#F1F5FA"
 secondaryBackgroundColor = "#E8EFF7"
 textColor = "#1F2A3D"
-font = "sans serif"
+
+[theme.dark]
+primaryColor = "#1A8A9B"
+backgroundColor = "#10161E"
+secondaryBackgroundColor = "#1A2430"
+textColor = "#E6EDF5"

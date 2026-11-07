@@ -1,0 +1,8 @@
+*
+!main.py
+!requirements.txt
+!videocap
+!.streamlit
+!docker-entrypoint.sh
+.streamlit/secrets.toml
+**/__pycache__

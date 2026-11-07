@@ -1,0 +1,28 @@
+services:
+  videocap:
+    build: .
+    restart: unless-stopped
+    ports:
+      # Only reachable from this computer. To reach it from other devices, remove 127.0.0.1, set VIDEOCAP_PASSWORD
+      # below, and list in VIDEOCAP_ALLOWED_HOSTS the addresses or names those devices type in their browser.
+      - "127.0.0.1:8501:8501"
+    environment:
+      # Docker hides the visitor's address, so the app cannot tell this machine's owner from anyone else without this.
+      VIDEOCAP_TRUST_REMOTE: "1"
+      # VIDEOCAP_PASSWORD: "choose-a-long-password"
+      # The app trusts only browsers that asked for localhost or one of these names, so another website cannot pose as
+      # this machine. Without this line, other devices get only the public visitor's pages, not the owner's.
+      # VIDEOCAP_ALLOWED_HOSTS: "192.168.1.20,nas.local"
+      # Times the server itself writes, such as a stream's planned start, use this zone. The pages and scheduled
+      # downloads follow the browser's own time zone. Change it if the server lives elsewhere.
+      TZ: "Asia/Taipei"
+      # Downloaded files belong to the owner of ./downloads (uid 1000 if Docker had to create the folder).
+      # To pick the owner yourself, for example a NAS account, set its numbers (shown by: id):
+      # PUID: "1026"
+      # PGID: "100"
+    volumes:
+      - ./downloads:/downloads
+      - videocap-data:/data
+
+volumes:
+  videocap-data:
