@@ -154,6 +154,29 @@ def _app_job() -> Optional[int]:
         return job
 
 
+def end_process_tree(process: subprocess.Popen[Any], timeout: float = 10.0) -> None:
+    """Ends a child and everything it started. ffmpeg installed through a package manager is often a small launcher
+    (Chocolatey's shim, for one) whose real ffmpeg is a child of its own: killing only the launcher would leave that
+    ffmpeg writing its file. The caller waits for the process afterwards."""
+    if process.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def remove_when_released(path: Path, timeout: float = 3.0) -> bool:
     """Deletes a file or folder a process that was just killed may still hold. Windows keeps the handle open for a
     moment after the process ends, and a delete in that moment fails with "being used by another process"."""

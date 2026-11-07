@@ -147,3 +147,36 @@ def test_ffmpeg_runs_yt_dlp_starts_join_the_apps_job() -> None:
     finally:
         process.kill()
         process.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="package-manager launchers are a Windows habit")
+def test_ending_a_process_also_ends_what_it_started(tmp_path: Path) -> None:
+    import subprocess
+    import time
+
+    from videocap.processes import end_process_tree
+
+    # cmd stands in for a launcher such as Chocolatey's ffmpeg shim: the real work runs in its child.
+    pid_file = tmp_path / "pid.txt"
+    script = tmp_path / "child.py"
+    # A file, because cmd would mangle quotes and semicolons in a -c argument.
+    lines = ["import os, time", f"open(r'{pid_file}', 'w').write(str(os.getpid()))", "time.sleep(60)", ""]
+    script.write_text("\n".join(lines), encoding="utf-8")
+    launcher = subprocess.Popen(["cmd", "/d", "/c", sys.executable, str(script)], creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        deadline = time.monotonic() + 15
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        child_pid = int(pid_file.read_text())
+        end_process_tree(launcher)
+        launcher.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            listing = subprocess.run(["tasklist", "/FI", f"PID eq {child_pid}", "/NH"], capture_output=True, text=True, check=False).stdout
+            if str(child_pid) not in listing:
+                break
+            time.sleep(0.2)
+        assert str(child_pid) not in listing
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()

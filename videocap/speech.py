@@ -26,7 +26,7 @@ import numpy
 from videocap.chinese import TRADITIONAL_LANGUAGE, ChineseConversionUnavailable, to_traditional
 from videocap.config import get_data_dir
 from videocap.media_tools import GPU_FALLBACK_TEXT, TOOL_LABELS, ToolProgress, ToolRequest, ToolResult, summarize_ffmpeg_error
-from videocap.processes import start_tied_process
+from videocap.processes import end_process_tree, start_tied_process
 from videocap.subtitles import Cue, cues_to_srt, is_cjk
 from videocap.tooling import NO_WINDOW
 
@@ -259,7 +259,7 @@ def decode_audio(path: Path, ffmpeg: str, should_stop: Callable[[], bool]) -> Op
         samples = bytearray()
         while chunk := process.stdout.read(1 << 20):
             if should_stop():
-                process.terminate()
+                end_process_tree(process)
                 process.wait()
                 return None
             samples += chunk

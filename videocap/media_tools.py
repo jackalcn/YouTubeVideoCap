@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 from videocap.library import LANGUAGE_SEGMENT_RE, display_size, partial_output_path, probe_media
-from videocap.processes import remove_when_released, start_tied_process
+from videocap.processes import end_process_tree, remove_when_released, start_tied_process
 from videocap.subtitles import format_timestamp_short
 from videocap.textfiles import read_text_file
 from videocap.tooling import format_bytes, get_ffmpeg_status
@@ -946,7 +946,7 @@ def _run_ffmpeg(
     for line in process.stdout:
         if should_stop and should_stop():
             stopped = True
-            process.terminate()
+            end_process_tree(process)
             break
         match = PROGRESS_TIME_RE.match(line.strip())
         if match:

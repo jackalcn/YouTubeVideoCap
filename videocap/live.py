@@ -14,7 +14,7 @@ from typing import IO, Any, Callable, Mapping, Optional, Protocol, cast
 
 from videocap.config import LIVE_MIN_FREE_BYTES, RECORDING_STATUS_PREFIX
 from videocap.media_tools import reserve_output_path
-from videocap.processes import start_tied_process
+from videocap.processes import end_process_tree, start_tied_process
 from videocap.tooling import format_bytes, format_duration, get_free_disk_bytes
 
 
@@ -89,7 +89,7 @@ def finish_recording(ffmpeg: str, recording_path: Path, output_path: Path) -> Pa
     try:
         returncode = process.wait(timeout=REMUX_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        process.kill()
+        end_process_tree(process)
         process.wait()
         remove_if_empty(output_path)
         return recording_path
@@ -221,4 +221,4 @@ def ask_ffmpeg_to_quit(process: subprocess.Popen[bytes]) -> None:
         process.stdin.flush()
         process.wait(timeout=QUIT_WAIT_SECONDS)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        process.terminate()
+        end_process_tree(process)
