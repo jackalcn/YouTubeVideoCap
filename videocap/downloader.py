@@ -63,7 +63,7 @@ from videocap.options import (
     waits_for_live,
     writes_thumbnail,
 )
-from videocap.processes import tie_to_app, tied_popen_options
+from videocap.processes import remove_when_released, tie_to_app, tied_popen_options
 from videocap.sidecars import release_time, set_file_times, write_comments_csv, write_live_chat_csv, write_music_tags, write_nfo
 from videocap.subtitles import READABLE_SUBTITLE_EXTENSIONS, cues_to_srt, cues_to_vtt, cut_cues, read_subtitle_file, write_transcript
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status, get_free_disk_bytes
@@ -960,10 +960,8 @@ def remove_partial_files(paths: list[str], keep: set[str]) -> None:
         if is_unfinished and raw_path not in keep:
             candidates.append(path)
         for candidate in candidates:
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # ffmpeg was killed a moment ago and may still hold the file on Windows.
+            remove_when_released(candidate)
 
 
 def glob_escape(name: str) -> str:

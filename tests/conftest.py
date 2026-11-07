@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import os
+import functools
 import subprocess
 import sys
 import tempfile
@@ -63,3 +65,31 @@ def sample_subtitle(tmp_path_factory: pytest.TempPathFactory) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+@functools.lru_cache(maxsize=1)
+def shortcuts_can_be_saved() -> bool:
+    """Whether this Windows session can save a .lnk through WScript.Shell. GitHub's Windows runners answer "Value does
+    not fall within the expected range" to every Save, so the autostart tests are skipped there."""
+    if sys.platform != "win32":
+        return False
+    with tempfile.TemporaryDirectory(prefix="vc-lnk-") as folder:
+        target = Path(folder) / "probe.lnk"
+        script = (
+            "$ErrorActionPreference = 'Stop'; $s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:VIDEOCAP_PROBE); "
+            "$s.TargetPath = $env:SystemRoot + '\\notepad.exe'; $s.Save()"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                env={**os.environ, "VIDEOCAP_PROBE": str(target)},
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0 and target.exists()
+
+
+needs_shortcuts = pytest.mark.skipif(not shortcuts_can_be_saved(), reason="this Windows session cannot save shortcuts")

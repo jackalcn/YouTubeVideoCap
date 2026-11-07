@@ -17,6 +17,8 @@ from typing import Any, Callable
 
 import pytest
 
+from conftest import shortcuts_can_be_saved
+
 import videocap.tooling as tooling
 
 
@@ -418,7 +420,9 @@ def test_no_tool_opens_a_console_window(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
 # Starting with Windows
 
-windows_only = pytest.mark.skipif(sys.platform != "win32", reason="the Startup folder is Windows'")
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32" or not shortcuts_can_be_saved(), reason="the Startup folder is Windows', and this session must save shortcuts"
+)
 
 
 def read_shortcut(path: Path) -> list[str]:

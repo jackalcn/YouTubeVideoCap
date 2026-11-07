@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import shortcuts_can_be_saved
+
 
 ROOT = Path(__file__).resolve().parents[1]
 # A folder name like the ones people really use: spaces, Chinese and brackets all break careless quoting.
@@ -23,6 +25,8 @@ REQUIREMENTS = "streamlit>=1.57\nyt-dlp[default,deno]\n"
 SH = shutil.which("sh")
 needs_sh = pytest.mark.skipif(SH is None, reason="needs a POSIX shell")
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="start.bat is for Windows")
+# autostart.bat saves a shortcut through WScript.Shell, which GitHub's Windows runners refuse.
+needs_shortcuts = pytest.mark.skipif(not shortcuts_can_be_saved(), reason="this Windows session cannot save shortcuts")
 
 # Stand-ins for the system Python and the one inside .venv. Files in $FAKE_STATE decide how they behave,
 # so a test can make the network fail, the Python too old, or venv lack ensurepip, without installing anything.
@@ -427,6 +431,7 @@ def read_shortcut(path: Path) -> dict[str, str]:
 
 
 @windows_only
+@needs_shortcuts
 def test_autostart_starts_the_app_hidden_at_sign_in_for_this_computer_only(autostart) -> None:
     project, startup, run = autostart
     added = run()
@@ -450,6 +455,7 @@ def test_autostart_starts_the_app_hidden_at_sign_in_for_this_computer_only(autos
 
 
 @windows_only
+@needs_shortcuts
 def test_autostart_refuses_a_folder_with_a_percent_sign(autostart, tmp_path: Path) -> None:
     project, startup, run = autostart
     # The shortcut fills in %NAME% in its target, so it would point elsewhere and the app would never start.
@@ -471,6 +477,7 @@ def test_autostart_refuses_a_folder_with_a_percent_sign(autostart, tmp_path: Pat
 
 
 @windows_only
+@needs_shortcuts
 def test_autostart_refuses_a_folder_too_deep_for_a_shortcut(autostart, tmp_path: Path) -> None:
     project, startup, run = autostart
     # The shortcut object quietly cuts a target past 259 characters, so the app would never start. The folder is made
@@ -494,6 +501,7 @@ def test_autostart_refuses_a_folder_too_deep_for_a_shortcut(autostart, tmp_path:
 
 
 @windows_only
+@needs_shortcuts
 def test_autostart_asks_for_start_bat_first(autostart) -> None:
     project, startup, run = autostart
     shutil.rmtree(project / ".venv")

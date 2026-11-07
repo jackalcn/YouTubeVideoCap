@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 from videocap.library import LANGUAGE_SEGMENT_RE, display_size, partial_output_path, probe_media
-from videocap.processes import start_tied_process
+from videocap.processes import remove_when_released, start_tied_process
 from videocap.subtitles import format_timestamp_short
 from videocap.textfiles import read_text_file
 from videocap.tooling import format_bytes, get_ffmpeg_status
@@ -808,17 +808,19 @@ def run_tool(
     label = TOOL_LABELS.get(request.tool, request.tool)
     progress_ui.progress(0.0, text=f"{label}...")
     try:
-        with tempfile.TemporaryDirectory(prefix="youtube-downloader-tool-") as workdir:
+        # A killed ffmpeg may still hold a work file for a moment, so the folder is removed again below.
+        with tempfile.TemporaryDirectory(prefix="youtube-downloader-tool-", ignore_cleanup_errors=True) as workdir:
             if request.tool in SUBTITLE_TOOLS:
                 copy_subtitle_as_utf8(Path(str(request.params["subtitle_path"])), Path(workdir) / working_subtitle_name(request))
             result = run_tool_commands(request, output_path, ffmpeg, info, workdir, progress_ui, should_stop, inputs)
+        remove_when_released(Path(workdir))
         if result.output_path:
             result.output_path = finish_tool_output(result.output_path)
         else:
-            work_path.unlink(missing_ok=True)
+            remove_when_released(work_path)
         return result
     except OSError as exc:
-        work_path.unlink(missing_ok=True)
+        remove_when_released(work_path)
         return ToolResult(error=f"{label}失敗：{exc}")
 
 

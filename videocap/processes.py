@@ -5,9 +5,12 @@ from __future__ import annotations
 import ctypes
 import os
 import signal
+import shutil
 import subprocess
 import sys
+import time
 import threading
+from pathlib import Path
 from functools import lru_cache
 from typing import Any, Callable, Optional
 
@@ -149,3 +152,22 @@ def _app_job() -> Optional[int]:
             return None
         _job_handle = job
         return job
+
+
+def remove_when_released(path: Path, timeout: float = 3.0) -> bool:
+    """Deletes a file or folder a process that was just killed may still hold. Windows keeps the handle open for a
+    moment after the process ends, and a delete in that moment fails with "being used by another process"."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            return True
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+        except OSError:
+            return False

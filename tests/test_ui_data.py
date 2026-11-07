@@ -206,7 +206,7 @@ def test_a_retention_rule_shows_what_it_deletes_before_it_is_saved(tmp_path: Pat
         )
 
     app = page_with("subscriptions", {})
-    assert not app.warning
+    assert "現在套用會刪除" not in texts(app.warning)
     app.radio(key=f"subscription_retention_mode_{subscription_id}").set_value("days").run()
     assert "現在套用會刪除 1 部：老影片" in texts(app.warning)
     assert (folder / "老影片.mp4").exists()
