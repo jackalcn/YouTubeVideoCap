@@ -1,0 +1,6 @@
+line-length = 140
+target-version = "py311"
+extend-exclude = [".venv", "downloads"]
+
+[lint]
+select = ["E9", "F"]
