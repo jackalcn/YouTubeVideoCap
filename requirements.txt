@@ -2,3 +2,9 @@ streamlit>=1.57
 # curl-cffi is left out on purpose: on Windows it made subtitle downloads fail (curl errors 7 and 77),
 # and it did not avoid YouTube's HTTP 429 on machine-translated tracks.
 yt-dlp[default,deno]
+# On Linux desktops, yt-dlp needs this to read the Chrome, Edge, Brave, Opera or Vivaldi login from the GNOME keyring.
+secretstorage; sys_platform == "linux"
+# Turns Simplified Chinese subtitles into Taiwan Traditional Chinese, with Taiwanese wording.
+opencc>=1.1
+# Deleting from the library or by a subscription's retention rule moves files to the recycle bin, so a slip can be undone.
+send2trash>=1.8

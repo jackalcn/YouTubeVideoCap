@@ -1,0 +1,7 @@
+# Optional: speech recognition subtitles (the 工具 page's 語音辨識 tab). About 125 MB, so it is not in requirements.txt;
+# the 系統 page's 「安裝語音辨識」 button installs it into the running environment. Whisper on CTranslate2, without torch.
+faster-whisper>=1.1
+
+# Optional, for an NVIDIA graphics card: cuBLAS for CUDA 12, about 650 MB, which the 系統 page's 「安裝顯示卡支援」
+# button installs. CTranslate2's Windows and Linux builds need nothing else from CUDA besides the driver.
+# nvidia-cublas-cu12
