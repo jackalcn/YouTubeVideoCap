@@ -695,6 +695,7 @@ def test_a_finished_burn_with_missing_fonts_shows_a_warning(tools_app: Path, mon
     assert len([warning for warning in app.warning if "方框" in warning.value]) == 1
 
 
+@needs_ffmpeg
 def test_subtitle_merge_follows_the_source(tools_app: Path, submitted: list[ToolRequest]) -> None:
     tools_app.mkdir(parents=True)
     for name in ("Alpha clip.mp4", "Alpha clip.en.srt", "Bravo clip.mp4", "Bravo clip.zh-TW.srt"):

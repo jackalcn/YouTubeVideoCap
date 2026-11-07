@@ -351,7 +351,8 @@ def end_ffmpeg(process: subprocess.Popen[Any], output: Optional[Path]) -> None:
         process.kill()
         process.wait(timeout=10)
         if output:
-            output.unlink(missing_ok=True)
+            # Windows can keep the killed process's handle open for a moment longer, so the delete is retried.
+            remove_when_released(output)
     except (OSError, subprocess.TimeoutExpired):
         pass
 
