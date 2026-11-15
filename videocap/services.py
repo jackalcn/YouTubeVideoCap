@@ -35,9 +35,9 @@ from videocap.config import (
     SUBSCRIPTION_CHECK_SECONDS,
     get_data_dir,
 )
-from videocap.downloader import DownloadedItem, DownloadOutcome, empty_outcome, remove_partial_files, run_download
+from videocap.downloader import DownloadedItem, DownloadOutcome, empty_outcome, failed_videos, remove_partial_files, run_download
 from videocap.environment import disable_autostart, enable_autostart
-from videocap.errors import humanize_ytdlp_error, is_network_loss, is_rate_limited
+from videocap.errors import humanize_ytdlp_error, is_network_loss, is_rate_limited, is_unreachable
 from videocap.inspector import list_recent_video_ids
 from videocap.jobs import (
     CANCELED,
@@ -59,6 +59,7 @@ from videocap.media_tools import TOOL_LABELS, ToolRequest, ToolResult, run_tool
 from videocap.notify import NotifyTargets, send_all, send_in_background, target_problems, targets_from_dict
 from videocap.options import AccessLimits, DownloadOptions, LoginSource, NetworkOptions, job_url, options_from_spec
 from videocap.settings import DownloadSettings, JobSpec, job_spec_from_dict
+from videocap.sites import is_youtube_url
 from videocap.storage import (
     LAST_SETTINGS_KEY,
     MAX_CONCURRENT_KEY,
@@ -96,6 +97,9 @@ WINDOW_HOLD_PREFIX = "等待下載時段"
 RATE_LIMIT_HOLD_TEXT = "YouTube 暫時限制請求，稍後自動繼續"
 # Told on the pages and in the notification alike, with the time the queue continues.
 RATE_LIMIT_NOTICE = "YouTube 暫時限制了請求（HTTP 429／要求驗證），佇列已暫停，{clock} 後自動繼續。"
+# Checks run as this machine's owner, who may fetch any site, so a subscription to another site, say from a restored
+# backup, would be such a fetch on a schedule.
+SUBSCRIPTION_YOUTUBE_ONLY_MESSAGE = "訂閱目前只支援 YouTube 頻道與播放清單。"
 ENGINE_LOCK_FILE_NAME = "engine.lock"
 # Between channels when importing many subscriptions, each of which reads its channel from YouTube.
 SUBSCRIPTION_IMPORT_PAUSE_SECONDS = 3.0
@@ -417,7 +421,11 @@ class AppServices:
             # Its uploaded login went when it stopped, and the retry would fail for want of it instead.
             return False
         errors = job_errors([job])
-        if not any(is_network_loss(message) for message in errors) or any(is_rate_limited(message) for message in errors):
+        # Another site that could not be reached at all is most likely a mistyped address, which would only fail
+        # again after every wait. YouTube itself is always there, so for it that is the network.
+        youtube = is_youtube_url(payload.spec.url)
+        lost = [message for message in errors if is_network_loss(message) and (youtube or not is_unreachable(message))]
+        if not lost or any(is_rate_limited(message) for message in errors):
             return False
         delay = AUTO_RETRY_DELAYS_SECONDS[min(job.auto_retries, len(AUTO_RETRY_DELAYS_SECONDS) - 1)]
         job.auto_retries += 1
@@ -429,7 +437,8 @@ class AppServices:
         return True
 
     def retry_failed_videos(self, job: Job, cookie_bytes: Optional[bytes] = None) -> list[Job]:
-        """For a finished playlist with a few failures: queues only those videos instead of the whole playlist again.
+        """For a finished playlist with a few failures: queues only those videos instead of the whole playlist again,
+        each by its own link. See failed_video_specs.
 
         A playlist that needed a login needs it for the retry too: pass the session's cookies, or put them on the job
         first as has_login_for does. The finished job only holds them long enough to hand them on."""
@@ -439,17 +448,14 @@ class AppServices:
         outcome = cast(Optional[DownloadOutcome], job.outcome)
         if job.state != DONE or not isinstance(payload, DownloadPayload) or not outcome or not outcome["failed_ids"]:
             return []
+        specs = failed_video_specs(payload.spec, outcome)
         open_slots = self.open_job_slots(job.owner, payload.limits, job.client)
-        if open_slots is not None and open_slots < len(outcome["failed_ids"]):
+        if open_slots is not None and open_slots < len(specs):
             return []
-        retried: list[Job] = []
-        for video_id in outcome["failed_ids"]:
-            spec = replace(
-                payload.spec, url=f"https://www.youtube.com/watch?v={video_id}", multiple_links=True, playlist_items="", video_ids=[]
-            )
-            retried.append(self.submit_download(spec, job.owner, payload.limits, login, job.batch_id, client=job.client))
+        retried = [self.submit_download(spec, job.owner, payload.limits, login, job.batch_id, client=job.client) for spec in specs]
         outcome["errors"] = []
         outcome["failed_ids"] = []
+        outcome["failed_urls"] = []
         return retried
 
     def forget_owner(self, owner: str, limits: AccessLimits) -> None:
@@ -719,8 +725,12 @@ class AppServices:
             self.storage.update_subscription(subscription_id, last_result=summary)
 
         # Also a playlist that finished only some of its videos: the rest of the queue would meet the same limit.
+        # Another site limiting its own requests says nothing of YouTube's, so that job only fails, as any job does.
         rate_limited = (
-            job.owner == LOCAL_OWNER and job.state in (DONE, FAILED) and any(is_rate_limited(message) for message in job_errors([job]))
+            job.owner == LOCAL_OWNER
+            and job.state in (DONE, FAILED)
+            and is_youtube_url(payload.spec.url)
+            and any(is_rate_limited(message) for message in job_errors([job]))
         )
         if rate_limited:
             self.pause_for_rate_limit(job)
@@ -888,6 +898,8 @@ class AppServices:
 
     def validate_subscription(self, url: str, settings: DownloadSettings, output_dir: str) -> None:
         """Raises ValueError with a message for the person when these settings would make every check fail."""
+        if not is_youtube_url(url):
+            raise ValueError(SUBSCRIPTION_YOUTUBE_ONLY_MESSAGE)
         self.validate_spec(subscription_spec(url, settings, output_dir, 1), AccessLimits())
 
     def check_subscription(self, subscription: Subscription) -> Optional[Job]:
@@ -895,6 +907,10 @@ class AppServices:
         if not self.storage:
             return None
         self.storage.update_subscription(subscription.id, last_checked_at=time.time(), last_result="檢查中...")
+        if not is_youtube_url(subscription.url):
+            # Said like a setting that would make every check fail, and not due again until its next check.
+            self.storage.update_subscription(subscription.id, last_result=f"設定有誤：{SUBSCRIPTION_YOUTUBE_ONLY_MESSAGE}")
+            return None
         for job in self.manager.unfinished_jobs(LOCAL_OWNER):
             payload = job.payload
             if isinstance(payload, DownloadPayload) and payload.spec.subscription_id == subscription.id:
@@ -1111,6 +1127,22 @@ def reset_shared_services() -> None:
         for services in holder.instances.values():
             services.shutdown()
         holder.instances.clear()
+
+
+def failed_video_specs(spec: JobSpec, outcome: DownloadOutcome) -> list[JobSpec]:
+    """What 重試失敗的影片 queues for a job: a job for each failed video's own link. When a link is the job's own, as
+    for one of two videos on a page, or another site's video has none, the job itself runs again instead, keeping what
+    it finished, which also covers every other failed video of it."""
+    own_links = {spec.url, job_url(spec)}
+    links: list[str] = []
+    for video_id, link in failed_videos(outcome):
+        if not link and is_youtube_url(spec.url):
+            # Jobs that finished before the links were kept have only the IDs, which on YouTube are enough.
+            link = f"https://www.youtube.com/watch?v={video_id}"
+        if not link or link in own_links:
+            return [spec.as_resuming()]
+        links.append(link)
+    return [replace(spec, url=link, multiple_links=True, playlist_items="", video_ids=[]) for link in dict.fromkeys(links)]
 
 
 def subscription_depth(url: str, max_items: int) -> int:

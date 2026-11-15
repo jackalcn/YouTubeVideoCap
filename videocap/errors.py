@@ -181,6 +181,11 @@ def is_network_loss(message: str) -> bool:
     return failure_hint(message) in (CONNECTION_LOST_HINT, UNREACHABLE_HINT)
 
 
+def is_unreachable(message: str) -> bool:
+    """The site could not be reached at all, as with a mistyped address, rather than lost during a download."""
+    return failure_hint(message) == UNREACHABLE_HINT
+
+
 def warns_of_missing_js_runtime(warnings: Iterable[str]) -> bool:
     return any(marker in warning.lower() for warning in warnings for marker in JS_RUNTIME_MARKERS)
 

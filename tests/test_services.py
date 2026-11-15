@@ -398,6 +398,64 @@ def test_retry_of_a_partly_failed_playlist_only_fetches_what_failed(services: Ap
     assert fake_run.calls[-1][1].playlist_items == ""
 
 
+OTHER_SITE_LIST = "https://example.com/videos/list"
+
+
+def finished_job_with_failures(services: AppServices, tmp_path: Path, fake_run: FakeRun, spec: JobSpec, **failed: Any) -> Job:
+    fake_run.result = lambda url, options, should_stop: finished_outcome(options.output_dir / "a.mp4", errors=["一部失敗"], **failed)
+    job = services.submit_download(spec, LOCAL_OWNER, AccessLimits())
+    wait_until(lambda: job.state == DONE)
+    fake_run.result = lambda url, options, should_stop: finished_outcome(options.output_dir / "b.mp4")
+    return job
+
+
+def test_retrying_another_sites_failed_videos_uses_their_own_links(services: AppServices, tmp_path: Path, fake_run: FakeRun) -> None:
+    clip = "https://example.com/videos/clip-2"
+    spec = make_spec(tmp_path, url=OTHER_SITE_LIST)
+    job = finished_job_with_failures(services, tmp_path, fake_run, spec, failed_ids=["clip-2"], failed_urls=[clip])
+    retried = services.retry_failed_videos(job)
+    assert len(retried) == 1
+    wait_until(lambda: retried[0].state == DONE)
+    assert fake_run.calls[-1][0] == clip
+    assert job.outcome["failed_ids"] == [] and job.outcome["failed_urls"] == []  # type: ignore[index]
+
+
+def test_retrying_the_one_failed_video_of_a_page_resumes_its_job(services: AppServices, tmp_path: Path, fake_run: FakeRun) -> None:
+    # Two videos on one page: both have the page's link, so the page itself is asked for again.
+    page = "https://example.com/watch/42"
+    spec = make_spec(tmp_path, url=page, playlist_items="1-2")
+    job = finished_job_with_failures(services, tmp_path, fake_run, spec, failed_ids=["clip-b"], failed_urls=[page])
+    retried = services.retry_failed_videos(job)
+    assert len(retried) == 1
+    wait_until(lambda: retried[0].state == DONE)
+    assert retried[0].payload.spec == spec.as_resuming()
+    url, options = fake_run.calls[-1]
+    assert url == page
+    # Keeps the video the page already gave, as 重試 does.
+    assert options.overwrite_existing is False
+
+
+def test_a_failed_video_of_another_site_with_no_known_link_resumes_its_job(services: AppServices, tmp_path: Path, fake_run: FakeRun) -> None:
+    spec = make_spec(tmp_path, url=OTHER_SITE_LIST)
+    job = finished_job_with_failures(services, tmp_path, fake_run, spec, failed_ids=["abcdefghijk"], failed_urls=[""])
+    retried = services.retry_failed_videos(job)
+    assert len(retried) == 1
+    wait_until(lambda: retried[0].state == DONE)
+    # Never a YouTube link made from another site's ID.
+    assert [url for url, _ in fake_run.calls[1:]] == [OTHER_SITE_LIST]
+    assert retried[0].payload.spec == spec.as_resuming()
+
+
+def test_retrying_a_youtube_job_saved_before_failed_links_were_kept(services: AppServices, tmp_path: Path, fake_run: FakeRun) -> None:
+    spec = make_spec(tmp_path, url="https://www.youtube.com/playlist?list=PLabc")
+    job = finished_job_with_failures(services, tmp_path, fake_run, spec, failed_ids=["aaaaaaaaaaa", "bbbbbbbbbbb"])
+    del job.outcome["failed_urls"]  # type: ignore[index]
+    retried = services.retry_failed_videos(job)
+    assert len(retried) == 2
+    wait_until(lambda: all(retry.state == DONE for retry in retried))
+    assert sorted(url for url, _ in fake_run.calls[1:]) == [video("aaaaaaaaaaa"), video("bbbbbbbbbbb")]
+
+
 def test_public_visitors_get_private_folders_and_share_nothing(tmp_path: Path, fake_run: FakeRun, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(services_module, "CLOUD_OUTPUT_ROOT", tmp_path / "public")
     services = AppServices(is_public=True)
@@ -828,6 +886,24 @@ def test_a_check_that_fails_before_it_downloads_anything_does_not_stay_checking(
     subscription = services.storage.get_subscription(subscription_id)
     assert subscription is not None
     assert last_result_of_a_failed_check(services, subscription).startswith("檢查失敗：下載資料夾無法寫入")
+
+
+def test_subscriptions_are_for_youtube_only(services: AppServices, tmp_path: Path, fake_run: FakeRun) -> None:
+    assert services.storage is not None
+    other_site = "https://vimeo.com/channels/staffpicks"
+    with pytest.raises(ValueError, match="訂閱目前只支援 YouTube 頻道與播放清單。"):
+        services.validate_subscription(other_site, DownloadSettings(), str(tmp_path / "out"))
+    # Such a subscription, say from a restored backup, would be checked as this machine's owner: on any site.
+    subscription = subscribe(services, tmp_path, other_site)
+    good = subscribe(services, tmp_path, "https://www.youtube.com/@good")
+    assert services.run_due_subscriptions() == 2
+    saved = services.storage.get_subscription(subscription.id)
+    assert saved is not None and "訂閱目前只支援 YouTube 頻道與播放清單。" in saved.last_result
+    # Not due again at the next tick.
+    assert saved.last_checked_at is not None
+    assert services.check_subscription(subscription) is None
+    assert [job.payload.spec.url for job in services.manager.list_jobs()] == [good.url]
+    assert not any("vimeo" in url for url, _ in fake_run.calls)
 
 
 # Surviving a restart
@@ -1662,6 +1738,29 @@ def test_a_second_limit_inside_the_pause_does_not_lengthen_it(services: AppServi
     assert services.rate_limit_until() == until
 
 
+@pytest.mark.parametrize(("url", "pauses"), [(video("limited0001"), True), ("https://example.com/limited/clip.mp4", False)])
+def test_only_youtubes_rate_limit_pauses_the_queue(
+    services: AppServices, tmp_path: Path, fake_run: FakeRun, monkeypatch: pytest.MonkeyPatch, url: str, pauses: bool
+) -> None:
+    sent: list[str] = []
+    monkeypatch.setattr(services, "_notify", lambda title, message: sent.append(title))
+    limited_or_blocking(fake_run)
+    running = services.submit_download(make_spec(tmp_path, url=video("blocking001")), LOCAL_OWNER, AccessLimits())
+    wait_until(lambda: running.state == RUNNING)
+    failed = services.submit_download(make_spec(tmp_path, url=url), LOCAL_OWNER, AccessLimits())
+    wait_until(lambda: failed.state == FAILED and bool(sent))
+    if pauses:
+        wait_until(lambda: running.state == PAUSED)
+        assert sent == ["下載佇列已暫停"]
+    else:
+        # Another site limiting its own requests says nothing about YouTube: that job just fails, as any job does.
+        time.sleep(0.05)
+        assert running.state == RUNNING and services.rate_limit_until() is None
+        assert sent == ["下載失敗"]
+        assert failed.auto_retries == 0
+    services.manager.cancel(running.id)
+
+
 def test_a_visitors_rate_limit_pauses_nothing(tmp_path: Path, fake_run: FakeRun) -> None:
     # A public host has nobody to press 立即繼續, and each visitor's page shows their own failure.
     limited_or_blocking(fake_run)
@@ -1721,6 +1820,35 @@ def test_only_a_lost_connection_is_retried_by_itself(services: AppServices, tmp_
     time.sleep(0.05)
     assert job.state == FAILED and job.auto_retries == 0
     services.end_rate_limit_pause(AccessLimits())
+
+
+UNREACHABLE = humanize_ytdlp_error("ERROR: <urlopen error [Errno 11001] getaddrinfo failed>")
+OTHER_SITE_CLIP = "https://example.com/clip.mp4"
+
+
+@pytest.mark.parametrize(
+    ("url", "message", "retried"),
+    [
+        (URL, DROPPED, True),
+        (URL, UNREACHABLE, True),
+        (OTHER_SITE_CLIP, DROPPED, True),
+        # Most likely a mistyped address, which would only fail again after three waits.
+        (OTHER_SITE_CLIP, UNREACHABLE, False),
+    ],
+    ids=["youtube-dropped", "youtube-unreachable", "other-site-dropped", "other-site-unreachable"],
+)
+def test_another_site_that_cannot_be_reached_at_all_is_not_retried_by_itself(
+    services: AppServices, tmp_path: Path, fake_run: FakeRun, url: str, message: str, retried: bool
+) -> None:
+    always_failing(fake_run, message)
+    job = services.submit_download(make_spec(tmp_path, url=url), LOCAL_OWNER, AccessLimits())
+    if retried:
+        wait_until(lambda: job.auto_retries == 1 and job.state == QUEUED)
+        services.manager.cancel(job.id)
+    else:
+        wait_until(lambda: job.state == FAILED)
+        time.sleep(0.05)
+        assert job.state == FAILED and job.auto_retries == 0
 
 
 def test_a_visitors_lost_connection_is_left_failed(tmp_path: Path, fake_run: FakeRun) -> None:
