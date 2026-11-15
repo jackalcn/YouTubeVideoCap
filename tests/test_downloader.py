@@ -159,6 +159,42 @@ def test_errors_are_translated_and_failed_videos_identified(fake_ydl: type[FakeY
     assert len(outcome["errors"]) == 1
     assert "影片無法使用" in outcome["errors"][0]
     assert outcome["failed_ids"] == ["abc123def45"]
+    # It failed before it started, so its own link is not known.
+    assert outcome["failed_urls"] == [""]
+
+
+def test_each_failed_video_keeps_its_own_link(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def script(ydl: FakeYDL) -> Any:
+        logger, check = ydl.opts["logger"], ydl.opts["match_filter"]
+        assert check({"id": "clip1", "title": "One", "webpage_url": "https://example.com/one"}, incomplete=False) is None
+        logger.error("ERROR: unable to download video data: HTTP Error 404: Not Found")
+        # A direct link to a file has no page of its own, only the link it was asked for by.
+        assert check({"id": "clip2", "title": "Two", "original_url": "https://example.com/two.mp4"}, incomplete=False) is None
+        logger.error("ERROR: unable to download video data: HTTP Error 500: Internal Server Error")
+        assert check({"id": "clip3", "title": "Three", "webpage_url": "https://example.com/three"}, incomplete=False) is None
+        ydl.opts["post_hooks"][0](str(ydl.finish_video(id="clip3")["filepath"]))
+        logger.error("ERROR: [youtube] abcdefghijk: Video unavailable")
+        return None
+
+    monkeypatch.setattr(FakeYDL, "script", staticmethod(script))
+    outcome = run_download("https://example.com/list", make_options(tmp_path), Progress())
+    assert outcome["failed_ids"] == ["clip1", "clip2", "abcdefghijk"]
+    assert outcome["failed_urls"] == ["https://example.com/one", "https://example.com/two.mp4", ""]
+
+
+def test_an_outcome_saved_before_failed_links_were_kept_still_merges() -> None:
+    from videocap.downloader import merge_outcome
+
+    older: Any = empty_outcome()
+    older["failed_ids"] = ["oldVideo001", "oldVideo002"]
+    del older["failed_urls"]
+    retry = empty_outcome()
+    retry["failed_ids"] = ["oldVideo001", "newVideo001"]
+    retry["failed_urls"] = ["https://www.youtube.com/watch?v=oldVideo001", "https://example.com/new"]
+    merge_outcome(older, retry)
+    assert older["failed_ids"] == ["oldVideo001", "oldVideo002", "newVideo001"]
+    # A link the retry learned fills in one that was unknown.
+    assert older["failed_urls"] == ["https://www.youtube.com/watch?v=oldVideo001", "", "https://example.com/new"]
 
 
 def test_engine_crash_becomes_an_error_message(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -194,14 +230,18 @@ def run_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, info: dict[str, 
     return captured["reason"], outcome
 
 
+# What yt-dlp's YouTube extractor names itself in every entry it fully read.
+YOUTUBE_LIVE = {"title": "Live", "live_status": "is_live", "extractor_key": "Youtube"}
+
+
 def test_live_stream_is_skipped_by_default(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    reason, outcome = run_filter(tmp_path, monkeypatch, {"title": "Live", "live_status": "is_live"})
+    reason, outcome = run_filter(tmp_path, monkeypatch, YOUTUBE_LIVE)
     assert reason and "直播進行中" in reason
     assert outcome["skipped"] == [reason]
 
 
 def test_recording_a_live_stream_needs_ffmpeg(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    reason, _ = run_filter(tmp_path, monkeypatch, {"title": "Live", "live_status": "is_live"}, live_mode="record")
+    reason, _ = run_filter(tmp_path, monkeypatch, YOUTUBE_LIVE, live_mode="record")
     assert reason and "ffmpeg" in reason
 
 
@@ -216,10 +256,11 @@ def test_live_stream_is_recorded_by_the_app_instead_of_yt_dlp(fake_ydl: type[Fak
         return downloader_module.RecordingResult(output_path)
 
     monkeypatch.setattr(downloader_module, "record_live_stream", fake_record)
+    # The job's link is another site's page with the stream embedded: what counts is the extractor that read it.
     reason, outcome = run_filter(
         tmp_path,
         monkeypatch,
-        {"title": "Live", "id": "abc", "live_status": "is_live", "url": "http://live", "ext": "mp4"},
+        {**YOUTUBE_LIVE, "id": "abc", "url": "http://live", "ext": "mp4"},
         live_mode="record",
     )
     # A reason stops yt-dlp's own ffmpeg, which could not be stopped once started.
@@ -229,8 +270,28 @@ def test_live_stream_is_recorded_by_the_app_instead_of_yt_dlp(fake_ydl: type[Fak
     assert len(outcome["items"]) == 1
 
 
+def test_another_sites_live_stream_is_skipped_rather_than_recorded(
+    fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(downloader_module, "get_ffmpeg_status", lambda: (True, "ffmpeg"))
+    recorded: list[Any] = []
+    monkeypatch.setattr(downloader_module, "record_live_stream", lambda *args: recorded.append(args))
+    live = {"title": "Live", "id": "abc", "live_status": "is_live", "url": "http://live", "ext": "mp4", "extractor_key": "TwitchStream"}
+    for incomplete in (False, True):
+        # yt-dlp asks before picking formats too, with the extractor already named.
+        reason, outcome = run_filter(tmp_path, monkeypatch, live, incomplete=incomplete, live_mode="record")
+        assert reason == "Live：目前只支援錄製 YouTube 直播。"
+        assert outcome["skipped"] == [reason]
+        assert outcome["items"] == []
+    assert recorded == []
+    # Even when the person did not ask to record, they hear why it will not be.
+    reason, _ = run_filter(tmp_path, monkeypatch, live)
+    assert reason == "Live：目前只支援錄製 YouTube 直播。"
+
+
 def test_listing_of_a_live_stream_is_not_recorded_until_complete(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(downloader_module, "get_ffmpeg_status", lambda: (True, "ffmpeg"))
+    # A playlist's listing names no extractor yet, so neither a YouTube nor another site's entry is decided here.
     reason, outcome = run_filter(tmp_path, monkeypatch, {"title": "Live", "live_status": "is_live"}, incomplete=True, live_mode="record")
     assert reason is None
     assert outcome["items"] == []
@@ -288,7 +349,7 @@ def test_filters_apply_during_listing(fake_ydl: type[FakeYDL], tmp_path: Path, m
 
 def test_same_reason_is_reported_once(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def script(ydl: FakeYDL) -> Any:
-        info = {"title": "Live", "live_status": "is_live"}
+        info = YOUTUBE_LIVE
         ydl.opts["match_filter"](info, incomplete=True)
         ydl.opts["match_filter"](info, incomplete=False)
         return None
@@ -425,11 +486,53 @@ def test_cutting_sponsors_is_wrapped_for_kept_files(fake_ydl: type[FakeYDL], tmp
     options = make_options(
         tmp_path, embed_metadata=True, sponsorblock_mode="remove", sponsorblock_categories=("sponsor",), overwrite_existing=False
     )
-    download_with_ytdlp("u", options, Progress())
+    download_with_ytdlp("https://youtu.be/abc123def45", options, Progress())
     steps = fake_ydl.instances[0].post_processors["post_process"]
     names = [type(step).__name__ for step in steps]
     assert names == ["CollectDownloadedItemsPP", "KeptFileCutPP", "FFmpegMetadataPP"]
     assert type(steps[1].inner).__name__ == "ModifyChaptersPP"
+
+
+YOUTUBE_ONLY_OPTIONS: dict[str, Any] = {
+    "sponsorblock_mode": "remove",
+    "sponsorblock_categories": ("sponsor",),
+    "save_live_chat": True,
+    "comments_mode": "top",
+    "wait_for_live": True,
+}
+YOUTUBE_ONLY_STEPS = {"SponsorBlock", "SponsorBlockNamesPP", "KeptFileCutPP", "PastStreamChatOnlyPP", "WriteSidecarsPP"}
+
+
+def run_with_youtube_only_options(fake_ydl: type[FakeYDL], monkeypatch: pytest.MonkeyPatch, tmp_path: Path, url: str) -> tuple[Any, FakeYDL, set[str]]:
+    monkeypatch.setattr(downloader_module, "get_ffmpeg_status", lambda: (True, "ffmpeg"))
+    monkeypatch.setattr(FakeYDL, "script", staticmethod(lambda ydl: None))
+    outcome = download_with_ytdlp(url, make_options(tmp_path, **YOUTUBE_ONLY_OPTIONS), Progress())
+    ydl = fake_ydl.instances[0]
+    steps = {type(step).__name__ for added in ydl.post_processors.values() for step in added}
+    steps |= {step["key"] for step in ydl.opts.get("postprocessors") or []}
+    return outcome, ydl, steps
+
+
+def test_youtube_only_options_are_left_out_for_another_site(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, ydl, steps = run_with_youtube_only_options(fake_ydl, monkeypatch, tmp_path, "https://vimeo.com/123456789")
+    assert outcome["notes"] == [
+        "這個網站不支援 SponsorBlock，已略過。",
+        "這個網站不支援另存聊天室紀錄，已略過。",
+        "這個網站不支援另存留言，已略過。",
+        "等待開播只支援 YouTube，已略過。",
+    ]
+    # The comment limit is an argument of YouTube's extractor alone, so another site's would read every comment.
+    assert "getcomments" not in ydl.opts
+    assert "writesubtitles" not in ydl.opts and "wait_for_video" not in ydl.opts
+    assert not steps & YOUTUBE_ONLY_STEPS
+
+
+def test_a_youtube_job_keeps_its_own_options(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, ydl, steps = run_with_youtube_only_options(fake_ydl, monkeypatch, tmp_path, "https://www.youtube.com/watch?v=abc123def45")
+    assert outcome["notes"] == []
+    assert ydl.opts["getcomments"] is True
+    assert "live_chat" in ydl.opts["subtitleslangs"] and "wait_for_video" in ydl.opts
+    assert YOUTUBE_ONLY_STEPS <= steps
 
 
 def test_a_kept_file_cut_with_other_segments_is_left_as_it_is() -> None:
@@ -947,7 +1050,7 @@ class FakeRecorder:
 
 
 def live_entry(video_id: str, **extra: Any) -> dict[str, Any]:
-    return {"title": f"Live {video_id}", "id": video_id, "live_status": "is_live", "url": "http://live", "ext": "mp4", **extra}
+    return {**YOUTUBE_LIVE, "title": f"Live {video_id}", "id": video_id, "url": "http://live", "ext": "mp4", **extra}
 
 
 @pytest.fixture
@@ -1728,8 +1831,23 @@ def test_a_video_refused_again_is_reported_once(offline_youtube: OfflineYouTube,
     assert len(outcome["errors"]) == 1 and "拒絕" in outcome["errors"][0]
     # The 重試失敗的影片 button can now find it, though yt-dlp's message does not name it.
     assert outcome["failed_ids"] == ["forbidVid02"]
+    assert outcome["failed_urls"] == ["https://www.youtube.com/watch?v=forbidVid02"]
     assert offline_youtube.extractions.count("https://www.youtube.com/watch?v=forbidVid02") == 2
     assert outcome["notes"] == []
+
+
+def test_another_sites_403_is_not_retried_as_a_youtube_video(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:
+    url = offline_youtube.add_video("refusedClip", "Refused clip", url="https://vimeo.com/123456789")
+    offline_youtube.refused_unless_client["refusedClip"] = "tv"
+    spec = JobSpec(url=url, settings=DownloadSettings(download_subtitles=False), output_dir=str(tmp_path))
+    log: list[str] = []
+    outcome = run_download(url, options_from_spec(spec, AccessLimits()), Progress(), on_log=log.append)
+    assert outcome["items"] == []
+    assert len(outcome["errors"]) == 1 and "403" in outcome["errors"][0]
+    # Its own link, for 重試失敗的影片: a YouTube link made from its ID would be another video, or none.
+    assert outcome["failed_ids"] == ["refusedClip"] and outcome["failed_urls"] == [url]
+    assert offline_youtube.extractions == [url]
+    assert not any("YouTube 用戶端" in line for line in log)
 
 
 def test_a_chosen_player_client_is_not_replaced(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:

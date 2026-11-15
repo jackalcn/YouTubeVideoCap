@@ -65,6 +65,7 @@ from videocap.options import (
 )
 from videocap.processes import end_process_tree, remove_when_released, tie_to_app, tied_popen_options
 from videocap.sidecars import release_time, set_file_times, write_comments_csv, write_live_chat_csv, write_music_tags, write_nfo
+from videocap.sites import is_youtube_url
 from videocap.subtitles import READABLE_SUBTITLE_EXTENSIONS, cues_to_srt, cues_to_vtt, cut_cues, read_subtitle_file, write_transcript
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status, get_free_disk_bytes
 
@@ -168,6 +169,17 @@ WAIT_LOG_PREFIX = "[wait]"
 WAIT_COUNTDOWN_PREFIX = "[wait] Remaining time"
 # yt-dlp's YouTube extractor says this whenever 優先使用繁體中文標題與說明 is on, which the person asked for.
 HARMLESS_WARNING_RE = re.compile(r'Preferring "[^"]*" translated fields\.')
+# What a link to another site runs without, said once per job. SponsorBlock looks segments up by YouTube's video IDs,
+# the chat replay and the comment limit are arguments of YouTube's extractor alone (another site's extractor would read
+# every comment), and only a YouTube link is waited for.
+OTHER_SITE_SPONSORBLOCK_NOTE = "這個網站不支援 SponsorBlock，已略過。"
+OTHER_SITE_LIVE_CHAT_NOTE = "這個網站不支援另存聊天室紀錄，已略過。"
+OTHER_SITE_COMMENTS_NOTE = "這個網站不支援另存留言，已略過。"
+OTHER_SITE_LIVE_WAIT_NOTE = "等待開播只支援 YouTube，已略過。"
+# Only YouTube's live streams are recorded for now; another site's is skipped with this, after its title.
+OTHER_SITE_LIVE_REASON = "目前只支援錄製 YouTube 直播。"
+# Every YouTube extractor's key starts with this: Youtube, YoutubeTab, YoutubeClip...
+YOUTUBE_EXTRACTOR_PREFIX = "Youtube"
 
 
 class OptionalItemFields(TypedDict, total=False):
@@ -201,6 +213,9 @@ class DownloadOutcome(TypedDict):
     notes: list[str]
     subtitle_note: str
     failed_ids: list[str]
+    # Each failed video's own link, in the order of failed_ids, or "" when unknown. An outcome restored from a job
+    # saved before these were kept has none: read them through failed_videos.
+    failed_urls: list[str]
     archived_skips: int
     partial_paths: list[str]
     stopped: bool
@@ -993,8 +1008,9 @@ def download_with_ytdlp(
 ) -> DownloadOutcome:
     outcome, failures = download_once(url, options, progress_ui, status_ui, should_stop, on_log)
     forbidden = list(dict.fromkeys(video_id for message, video_id in failures if video_id and FORBIDDEN_MARKER in message.lower()))
-    # A client the person picked is a choice to respect, and a stopped job is meant to stop.
-    if not forbidden or options.network.player_client or outcome["stopped"]:
+    # A client the person picked is a choice to respect, and a stopped job is meant to stop. Only YouTube has other
+    # clients to ask, and the retry asks YouTube for the video by its ID.
+    if not forbidden or options.network.player_client or outcome["stopped"] or not is_youtube_url(url):
         return outcome
     if options_for_forbidden_retry(options, outcome) is None:
         return outcome
@@ -1026,7 +1042,7 @@ def download_with_ytdlp(
     # A retried video's first error is replaced by what its retry says; one left without a retry keeps its own.
     retry_errors = outcome["errors"][len(first_errors) :]
     outcome["errors"] = [text for text, (_, video_id) in first_errors if video_id not in retried] + retry_errors
-    outcome["failed_ids"] = [video_id for video_id in outcome["failed_ids"] if video_id not in retried or video_id in still_failed]
+    set_failed_videos(outcome, [video for video in failed_videos(outcome) if video[0] not in retried or video[0] in still_failed])
     if recovered:
         outcome["notes"].append(f"{recovered} 部影片原本被 YouTube 拒絕（HTTP 403），改用其他 YouTube 用戶端後已下載完成。")
     return outcome
@@ -1062,13 +1078,51 @@ def options_for_forbidden_retry(options: DownloadOptions, outcome: DownloadOutco
     )
 
 
+def failed_videos(outcome: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Each failed video's ID with its own link, or "" when that is unknown, as in an outcome saved before the links
+    were kept."""
+    links = list(outcome.get("failed_urls") or [])
+    return [(video_id, links[index] if index < len(links) else "") for index, video_id in enumerate(outcome.get("failed_ids") or [])]
+
+
+def set_failed_videos(outcome: DownloadOutcome, videos: list[tuple[str, str]]) -> None:
+    outcome["failed_ids"] = [video_id for video_id, _ in videos]
+    outcome["failed_urls"] = [link for _, link in videos]
+
+
 def merge_outcome(outcome: DownloadOutcome, retry: DownloadOutcome) -> None:
     outcome["items"].extend(retry["items"])
     outcome["errors"].extend(retry["errors"])
-    outcome["failed_ids"].extend(video_id for video_id in retry["failed_ids"] if video_id not in outcome["failed_ids"])
+    failed = dict(failed_videos(outcome))
+    for video_id, link in failed_videos(retry):
+        # A link the retry learned fills in one that was unknown.
+        failed[video_id] = failed.get(video_id) or link
+    set_failed_videos(outcome, list(failed.items()))
     for key in ("skipped", "warnings", "notes", "partial_paths"):
         outcome[key].extend(entry for entry in retry[key] if entry not in outcome[key])  # type: ignore[literal-required]
     outcome["stopped"] = outcome["stopped"] or retry["stopped"]
+
+
+def without_youtube_only_options(options: DownloadOptions, url: str) -> tuple[DownloadOptions, list[str]]:
+    """Another site's link runs without the options only YouTube offers. Returns the options, with a note for each
+    one that was on and is left out."""
+    if is_youtube_url(url):
+        return options, []
+    changes: dict[str, Any] = {}
+    notes: list[str] = []
+    if options.sponsorblock_mode != "off" and options.sponsorblock_categories:
+        changes.update(sponsorblock_mode="off", sponsorblock_categories=())
+        notes.append(OTHER_SITE_SPONSORBLOCK_NOTE)
+    if options.save_live_chat:
+        changes["save_live_chat"] = False
+        notes.append(OTHER_SITE_LIVE_CHAT_NOTE)
+    if options.comments_mode != "off":
+        changes["comments_mode"] = "off"
+        notes.append(OTHER_SITE_COMMENTS_NOTE)
+    if options.wait_for_live:
+        changes["wait_for_live"] = False
+        notes.append(OTHER_SITE_LIVE_WAIT_NOTE)
+    return replace(options, **changes), notes
 
 
 def download_once(
@@ -1081,6 +1135,7 @@ def download_once(
 ) -> tuple[DownloadOutcome, list[tuple[str, str]]]:
     """One yt-dlp run. Also returns yt-dlp's own error messages with their videos, in the order of the outcome's
     translated ones."""
+    options, notes = without_youtube_only_options(options, url)
     options.output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_available, _ = get_ffmpeg_status()
 
@@ -1101,9 +1156,9 @@ def download_once(
         if should_stop and should_stop():
             raise JobStopped()
 
-    started_videos: list[str] = []
+    # Each started video's own link by its ID, so a failed one can be tried again by itself, from any site.
+    started_videos: dict[str, str] = {}
     lower_quality: list[str] = []
-    notes: list[str] = []
     logged_in = options.login.is_used
 
     def wait_before_next_video(video_id: str) -> None:
@@ -1152,8 +1207,13 @@ def download_once(
             return f"{title}：不在勾選的項目中。"
         reason = entry_filter_reason(info, bool(incomplete), options.filters)
         if not reason and info.get("live_status") == "is_live":
+            extractor = str(info.get("extractor_key") or "")
+            # Decided by the extractor that read the stream, so one embedded in another site's page is still
+            # YouTube's. A playlist's listing names no extractor yet; the entry's own checks do.
+            if not extractor.startswith(YOUTUBE_EXTRACTOR_PREFIX) and (extractor or not incomplete):
+                reason = f"{title}：{OTHER_SITE_LIVE_REASON}"
             # A stream someone waited for is meant to be recorded.
-            if options.live_mode == "skip" and not wanted_wait:
+            elif options.live_mode == "skip" and not wanted_wait:
                 reason = f"{title}：直播進行中，結束後才能下載。"
             elif not ffmpeg_available:
                 reason = f"{title}：錄製直播需要 ffmpeg。"
@@ -1192,8 +1252,8 @@ def download_once(
             wait_before_next_video(video_id)
             if logged_in:
                 LOGIN_PACER.mark()
-            if video_id not in started_videos:
-                started_videos.append(video_id)
+            # A direct link to a file has no page of its own, only the link it was asked for by.
+            started_videos.setdefault(video_id, str(info.get("webpage_url") or info.get("original_url") or ""))
             note_lower_quality(info)
             tracker.start_item(info)
         return reason
@@ -1335,6 +1395,7 @@ def download_once(
         notes.append(WHOLE_VIDEO_CUT_NOTE)
     if warns_of_missing_js_runtime(logger.warnings):
         notes.extend(explain_js_runtime(errors, humanized, lower_quality))
+    failed_ids = list(dict.fromkeys(video_id for _, video_id in failures if video_id))
     outcome: DownloadOutcome = {
         "items": items,
         "errors": humanized,
@@ -1342,7 +1403,9 @@ def download_once(
         "warnings": list(dict.fromkeys(logger.warnings)),
         "notes": list(dict.fromkeys(notes)),
         "subtitle_note": "",
-        "failed_ids": list(dict.fromkeys(video_id for _, video_id in failures if video_id)),
+        "failed_ids": failed_ids,
+        # A video that failed before it started, such as one yt-dlp could not read, has no known link.
+        "failed_urls": [started_videos.get(video_id, "") for video_id in failed_ids],
         "archived_skips": logger.archived_skips,
         "partial_paths": partial_paths,
         "stopped": stopped,
@@ -1557,6 +1620,7 @@ def empty_outcome() -> DownloadOutcome:
         "notes": [],
         "subtitle_note": "",
         "failed_ids": [],
+        "failed_urls": [],
         "archived_skips": 0,
         "partial_paths": [],
         "stopped": False,

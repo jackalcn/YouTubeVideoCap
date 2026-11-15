@@ -92,9 +92,11 @@ class OfflineYouTube:
         formats: Optional[list[dict[str, Any]]] = None,
         subtitles: bool = False,
         thumbnail: bool = False,
+        url: str = "",
         **extra: Any,
     ) -> str:
-        url = f"https://www.youtube.com/watch?v={video_id}"
+        """`url` puts the video on another site instead: extraction is replaced for every site's extractor."""
+        url = url or f"https://www.youtube.com/watch?v={video_id}"
         info: dict[str, Any] = {
             "id": video_id, "title": title, "duration": DURATION, "channel": f"Channel of {video_id}",
             "upload_date": "20260101", "webpage_url": url, "live_status": "not_live",
