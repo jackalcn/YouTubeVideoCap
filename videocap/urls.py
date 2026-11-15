@@ -3,11 +3,13 @@ from __future__ import annotations
 import functools
 import math
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
-from videocap.config import YOUTUBE_EXTRACTORS, YOUTUBE_HOSTS
+from videocap.config import YOUTUBE_EXTRACTORS
+from videocap.sites import HOST_ALIASES, STUDIO_HOST, is_youtube_host, is_youtube_url, link_kind, site_of_url, strip_tracking
 
 
 # Text copied from a chat or web page wraps links in these, so they cannot be part of a usable link.
@@ -19,6 +21,13 @@ BARE_HOST_RE = re.compile(r"^[\w-]+(\.[\w-]+)+/?$")
 EMBEDDED_SCHEME_RE = re.compile(r"(?i)https?://")
 # Video and playlist links are plain ASCII, so the first other character starts text typed right after the link.
 GLUED_TEXT_RE = re.compile(r"[^\x21-\x7e].*", re.S)
+# Another site's link, taken whole: its parameters may hold the commas, semicolons and brackets that TOKEN_SEPARATORS_RE
+# splits at, and a signed link stops working once cut. It ends at the first character that is not plain ASCII, as
+# above, at a quote, a backtick or an angle bracket around it, or where a list's separator is followed by the next link.
+OTHER_LINK_RE = re.compile(r"(?i)https?://(?:(?![,;|]https?://)[\x21\x23-\x3b\x3d\x3f-\x5f\x61-\x7e])+")
+# What a sentence or its brackets leave at the end of a link.
+OTHER_LINK_TRAILING = ".,;:!?'~*"
+CLOSING_BRACKETS = {")": "(", "]": "[", "}": "{"}
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 # "videoseries" and "live_stream" are 11 characters long too, but name a playlist or a channel's stream.
@@ -34,10 +43,8 @@ MISTYPED_ID_RE = re.compile(r"^(?=.*[0-9_-])[A-Za-z0-9_-]{6,}$")
 CHANNEL_ROOT_RE = re.compile(r"^(/(?:@[^/]+|channel/[^/]+|c/[^/]+|user/[^/]+))/?$")
 CHANNEL_PATH_PREFIXES = ("/@", "/channel/", "/c/", "/user/")
 
-# The same pages under another name. One spelling keeps duplicates together, and yt-dlp's clip pattern has no mobile host.
-HOST_ALIASES = {"m.youtube.com": "www.youtube.com", "youtubekids.com": "www.youtube.com", "www.youtubekids.com": "www.youtube.com"}
-STUDIO_HOST = "studio.youtube.com"
 SAME_SITE_HOSTS = frozenset({"youtube.com", "www.youtube.com"})
+# YouTube's own. Other sites may give these names another meaning, so sites.strip_tracking handles their links.
 TRACKING_PARAMETERS = frozenset({"si", "feature", "pp"})
 
 TIMESTAMP_PATTERN = r"(?:\d+:)?\d{1,2}:\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?"
@@ -124,8 +131,7 @@ def normalize_youtube_url(token: str) -> Optional[str]:
         return None
 
     has_tricky_authority = "@" in parsed.netloc or "\\" in candidate
-    known_host = host in YOUTUBE_HOSTS or host in HOST_ALIASES or host == STUDIO_HOST
-    if parsed.scheme not in {"http", "https"} or not known_host or has_tricky_authority or port not in {None, 80, 443}:
+    if parsed.scheme not in {"http", "https"} or not is_youtube_host(host) or has_tricky_authority or port not in {None, 80, 443}:
         return None
 
     # yt-dlp matches links case-sensitively, so a phone's "Youtu.be/..." only works with its host lowercased.
@@ -140,11 +146,14 @@ def normalize_youtube_url(token: str) -> Optional[str]:
 
 
 def extract_video_id(url: str) -> Optional[str]:
+    """The YouTube video a link names. Other sites also have /watch?v= and /embed/ pages, which name no YouTube video."""
     try:
         parsed = urlparse(url)
     except ValueError:
         return None
     host = (parsed.hostname or "").lower()
+    if not is_youtube_host(host):
+        return None
     if host == "youtu.be":
         candidate = parsed.path.strip("/").split("/")[0]
         return candidate if VIDEO_ID_RE.match(candidate) else None
@@ -156,7 +165,9 @@ def extract_video_id(url: str) -> Optional[str]:
 
 
 def classify_youtube_url(url: str) -> str:
-    """Returns video, playlist, channel, or other."""
+    """Returns video, playlist, channel, or other. Another site's link is always other: its paths mean something else."""
+    if not is_youtube_url(url):
+        return "other"
     if extract_video_id(url):
         return "video"
     parsed = urlparse(url)
@@ -168,6 +179,10 @@ def classify_youtube_url(url: str) -> str:
 
 
 def url_identity(url: str, expand_playlist: bool = False) -> str:
+    if not is_youtube_url(url):
+        # Another site's parameters mean whatever that site says, so only the known click trackers are left out.
+        cleaned = urlparse(strip_tracking(url))
+        return f"{cleaned.netloc.lower()}{cleaned.path}?{cleaned.query}#{cleaned.fragment}"
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     # When whole playlists are wanted, a video link that names one asks for that playlist, not for the video.
@@ -188,18 +203,38 @@ def url_identity(url: str, expand_playlist: bool = False) -> str:
     return f"{host}{path}?{kept}"
 
 
-def parse_youtube_urls(raw: str, expand_playlist: bool = False) -> tuple[list[str], list[str]]:
-    """Finds YouTube links in pasted text, dropping duplicates, and returns them with the entries that cannot be used."""
-    urls: dict[str, str] = {}
-    rejected: list[str] = []
-    word_lines: list[list[tuple[str, Optional[str]]]] = []
+@dataclass(frozen=True)
+class ParsedLinks:
+    """What a pasted text holds."""
 
-    def add(url: str) -> None:
-        urls.setdefault(url_identity(url, expand_playlist), url)
+    urls: list[str] = field(default_factory=list)
+    # Entries that look like links or IDs but cannot be used.
+    rejected: list[str] = field(default_factory=list)
+    # Other sites' links from someone who may only download from YouTube.
+    blocked: list[str] = field(default_factory=list)
+    # Links to services whose videos are all encrypted.
+    protected: list[str] = field(default_factory=list)
+    # Ordinary web pages set aside because they came mixed with real video links, such as the links in a description.
+    pages: list[str] = field(default_factory=list)
 
-    # Links from a saved web page keep their HTML escaping, and its ";" would cut "&amp;list=..." off.
-    for line in raw.replace("&amp;", "&").splitlines():
-        found_link = False
+
+class LinkScan:
+    """Collects the links of a pasted text line by line, dropping duplicates and keeping the order they came in."""
+
+    def __init__(self, expand_playlist: bool = False, other_sites: bool = False) -> None:
+        self.expand_playlist = expand_playlist
+        self.other_sites = other_sites
+        self.urls: dict[str, str] = {}
+        self.rejected: list[str] = []
+        self.blocked: list[str] = []
+        self.protected: list[str] = []
+        self.page_links: dict[str, str] = {}
+        self.word_lines: list[list[tuple[str, Optional[str]]]] = []
+
+    def add(self, url: str) -> None:
+        self.urls.setdefault(url_identity(url, self.expand_playlist), url)
+
+    def scan_youtube_line(self, line: str, found_link: bool = False) -> None:
         bare_tokens: list[tuple[str, Optional[str]]] = []
         for raw_token in TOKEN_SEPARATORS_RE.split(line):
             token = strip_leading_text(raw_token.strip(TRAILING_PUNCTUATION))
@@ -209,42 +244,142 @@ def parse_youtube_urls(raw: str, expand_playlist: bool = False) -> tuple[list[st
                 found_link = True
                 url = normalize_youtube_url(token)
                 if url:
-                    add(url)
+                    self.add(url)
                 else:
-                    rejected.append(token)
+                    self.rejected.append(token)
                 continue
             bare_tokens.append((token, expand_bare_token(token)))
 
         # Words around a link are the sentence it was pasted from, even ones shaped like an ID or @handle.
         if found_link or not bare_tokens:
-            continue
+            return
         if all(expanded for _, expanded in bare_tokens):
             for _, expanded in bare_tokens:
-                add(expanded)
+                if expanded:
+                    self.add(expanded)
         else:
-            word_lines.append(bare_tokens)
+            self.word_lines.append(bare_tokens)
 
-    # A line of words is a typo worth reporting when nothing was found; next to links it is the message they came with.
-    for tokens in word_lines:
-        rejected.extend(token for token, expanded in tokens if not urls or (not expanded and MISTYPED_ID_RE.match(token)))
+    def take_other_links(self, line: str) -> tuple[str, bool]:
+        """Handles the links to other sites in a line. Returns the line without them, and whether it had any."""
+        found = False
 
-    return list(urls.values()), rejected
+        def take(match: re.Match[str]) -> str:
+            nonlocal found
+            link = trim_other_link(match.group(0))
+            if is_youtube_url(link):
+                # Left in place for the YouTube rules, which know its many shapes.
+                return match.group(0)
+            found = True
+            self.add_other_link(link)
+            return " "
+
+        return OTHER_LINK_RE.sub(take, line), found
+
+    def add_other_link(self, link: str) -> None:
+        url = normalize_other_url(link)
+        if url is None:
+            self.rejected.append(link)
+        elif not self.other_sites:
+            self.blocked.append(url)
+        elif link_kind(url) == "protected":
+            self.protected.append(url)
+        elif link_kind(url) == "page":
+            self.page_links.setdefault(url_identity(url), url)
+        else:
+            self.add(url)
+
+    def finish(self, include_pages: bool = False) -> ParsedLinks:
+        pages = list(self.page_links.values())
+        # Pages pasted on their own are what the person means to download; among video links they are more likely
+        # the other links of a description, so they wait until asked for.
+        if pages and (include_pages or not self.urls):
+            for url in pages:
+                self.add(url)
+            pages = []
+        # A line of words is a typo worth reporting when nothing was found; next to links it is the message they came with.
+        for tokens in self.word_lines:
+            self.rejected.extend(token for token, expanded in tokens if not self.urls or (not expanded and MISTYPED_ID_RE.match(token)))
+        return ParsedLinks(list(self.urls.values()), self.rejected, self.blocked, self.protected, pages)
+
+
+def trim_other_link(link: str) -> str:
+    """Cuts off what the sentence around a link left at its end: its full stop, or the bracket that closes a pair
+    opened before the link."""
+    while link:
+        last = link[-1]
+        opener = CLOSING_BRACKETS.get(last)
+        if last in OTHER_LINK_TRAILING or (opener and link.count(opener) < link.count(last)):
+            link = link[:-1]
+        else:
+            break
+    return link
+
+
+def normalize_other_url(link: str) -> Optional[str]:
+    """Another site's link as yt-dlp should get it, or None when it is not a usable web address."""
+    try:
+        parsed = urlparse(link)
+        host = parsed.hostname or ""
+        parsed.port
+    except ValueError:
+        return None
+    # A name before "@" is a login, which also lets a link pose as another site's: https://www.youtube.com@example.com/
+    if parsed.scheme.lower() not in {"http", "https"} or not host or "@" in parsed.netloc or "\\" in link:
+        return None
+    if parsed.scheme != parsed.scheme.lower() or parsed.netloc != parsed.netloc.lower():
+        # yt-dlp matches sites case-sensitively.
+        link = urlunparse(parsed._replace(scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower()))
+    return strip_tracking(link)
+
+
+def html_unescaped_lines(raw: str) -> list[str]:
+    # Links from a saved web page keep their HTML escaping, and its ";" would cut "&amp;list=..." off.
+    return raw.replace("&amp;", "&").splitlines()
+
+
+def parse_youtube_urls(raw: str, expand_playlist: bool = False) -> tuple[list[str], list[str]]:
+    """Finds YouTube links in pasted text, dropping duplicates, and returns them with the entries that cannot be used."""
+    scan = LinkScan(expand_playlist)
+    for line in html_unescaped_lines(raw):
+        scan.scan_youtube_line(line)
+    found = scan.finish()
+    return found.urls, found.rejected
+
+
+def parse_links(raw: str, expand_playlist: bool = False, other_sites: bool = False, include_pages: bool = False) -> ParsedLinks:
+    """Finds the links in pasted text. YouTube links are read as parse_youtube_urls reads them. Other sites' links must
+    start with http:// or https://, and are used only when other_sites allows them, which is for this machine's owner:
+    for anyone else they are reported as blocked."""
+    scan = LinkScan(expand_playlist, other_sites)
+    for line in html_unescaped_lines(raw):
+        rest, found = scan.take_other_links(line)
+        scan.scan_youtube_line(rest, found_link=found)
+    return scan.finish(include_pages)
 
 
 def describe_url_counts(urls: list[str], expand_playlist: bool = False) -> str:
     labels = {"video": "部影片", "playlist": "個播放清單", "channel": "個頻道", "other": "個其他連結"}
     counts: dict[str, int] = {}
+    other_sites: dict[str, int] = {}
     for url in urls:
+        if not is_youtube_url(url):
+            site = site_of_url(url)
+            other_sites[site] = other_sites.get(site, 0) + 1
+            continue
         kind = classify_youtube_url(url)
         if expand_playlist and kind == "video" and "list" in parse_qs(urlparse(url).query):
             kind = "playlist"
         counts[kind] = counts.get(kind, 0) + 1
-    return "、".join(f"{counts[kind]} {label}" for kind, label in labels.items() if kind in counts)
+    parts = [f"{counts[kind]} {label}" for kind, label in labels.items() if kind in counts]
+    parts.extend(f"{site} {count} 個連結" for site, count in other_sites.items())
+    return "、".join(parts)
 
 
 def apply_channel_tab(url: str, tab: str) -> str:
     """Points a channel's root URL at one tab; yt-dlp would otherwise walk every tab of the channel."""
-    if tab == "all":
+    # Other sites also have /@name pages, which have no such tabs.
+    if tab == "all" or not is_youtube_url(url):
         return url
     parsed = urlparse(url)
     match = CHANNEL_ROOT_RE.match(parsed.path)

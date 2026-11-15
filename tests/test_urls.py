@@ -6,6 +6,7 @@ import pytest
 import yt_dlp
 
 from videocap.config import YOUTUBE_EXTRACTORS
+from videocap.sites import link_kind, site_label, strip_tracking
 from videocap.urls import (
     apply_channel_tab,
     classify_youtube_url,
@@ -13,9 +14,11 @@ from videocap.urls import (
     extract_video_id,
     format_timestamp,
     parse_date_filter,
+    parse_links,
     parse_time_ranges,
     parse_timestamp,
     parse_youtube_urls,
+    ParsedLinks,
     url_identity,
     validate_playlist_items,
 )
@@ -432,3 +435,191 @@ def test_studio_and_kids_links(text: str, expected: str) -> None:
 )
 def test_other_studio_pages_are_not_videos(bad: str) -> None:
     assert parse_youtube_urls(bad) == ([], [bad])
+
+
+# Other sites
+
+WATCH_LINK = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+SIGNED_LINK = "https://cdn.example.com/v/clip.mp4?Expires=1700000000&Signature=a,b;c(d)~e%2Ff&Key-Pair-Id=K[1]|2"
+
+
+def owner_links(text: str, **options: bool) -> ParsedLinks:
+    return parse_links(text, other_sites=True, **options)
+
+
+def test_the_owner_gets_links_to_other_sites_and_visitors_do_not() -> None:
+    text = f"{WATCH_LINK}\nhttps://vimeo.com/76979871\n{SIGNED_LINK}"
+    assert owner_links(text).urls == [WATCH_LINK, "https://vimeo.com/76979871", SIGNED_LINK]
+    visitor = parse_links(text)
+    assert visitor.urls == [WATCH_LINK]
+    assert visitor.blocked == ["https://vimeo.com/76979871", SIGNED_LINK]
+    assert visitor.rejected == []
+    # The YouTube-only reader the subscriptions page uses is unchanged.
+    assert parse_youtube_urls(text) == ([WATCH_LINK], ["https://vimeo.com/76979871", "https://cdn.example.com/v/clip.mp4?Expires=1700000000&Signature=a"])
+
+
+def test_a_signed_link_keeps_every_character_of_its_parameters() -> None:
+    # Commas, semicolons, brackets and bars are where YouTube's own rules split text.
+    assert owner_links(SIGNED_LINK).urls == [SIGNED_LINK]
+    assert owner_links(f"下載 {SIGNED_LINK} 謝謝").urls == [SIGNED_LINK]
+
+
+@pytest.mark.parametrize(
+    ("link", "cleaned"),
+    [
+        ("https://example.com/a.mp4?utm_source=x&id=7&utm_medium=y", "https://example.com/a.mp4?id=7"),
+        ("https://example.com/a.mp4?fbclid=abc&token=A%2FB+C&gclid=1&igshid=2", "https://example.com/a.mp4?token=A%2FB+C"),
+        ("https://example.com/a.mp4?UTM_Campaign=x", "https://example.com/a.mp4"),
+        # These three are YouTube's trackers; another site may mean something else by them.
+        ("https://example.com/watch?si=1&feature=share&pp=2", "https://example.com/watch?si=1&feature=share&pp=2"),
+        ("https://example.com/a.mp4?b=2&a=1#t=30", "https://example.com/a.mp4?b=2&a=1#t=30"),
+        ("https://example.com/a.mp4", "https://example.com/a.mp4"),
+    ],
+)
+def test_only_known_click_trackers_are_removed_from_other_sites_links(link: str, cleaned: str) -> None:
+    assert strip_tracking(link) == cleaned
+    assert owner_links(link).urls == [cleaned]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://example.com/a.mp4，請看",
+        "https://example.com/a.mp4請看這個",
+        "看這個https://example.com/a.mp4。",
+        "影片（https://example.com/a.mp4）很棒",
+        "「https://example.com/a.mp4」",
+        "https://example.com/a.mp4　下一個",
+        "(https://example.com/a.mp4).",
+        "[影片](https://example.com/a.mp4)",
+        '<a href="https://example.com/a.mp4">影片</a>',
+        "see https://example.com/a.mp4, then reply",
+        "'https://example.com/a.mp4'",
+        "`https://example.com/a.mp4`",
+    ],
+)
+def test_another_sites_link_ends_where_the_text_around_it_begins(text: str) -> None:
+    assert owner_links(text).urls == ["https://example.com/a.mp4"]
+
+
+def test_brackets_that_belong_to_a_link_stay() -> None:
+    link = "https://example.com/wiki/Clip_(2024).mp4"
+    assert owner_links(f"({link})").urls == [link]
+    assert owner_links(link).urls == [link]
+
+
+def test_links_in_a_list_without_spaces_are_separate_links() -> None:
+    found = owner_links(f"https://vimeo.com/1,https://vimeo.com/2;{WATCH_LINK}|https://example.com/b.mp4")
+    assert found.urls == ["https://vimeo.com/1", "https://vimeo.com/2", "https://example.com/b.mp4", WATCH_LINK]
+
+
+@pytest.mark.parametrize("text", ["example.com/a.mp4", "vimeo.com/76979871", "www.example.com/video/1"])
+def test_other_sites_need_the_protocol_written_out(text: str) -> None:
+    # A site's name in a sentence would otherwise become something to download.
+    found = owner_links(text)
+    assert found.urls == [] and found.rejected == [text]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://www.youtube.com@evil.example/watch?v=jNQXAC9IVRw",
+        "https://user:secret@example.com/a.mp4",
+        "https://example.com\\@www.youtube.com/a.mp4",
+        "https:///a.mp4",
+        "https://example.com:port/a.mp4",
+    ],
+)
+def test_a_link_that_hides_its_site_is_refused_for_everyone(bad: str) -> None:
+    for found in (owner_links(bad), parse_links(bad)):
+        assert found.urls == [] and found.blocked == [] and found.rejected
+
+
+def test_other_protocols_are_not_links_to_download() -> None:
+    found = owner_links("ftp://example.com/a.mp4 file:///C:/a.mp4")
+    assert found.urls == [] and len(found.rejected) == 2
+
+
+def test_a_page_alone_is_tried_and_among_video_links_it_waits() -> None:
+    page, article = "https://example.com/watch/page.html", "https://news.example.org/story?id=5"
+    alone = owner_links(f"{page}\n{article}")
+    assert alone.urls == [page, article] and alone.pages == []
+    # The other links of a pasted video description are rarely videos.
+    mixed = owner_links(f"{WATCH_LINK}\n贊助商：{page}\n{article}")
+    assert mixed.urls == [WATCH_LINK] and mixed.pages == [page, article]
+    assert owner_links(f"{WATCH_LINK}\n{page}\n{article}", include_pages=True).urls == [WATCH_LINK, page, article]
+    # A media file or a site yt-dlp knows is not a guess.
+    assert owner_links(f"{page}\nhttps://example.com/a.m3u8").pages == [page]
+    assert owner_links(f"{page}\nhttps://vimeo.com/76979871").pages == [page]
+
+
+def test_services_that_encrypt_everything_are_told_apart() -> None:
+    found = owner_links("https://www.netflix.com/watch/80192098\nhttps://www.disneyplus.com/video/abc\nhttps://vimeo.com/1")
+    assert found.protected == ["https://www.netflix.com/watch/80192098", "https://www.disneyplus.com/video/abc"]
+    assert found.urls == ["https://vimeo.com/1"]
+    # A visitor is only told that other sites are not for them.
+    assert len(parse_links("https://www.netflix.com/watch/80192098").blocked) == 1
+
+
+def test_the_same_link_to_another_site_is_one_link() -> None:
+    found = owner_links("https://vimeo.com/76979871?utm_source=a\nhttps://VIMEO.com/76979871\nhttps://vimeo.com/76979871?fbclid=x")
+    assert found.urls == ["https://vimeo.com/76979871"]
+    # Parameters that are not trackers may name another video.
+    assert len(owner_links("https://example.com/watch?id=1\nhttps://example.com/watch?id=2").urls) == 2
+
+
+def test_youtube_rules_stop_at_youtube() -> None:
+    # Other sites have /watch?v=, ?list= and /@name pages too.
+    assert extract_video_id("https://example.com/watch?v=jNQXAC9IVRw") is None
+    assert extract_video_id("https://example.com/embed/jNQXAC9IVRw") is None
+    assert classify_youtube_url("https://www.tiktok.com/@someone") == "other"
+    assert classify_youtube_url("https://example.com/playlist?list=PLabcdefghijkl") == "other"
+    assert apply_channel_tab("https://www.tiktok.com/@someone", "videos") == "https://www.tiktok.com/@someone"
+    assert url_identity("https://a.example/watch?v=jNQXAC9IVRw") != url_identity("https://b.example/watch?v=jNQXAC9IVRw")
+    assert url_identity("https://a.example/x?list=PL1") != url_identity("https://a.example/y?list=PL1")
+    assert url_identity("https://a.example/x?list=PL1", expand_playlist=True) != url_identity("https://b.example/x?list=PL1", expand_playlist=True)
+    # Two test sites on one machine differ only by their port.
+    assert url_identity("http://127.0.0.1:8001/clip.mp4") != url_identity("http://127.0.0.1:8002/clip.mp4")
+
+
+def test_counts_name_the_other_sites() -> None:
+    urls = [WATCH_LINK, "https://vimeo.com/1", "https://vimeo.com/2", "https://example.com/a.mp4", "https://example.com/page"]
+    assert describe_url_counts(urls) == "1 部影片、Vimeo 2 個連結、example.com（直接連結） 1 個連結、example.com（一般網頁） 1 個連結"
+
+
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        (WATCH_LINK, "youtube"),
+        ("https://youtu.be/jNQXAC9IVRw", "youtube"),
+        ("https://vimeo.com/76979871", "known"),
+        ("https://www.bilibili.com/video/BV1xx411c7mD", "known"),
+        ("https://x.com/someone/status/1234567890", "known"),
+        ("https://example.com/a/clip.MP4?sig=1", "media"),
+        ("https://example.com/live/index.m3u8", "media"),
+        ("https://example.com/watch/page.html", "page"),
+        ("https://www.netflix.com/watch/80192098", "protected"),
+        ("https://www.disneyplus.com/video/abc", "protected"),
+    ],
+)
+def test_link_kinds(url: str, kind: str) -> None:
+    assert link_kind(url) == kind
+
+
+@pytest.mark.parametrize(
+    ("extractor", "url", "label"),
+    [
+        ("Youtube", WATCH_LINK, "YouTube"),
+        ("YoutubeTab", "https://www.youtube.com/@jawed", "YouTube"),
+        ("Vimeo", "https://vimeo.com/1", "Vimeo"),
+        ("BiliBili", "https://www.bilibili.com/video/BV1", "Bilibili"),
+        ("Twitter", "https://x.com/a/status/1", "X（Twitter）"),
+        ("TwitchVod", "https://www.twitch.tv/videos/1", "Twitch"),
+        ("TedTalk", "https://www.ted.com/talks/x", "TedTalk"),
+        ("Generic", "https://cdn.example.com/a.mp4?sig=1", "cdn.example.com（直接連結）"),
+        ("HTML5MediaEmbed", "https://example.com/page.html", "example.com（一般網頁）"),
+        ("Generic", "https://example.com/page.html", "example.com（一般網頁）"),
+    ],
+)
+def test_site_labels(extractor: str, url: str, label: str) -> None:
+    assert site_label(extractor, url) == label
