@@ -426,3 +426,32 @@ def test_inspection_uses_the_chosen_player_client(offline_ydl: type[OfflineYDL])
     report = inspector.inspect_link("https://youtu.be/abcdefghijk", link_options(player_client="web_embedded"))
     assert report["error"] == ""
     assert seen == [["web_embedded"]]
+
+
+@pytest.mark.parametrize("other_sites", [False, True])
+def test_inspection_reaches_other_sites_only_when_its_options_say_so(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, other_sites: bool) -> None:
+    from videocap.options import DownloadOptions
+
+    seen: dict[str, Any] = {}
+
+    class FakeYDL:
+        def __init__(self, opts: dict[str, Any]) -> None:
+            seen.update(opts)
+
+        def __enter__(self) -> FakeYDL:
+            return self
+
+        def __exit__(self, *args: object) -> bool:
+            return False
+
+        def add_post_processor(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def extract_info(self, url: str, download: bool = True) -> dict[str, Any]:
+            raise RuntimeError("nothing is fetched in this test")
+
+    monkeypatch.setattr(inspector.yt_dlp, "YoutubeDL", FakeYDL)
+    options = DownloadOptions(output_dir=tmp_path, output_template="%(title)s.%(ext)s", other_sites=other_sites)
+    report = inspector.inspect_link("https://vimeo.com/76979871", options)
+    assert report["error"]
+    assert seen["allowed_extractors"] == (["default"] if other_sites else YOUTUBE_EXTRACTORS)

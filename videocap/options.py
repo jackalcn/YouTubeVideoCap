@@ -44,6 +44,7 @@ from videocap.config import (
     YOUTUBE_EXTRACTORS,
 )
 from videocap.settings import DownloadSettings, JobSpec
+from videocap.sites import is_youtube_url
 from videocap.urls import apply_channel_tab, parse_date_filter, parse_time_ranges, url_identity, validate_playlist_items
 
 
@@ -171,6 +172,13 @@ class EntryFilters:
     only_ids: frozenset[str] = frozenset()
 
 
+# yt-dlp's generic extractor fetches whatever address it is given. On a shared host a visitor's link could then make
+# the server call machines only it can reach, so links to other sites are for this machine's owner alone.
+OTHER_SITES_OWNER_ONLY_MESSAGE = "這個主機只開放下載 YouTube 的影片。其他網站的連結會讓伺服器連到任意網址，所以只有在自己的電腦上執行時才能下載。"
+# yt-dlp's name for every extractor it enables by default. "all" would also turn on the ones it ships disabled.
+ALL_SITES_EXTRACTORS = ["default"]
+
+
 @dataclass(frozen=True)
 class AccessLimits:
     """What this visitor may do. A public host is shared, so its visitors must not reach the server's files or network settings."""
@@ -271,6 +279,9 @@ class DownloadOptions:
     # Writes a Kodi-style .nfo file (title, plot, aired date, channel) next to each video for Plex, Jellyfin and Kodi.
     # Trusted only, like the media-server folder layout it goes with.
     write_nfo: bool = False
+    # Whether links to sites other than YouTube may be fetched: see OTHER_SITES_OWNER_ONLY_MESSAGE. Off unless
+    # options_from_spec turns it on for this machine's owner, because AccessLimits() itself is trusted by default.
+    other_sites: bool = False
 
 
 class YtDlpLogger(Protocol):
@@ -335,14 +346,16 @@ def build_base_options(
     login: LoginSource,
     network: Optional[NetworkOptions] = None,
     noplaylist: bool = True,
+    other_sites: bool = False,
 ) -> dict[str, Any]:
     network = network or NetworkOptions()
     base_opts: dict[str, Any] = {
         "logger": logger,
         "quiet": True,
         "color": "no_color",
-        # Without this, yt-dlp's generic extractor would fetch any URL the server can reach.
-        "allowed_extractors": YOUTUBE_EXTRACTORS,
+        # Without this, yt-dlp's generic extractor would fetch any URL the server can reach. Only options made for
+        # this machine's owner ask for other sites.
+        "allowed_extractors": ALL_SITES_EXTRACTORS if other_sites else YOUTUBE_EXTRACTORS,
         "noplaylist": noplaylist,
         "retries": retry_count,
         "fragment_retries": retry_count,
@@ -522,7 +535,7 @@ def build_late_postprocessors(options: DownloadOptions, ffmpeg_available: bool) 
 
 
 def build_ydl_options(options: DownloadOptions, ffmpeg_available: bool, logger: YtDlpLogger) -> dict[str, Any]:
-    ydl_opts = build_base_options(logger, options.retry_count, options.login, options.network, options.noplaylist)
+    ydl_opts = build_base_options(logger, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites)
     ydl_opts.update(
         {
             "paths": {"home": str(options.output_dir)},
@@ -720,6 +733,10 @@ def options_from_spec(
     archive_path: Optional[Path] = None,
 ) -> DownloadOptions:
     """Validates a job's settings and turns them into engine options. Raises ValueError with a message for the user."""
+    # Every way a job is checked, inspected, started or started again comes through here, so this one check covers
+    # them all. The extractor list these options carry refuses the link a second time.
+    if not limits.trusted and not is_youtube_url(spec.url):
+        raise ValueError(OTHER_SITES_OWNER_ONLY_MESSAGE)
     settings = spec.settings
     time_ranges = parse_time_ranges(spec.time_ranges or settings.time_ranges)
     # Picked videos are found by ID, so positions must not narrow the list first.
@@ -817,6 +834,7 @@ def options_from_spec(
         wait_for_live=settings.wait_for_live and limits.trusted,
         mtime_upload_date=settings.mtime_upload_date,
         write_nfo=settings.write_nfo and limits.trusted,
+        other_sites=limits.trusted,
     )
 
 

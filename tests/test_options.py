@@ -191,7 +191,8 @@ def test_ydl_options_are_accepted_by_yt_dlp() -> None:
     ydl_opts = build_ydl_options(options, True, YtDlpLogCollector())
     assert ydl_opts["ratelimit"] == int(2.5 * 1024 * 1024)
     assert ydl_opts["source_address"] == "0.0.0.0"
-    assert ydl_opts["allowed_extractors"] == YOUTUBE_EXTRACTORS
+    # Options made for this machine's owner; a visitor's are checked with the other sites' tests below.
+    assert ydl_opts["allowed_extractors"] == ["default"]
     with yt_dlp.YoutubeDL(ydl_opts):  # type: ignore[arg-type]
         pass
 
@@ -222,7 +223,7 @@ def test_public_visitors_cannot_hold_a_slot_by_waiting() -> None:
 def test_login_spacing_leaves_a_public_job_most_of_its_time() -> None:
     # The waits count toward a public job's time limit, because the job holds its download slot and the one login
     # slot while it waits. Each video is waited for at most twice: once before it, and once before its 403 retry.
-    spec = JobSpec(url="u", settings=DownloadSettings(sleep_seconds=3600), output_dir="out", needs_cookie_file=True)
+    spec = JobSpec(url="https://youtu.be/jNQXAC9IVRw", settings=DownloadSettings(sleep_seconds=3600), output_dir="out", needs_cookie_file=True)
     limits = AccessLimits.for_public_host()
     options = options_from_spec(spec, limits, cookie_file=Path("cookies.txt"))
     assert options.wait_range == (10, 10)
@@ -1148,3 +1149,69 @@ def test_fallback_player_clients_need_no_po_token_and_take_cookies() -> None:
         assert INNERTUBE_CLIENTS[client]["SUPPORTS_COOKIES"], client
     # Different from what yt-dlp already tried.
     assert not set(FALLBACK_PLAYER_CLIENTS) & set(yt_dlp.extractor.youtube.YoutubeIE._DEFAULT_CLIENTS)
+
+
+# Other sites are for this machine's owner
+
+
+def test_other_sites_are_fetched_only_for_this_machines_owner(tmp_path: Path) -> None:
+    from videocap.options import ALL_SITES_EXTRACTORS, OTHER_SITES_OWNER_ONLY_MESSAGE
+
+    spec = JobSpec(url="https://vimeo.com/76979871", settings=DownloadSettings(), output_dir=str(tmp_path))
+    owner = options_from_spec(spec, AccessLimits())
+    assert owner.other_sites
+    ydl_opts = build_ydl_options(owner, True, YtDlpLogCollector())
+    assert ydl_opts["allowed_extractors"] == ALL_SITES_EXTRACTORS == ["default"]
+    with yt_dlp.YoutubeDL(ydl_opts):  # type: ignore[arg-type]
+        pass
+
+    with pytest.raises(ValueError) as refused:
+        options_from_spec(spec, AccessLimits.for_public_host())
+    assert str(refused.value) == OTHER_SITES_OWNER_ONLY_MESSAGE and "YouTube" in OTHER_SITES_OWNER_ONLY_MESSAGE
+    # A visitor's YouTube link gets options that reach nothing else.
+    visitor = options_from_spec(replace(spec, url="https://www.youtube.com/watch?v=jNQXAC9IVRw"), AccessLimits.for_public_host())
+    assert not visitor.other_sites
+    assert build_ydl_options(visitor, True, YtDlpLogCollector())["allowed_extractors"] == YOUTUBE_EXTRACTORS
+
+
+def test_options_reach_only_youtube_unless_made_for_the_owner(tmp_path: Path) -> None:
+    from videocap.options import LoginSource, build_base_options
+
+    # AccessLimits() is trusted by default, so the builders themselves must default to YouTube only.
+    assert DownloadOptions(output_dir=tmp_path, output_template="x").other_sites is False
+    assert build_base_options(YtDlpLogCollector(), 1, LoginSource())["allowed_extractors"] == YOUTUBE_EXTRACTORS
+    assert build_base_options(YtDlpLogCollector(), 1, LoginSource(), other_sites=True)["allowed_extractors"] == ["default"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://vimeo.com/76979871",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://localhost:8501/clip.mp4",
+        "https://www.youtube.com@evil.example/watch?v=jNQXAC9IVRw",
+        "https://youtube.com.evil.example/watch?v=jNQXAC9IVRw",
+        "https://evil.example/?next=https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        "file:///etc/passwd",
+        "ytsearch:cats",
+        "",
+    ],
+)
+def test_a_visitors_job_is_refused_unless_its_link_is_youtubes(tmp_path: Path, url: str) -> None:
+    spec = JobSpec(url=url, settings=DownloadSettings(), output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="只開放下載 YouTube"):
+        options_from_spec(spec, AccessLimits.for_public_host())
+
+
+def test_the_owners_own_ytdlp_options_cannot_change_which_sites_are_reached(tmp_path: Path) -> None:
+    from videocap.options import APP_MANAGED_YTDLP_KEYS
+
+    assert "allowed_extractors" in APP_MANAGED_YTDLP_KEYS
+    settings = DownloadSettings(ytdlp_extra_args="--use-extractors generic,youtube")
+    spec = JobSpec(url="https://www.youtube.com/watch?v=jNQXAC9IVRw", settings=settings, output_dir=str(tmp_path))
+    owner = options_from_spec(spec, AccessLimits())
+    assert "allowed_extractors" in owner.extra_ytdlp.ignored and "allowed_extractors" not in owner.extra_ytdlp.params
+    assert build_ydl_options(owner, True, YtDlpLogCollector())["allowed_extractors"] == ["default"]
+    # A visitor's settings never carry extra options at all.
+    visitor = options_from_spec(spec, AccessLimits.for_public_host())
+    assert build_ydl_options(visitor, True, YtDlpLogCollector())["allowed_extractors"] == YOUTUBE_EXTRACTORS

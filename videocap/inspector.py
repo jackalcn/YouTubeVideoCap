@@ -305,7 +305,7 @@ def preview_extension(info: Mapping[str, Any], options: DownloadOptions, ffmpeg_
 def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
     ffmpeg_available, _ = get_ffmpeg_status()
     log = YtDlpLogCollector()
-    opts = build_base_options(log, options.retry_count, options.login, options.network, options.noplaylist)
+    opts = build_base_options(log, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites)
     opts.update(build_format_options(options, ffmpeg_available))
     opts.update(
         {
