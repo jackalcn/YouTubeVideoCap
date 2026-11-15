@@ -65,7 +65,7 @@ from videocap.options import (
 )
 from videocap.processes import end_process_tree, remove_when_released, tie_to_app, tied_popen_options
 from videocap.sidecars import release_time, set_file_times, write_comments_csv, write_live_chat_csv, write_music_tags, write_nfo
-from videocap.sites import is_youtube_url
+from videocap.sites import URL_NAMED_EXTRACTORS, is_youtube_url, url_keyed_id
 from videocap.subtitles import READABLE_SUBTITLE_EXTENSIONS, cues_to_srt, cues_to_vtt, cut_cues, read_subtitle_file, write_transcript
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status, get_free_disk_bytes
 
@@ -99,6 +99,7 @@ POSTPROCESSOR_LABELS = {
     "FixupStretched": "正在修正檔案...",
     "FixupTimestamp": "正在修正檔案...",
     "ScrubText": "正在整理文字...",
+    "UrlKeyedId": "正在整理文字...",
     "CutClipSubtitles": "正在對齊片段字幕...",
     "MetadataParser": "正在整理影片資訊...",
     "MetadataFromField": "正在整理影片資訊...",
@@ -137,6 +138,8 @@ VIDEO_ID_IN_LINK_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/live/)([0-9A-Z
 SIDECAR_PATHS_FIELD = "__videocap_sidecars"
 # Where CollectDownloadedItemsPP put this video's item, for RecordFinalPathPP.
 ITEM_INDEX_FIELD = "__videocap_item_index"
+# Marks a video whose ID UrlKeyedIdPP has already rewritten.
+URL_KEYED_FIELD = "__videocap_url_keyed"
 # YouTube tracks that already are Taiwan Traditional, or close enough that a converted copy would add nothing.
 REAL_TRADITIONAL_TRACKS = frozenset({"zh-tw", "zh-hant"})
 
@@ -567,6 +570,33 @@ class ScrubTextPP(PostProcessor):
         return [], information
 
 
+class UrlKeyedIdPP(PostProcessor):
+    """Gives what a direct link or an ordinary page led to an ID that also says where it was found. yt-dlp names these
+    after the file or the page ("clip", "page-1"), so two sites' clip.mp4 would be one video to the download archive
+    and to the rule that keeps same-named files apart.
+
+    Runs at pre_process, which yt-dlp reaches before it looks a video up in the archive and before it names a file."""
+
+    def run(self, information: Any) -> tuple[list[str], Any]:
+        raw_id = information.get("id")
+        extractor = str(information.get("extractor_key") or "").lower()
+        # A list's flat entries pass through here too, before they have an ID.
+        if not raw_id or extractor not in URL_NAMED_EXTRACTORS or information.get(URL_KEYED_FIELD):
+            return [], information
+        # The link as it was given: a file that redirects to an address with a changing token then keeps its ID, and
+        # with it the partial file a paused download left.
+        page = str(information.get("original_url") or information.get("webpage_url") or "")
+        media = ""
+        if not information.get("direct"):
+            formats = information.get("formats") or [{}]
+            media = str(information.get("url") or formats[0].get("url") or "")
+        information["id"] = url_keyed_id(str(raw_id), page, media)
+        # yt-dlp also looks a video's older, bare names up in the archive, and those are the ones that collide.
+        information["_old_archive_ids"] = []
+        information[URL_KEYED_FIELD] = True
+        return [], information
+
+
 class CutClipSubtitlesPP(PostProcessor):
     """A clip's subtitle file is written for the whole video, so a player that loads it by name would show every
     line early. yt-dlp has written the file by before_dl, and the clip's own range sits in the section fields."""
@@ -965,6 +995,15 @@ def find_file_video_id(path: Path) -> Optional[str]:
     return None
 
 
+def file_came_from(path: Path, link: str) -> bool:
+    """Whether the link the metadata step embedded in an earlier download is this one. Only YouTube's links carry an
+    ID to compare instead; on other sites the same link is the same video."""
+    if not link:
+        return False
+    tags = cast(dict[str, Any], ((probe_media(path) or {}).get("format") or {}).get("tags") or {})
+    return any(str(value) == link for name, value in tags.items() if name.lower() in LINK_TAGS)
+
+
 def remove_partial_files(paths: list[str], keep: set[str]) -> None:
     """Cleans up what a cancelled download left behind: unfinished files and streams still waiting to be merged.
     A complete file is never removed, because it may be a finished video or subtitle the job reported."""
@@ -1194,6 +1233,8 @@ def download_once(
             return
         video_id = str(info.get("id") or "")
         owner = find_file_video_id(existing)
+        if owner is None and file_came_from(existing, str(info.get("webpage_url") or "")):
+            return
         if owner != video_id and not (owner is None and options.resuming):
             info[COLLISION_ID_FIELD] = f" [{video_id}]"
 
@@ -1327,6 +1368,9 @@ def download_once(
         # With skip_download yt-dlp never reaches post_process, and before_dl is the last step it still runs.
         collect_when = "post_process" if has_media else "before_dl"
         ydl.add_post_processor(ScrubTextPP(), when="pre_process")
+        if options.other_sites:
+            # Only these options can reach the extractors whose IDs need it.
+            ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")
         if options.time_ranges and options.download_subtitles:
             ydl.add_post_processor(CutClipSubtitlesPP(), when="before_dl")
         if options.save_live_chat:

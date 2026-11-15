@@ -4,8 +4,9 @@ the other sites yt-dlp knows, from direct links to a media file, and from ordina
 from __future__ import annotations
 
 import functools
+import hashlib
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urldefrag, urlparse, urlunparse
 
 from videocap.config import YOUTUBE_HOSTS
 
@@ -46,6 +47,8 @@ PROTECTED_HOSTS = (
 PROTECTED_EXTRACTOR = "KnownDRM"
 # yt-dlp names what these find after the file or the page, so two sites can give the same name.
 URL_NAMED_EXTRACTORS = frozenset({"generic", "html5mediaembed"})
+# The name part of a URL-keyed ID. yt-dlp's own can be a whole address, and the ID goes into file names.
+URL_KEYED_NAME_LENGTH = 40
 # How the sites people ask for most are shown; yt-dlp's extractor names start with these.
 SITE_NAMES = (
     ("youtube", "YouTube"),
@@ -157,3 +160,23 @@ def site_of_url(url: str) -> str:
     if is_youtube_url(url):
         return "YouTube"
     return site_label(extractor_for(url), url)
+
+
+def url_keyed_id(raw_id: str, page_url: str, media_url: str = "") -> str:
+    """An ID for what a URL-named extractor found, which also says where it was found: "clip" becomes "clip-3f9a1c2e".
+    Two sites' clip.mp4 would otherwise count as one video in the download archive and in file names.
+
+    The same link always gives the same ID, so a download can be continued or recognised later. Click trackers and
+    the part after "#" do not count; a signed link whose signature changed is, to this, another link."""
+    page = urldefrag(strip_tracking(page_url)).url
+    parts = [raw_id, page]
+    try:
+        media_path = urlparse(media_url).path
+        page_path = urlparse(page).path
+    except ValueError:
+        media_path = page_path = ""
+    # Two players on one page can point at files of the same name in different folders.
+    if media_path and media_path != page_path:
+        parts.append(media_path)
+    digest = hashlib.sha1("\n".join(parts).encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"{raw_id[:URL_KEYED_NAME_LENGTH]}-{digest}"

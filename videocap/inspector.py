@@ -15,7 +15,7 @@ from videocap.config import (
     LIVE_CHAT_TRACK,
     NO_LOGIN_COOKIES_MESSAGE,
 )
-from videocap.downloader import YtDlpLogCollector, estimate_size
+from videocap.downloader import UrlKeyedIdPP, YtDlpLogCollector, estimate_size
 from videocap.errors import humanize_ytdlp_error
 from videocap.options import (
     DownloadOptions,
@@ -324,6 +324,9 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
     has_media = options.media_type != "none"
     try:
         with yt_dlp.YoutubeDL(cast(Any, opts)) as ydl:
+            if options.other_sites:
+                # The same ID the download will give a direct link's or a page's video, and so the same file name.
+                ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")
             info = cast(dict[str, Any], ydl.extract_info(url, download=False))
             output_name = ""
             if "entries" not in info and has_media:
