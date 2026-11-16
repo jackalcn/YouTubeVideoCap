@@ -67,9 +67,23 @@ class LocalSite:
         shutil.copyfile(self.media[variant], target)
         return self.url(name)
 
+    def add_rewrapped(self, name: str, variant: str = "a") -> str:
+        """A clip in the container its name says, such as a .mkv: the streams are copied, so no encoder is needed."""
+        target = self.root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.media[variant]), "-c", "copy", str(target)], check=True)
+        return self.url(name)
+
     def add_page(self, name: str = "page.html", sources: tuple[str, ...] = ("clip.mp4",), title: str = "Local page") -> str:
         """An ordinary web page that plays the given files, which must be added too."""
-        players = "".join(f'<video src="{source}" controls></video>' for source in sources)
+        return self.write_page(name, title, "".join(f'<video src="{source}" controls></video>' for source in sources))
+
+    def add_choice_page(self, name: str, sources: tuple[tuple[str, str, int, int], ...], title: str = "Local page") -> str:
+        """A page whose one player offers a video as several files, each a (file, MIME type, width, height)."""
+        offered = "".join(f'<source src="{source}" type="{kind}" width="{width}" height="{height}">' for source, kind, width, height in sources)
+        return self.write_page(name, title, f"<video controls>{offered}</video>")
+
+    def write_page(self, name: str, title: str, players: str) -> str:
         html = f"<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1>{players}</body></html>"
         target = self.root / name
         target.parent.mkdir(parents=True, exist_ok=True)

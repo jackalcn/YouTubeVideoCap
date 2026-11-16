@@ -409,10 +409,10 @@ def test_a_site_that_lists_no_codecs_gets_a_format_table_and_a_summary(offline_y
     report = inspector.inspect_link("https://archive.org/details/oldfilm", link_options())
     assert report["error"] == ""
     assert len(report["format_rows"]) == 3 and all(row["類型"] == "影像" for row in report["format_rows"])
-    # yt-dlp picks the largest picture as one file, which names no codec.
-    assert report["selected_format"] == "304p ogv" and report["selected_size"] == 4062895
+    # One file, which names no codec. The Ogg copy is sharper, but MP4 is the container asked for and there is one.
+    assert report["selected_format"] == "240p mp4" and report["selected_size"] == 4340249
     assert report["resolutions"] == [304, 240]
-    assert report["output_name"] == "Old film.ogv"
+    assert report["output_name"] == "Old film.mp4"
 
 
 def test_a_direct_link_without_a_list_of_formats_is_not_called_unplayable(offline_ydl: type[OfflineYDL]) -> None:

@@ -225,8 +225,8 @@ def test_a_video_from_another_site_downloads_without_the_youtube_only_steps(tmp_
     outcome = download(tmp_path, url=ARCHIVE_VIDEO, sponsorblock_mode="remove", download_subtitles=False)
     item = outcome["items"][0]
     assert item["extractor"] == "archiveorg"
-    # The site's own file is kept as it is (here its sharpest copy is an Ogg video), under the name the preview gave.
-    assert Path(item["path"]).name == preview["output_name"]
+    # The archive's sharpest copy is an Ogg video. MP4 is the container asked for, so its MP4 is taken, as previewed.
+    assert Path(item["path"]).suffix == ".mp4" and Path(item["path"]).name == preview["output_name"]
     assert get_media_duration(Path(item["path"])) == pytest.approx(60, abs=3)
     # SponsorBlock only knows YouTube's videos: it is left out, and the person is told.
     assert OTHER_SITE_SPONSORBLOCK_NOTE in outcome["notes"]

@@ -44,7 +44,7 @@ def spec_options(limits: AccessLimits | None = None, **settings: object) -> Down
 def test_video_prefers_h264_mp4_under_the_quality_cap() -> None:
     options = build_format_options(make_options(max_height=1080), ffmpeg_available=True)
     assert options["format_sort"] == ["res:1080", "fps", "hdr:sdr", "vcodec:h264", "acodec:aac"]
-    assert options["format"] == "bv*+ba/b"
+    assert options["format"] == "bv*+ba/b[ext=mp4]/b"
     assert options["merge_output_format"] == "mp4"
 
 
@@ -74,14 +74,14 @@ def test_webm_container_avoids_h264_and_can_fall_back() -> None:
 
 def test_audio_language_selects_a_dubbed_track_with_fallback() -> None:
     video = build_format_options(make_options(audio_language="ja"), True)
-    assert video["format"] == "bv*+ba[language^=ja]/bv*+ba/b"
+    assert video["format"] == "bv*+ba[language^=ja]/bv*+ba/b[ext=mp4]/b"
     audio = build_format_options(make_options(media_type="audio", audio_format="mp3", audio_language="ja"), True)
     assert audio["format"] == "ba[language^=ja]/ba/b"
 
 
 def test_audio_language_cannot_inject_into_the_selector() -> None:
     options = build_format_options(make_options(audio_language="ja]/b[url!=x"), True)
-    assert options["format"] == "bv*+ba/b"
+    assert options["format"] == "bv*+ba/b[ext=mp4]/b"
 
 
 @pytest.mark.parametrize(
@@ -138,6 +138,68 @@ def test_mp4_and_chosen_formats_are_not_remuxed() -> None:
     assert build_early_postprocessors(make_options(container="mp4"), True) == []
     assert build_early_postprocessors(make_options(container="mkv", format_override="18"), True) == []
     assert build_early_postprocessors(make_options(container="mkv"), False) == []
+
+
+@pytest.mark.parametrize(
+    ("container", "selector"),
+    [("mp4", "bv*+ba/b[ext=mp4]/b"), ("webm", "bv*+ba/b[ext=webm]/b"), ("mkv", "bv*+ba/b")],
+)
+def test_a_single_file_is_asked_for_in_the_chosen_container(container: str, selector: str) -> None:
+    # MKV holds any file, so it asks for the sharpest one and the remuxer does the rest.
+    assert build_format_options(make_options(container=container), True)["format"] == selector
+
+
+def offered(format_id: str, extension: str, width: int = 0, height: int = 0, vcodec: str | None = None, acodec: str | None = None) -> dict[str, Any]:
+    """One of a site's formats. A codec of None is one the site does not name; "none" means the stream is not there."""
+    size = {"width": width, "height": height} if height else {}
+    return {"format_id": format_id, "url": f"http://127.0.0.1/{format_id}.{extension}", "ext": extension, "vcodec": vcodec, "acodec": acodec, **size}
+
+
+# The Internet Archive's shape: whole files, the sharpest not an MP4, and no word about codecs.
+WHOLE_FILES = [offered("ogv", "ogv", 400, 304), offered("mp4", "mp4", 320, 240)]
+NAMED_CODECS = [offered("webm", "webm", 1280, 720, "vp9", "opus"), offered("mp4", "mp4", 640, 360, "avc1.4d401e", "mp4a.40.2")]
+NO_MP4 = [offered("ogv", "ogv", 400, 304), offered("flv", "flv", 320, 240)]
+SEPARATE_STREAMS = [
+    offered("video", "mp4", 1920, 1080, "avc1.640028", "none"),
+    offered("audio", "m4a", vcodec="none", acodec="mp4a.40.2"),
+    offered("whole", "mp4", 640, 360, "avc1.4d401e", "mp4a.40.2"),
+]
+ONLY_AN_MP4 = [offered("18", "mp4", 640, 360, "avc1.42001E", "mp4a.40.2")]
+# With a sound-only file next to the whole ones, yt-dlp takes the sharpest picture before the container is asked about.
+WHOLE_FILES_AND_SOUND = [*NAMED_CODECS, offered("sound", "mp3", vcodec="none", acodec="mp3")]
+
+
+def picked(container: str, formats: list[dict[str, Any]]) -> str:
+    """What yt-dlp itself chooses from a site's formats under the app's options, as "format.extension"."""
+    options = build_format_options(make_options(container=container, max_height=1080), True)
+    video = {"id": "x", "title": "t", "extractor": "test", "extractor_key": "Test", "webpage_url": "http://127.0.0.1/x"}
+    with yt_dlp.YoutubeDL({"quiet": True, "simulate": True, **options}) as ydl:
+        chosen = ydl.process_video_result({**video, "formats": [dict(item) for item in formats]}, download=False)
+    return f"{chosen['format_id']}.{chosen['ext']}"
+
+
+@pytest.mark.parametrize(
+    ("formats", "container", "expected"),
+    [
+        (WHOLE_FILES, "mp4", "mp4.mp4"),
+        (WHOLE_FILES, "mkv", "ogv.ogv"),
+        (NAMED_CODECS, "mp4", "mp4.mp4"),
+        (NAMED_CODECS, "webm", "webm.webm"),
+        # Nothing in the container asked for: the site's own kind of file, the sharpest.
+        (NO_MP4, "mp4", "ogv.ogv"),
+        (WHOLE_FILES, "webm", "ogv.ogv"),
+        # Streams that can be joined still are, and the join makes the container.
+        (SEPARATE_STREAMS, "mp4", "video+audio.mp4"),
+        (SEPARATE_STREAMS, "mkv", "video+audio.mkv"),
+        (ONLY_AN_MP4, "mp4", "18.mp4"),
+        (ONLY_AN_MP4, "webm", "18.mp4"),
+        (WHOLE_FILES_AND_SOUND, "mp4", "webm.webm"),
+    ],
+)
+def test_yt_dlp_takes_a_single_file_by_container_and_still_joins_separate_streams(
+    formats: list[dict[str, Any]], container: str, expected: str
+) -> None:
+    assert picked(container, formats) == expected
 
 
 def test_final_extension_lets_yt_dlp_recognize_a_finished_file() -> None:

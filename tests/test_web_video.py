@@ -10,7 +10,7 @@ import pytest
 
 from conftest import needs_ffmpeg
 from offline_web import LocalSite, new_site_fixture, web_media_fixture  # noqa: F401
-from offline_youtube import duration_of
+from offline_youtube import duration_of, probe
 from videocap.downloader import UrlKeyedIdPP, run_download
 from videocap.inspector import inspect_link
 from videocap.options import AccessLimits, DownloadOptions, options_from_spec
@@ -151,6 +151,52 @@ def test_every_video_of_a_page_gets_its_own_id(new_site: NewSite, tmp_path: Path
     assert all(re.fullmatch(r"both-[12]-[0-9a-f]{8}", video_id) for video_id in ids)
     lines = archive.read_text(encoding="utf-8").splitlines()
     assert sorted(lines) == sorted(f"html5mediaembed {video_id}" for video_id in ids)
+
+
+# A site that offers one video as whole files of more than one kind
+
+OFFERED_FILES = (("big.mkv", "video/x-matroska", 480, 270), ("small.mp4", "video/mp4", 320, 240))
+
+
+def choice_page(site: LocalSite, *only: str) -> str:
+    """A page that offers the sharper clip as big.mkv and the smaller one as small.mp4, or only the files named."""
+    site.add_rewrapped("big.mkv", "b")
+    site.add_clip("small.mp4", "a")
+    return site.add_choice_page("watch.html", tuple(source for source in OFFERED_FILES if not only or source[0] in only))
+
+
+def picture_width(path: Path) -> int:
+    return next(int(stream["width"]) for stream in probe(path)["streams"] if stream["codec_type"] == "video")
+
+
+def test_a_site_that_has_an_mp4_gives_it_even_when_another_file_is_sharper(new_site: NewSite, tmp_path: Path) -> None:
+    url = choice_page(new_site())
+    preview = inspect(url, tmp_path)
+    outcome = download(url, tmp_path)
+    assert outcome["errors"] == []
+    saved = Path(outcome["items"][0]["path"])
+    # MP4 is the output container asked for, and no step would turn the sharper Matroska file into one.
+    assert saved.suffix == ".mp4" and picture_width(saved) == 320
+    assert preview["error"] == "" and preview["output_name"] == saved.name
+
+
+def test_a_site_without_an_mp4_keeps_its_own_kind_of_file(new_site: NewSite, tmp_path: Path) -> None:
+    url = choice_page(new_site(), "big.mkv")
+    outcome = download(url, tmp_path)
+    assert outcome["errors"] == []
+    saved = Path(outcome["items"][0]["path"])
+    assert saved.suffix == ".mkv" and picture_width(saved) == 480
+
+
+def test_the_mkv_container_takes_the_sharpest_file(new_site: NewSite, tmp_path: Path) -> None:
+    url = choice_page(new_site())
+    preview = inspect(url, tmp_path, container="mkv")
+    outcome = download(url, tmp_path, container="mkv")
+    assert outcome["errors"] == []
+    saved = Path(outcome["items"][0]["path"])
+    # MKV holds whatever the site has, so nothing is given up for it.
+    assert saved.suffix == ".mkv" and picture_width(saved) == 480
+    assert preview["output_name"] == saved.name
 
 
 # What is shown before downloading

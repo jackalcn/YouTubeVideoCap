@@ -60,6 +60,10 @@ VIDEO_CODEC_SORT = {
 MERGE_OUTPUT_FORMATS = {"mp4": "mp4", "mkv": "mkv", "webm": "webm/mkv"}
 # merge_output_format does nothing for a video that arrives as a single file, which needs remuxing instead.
 REMUX_TARGETS = {"mkv": "mkv", "webm": "webm>webm/mkv"}
+# A video that comes as one file is asked for in the chosen container first, even when the site's file of another
+# kind is sharper: no step turns a site's Ogg or FLV into an MP4. MKV holds any of them, so it has no entry here
+# and gets the sharpest file, which the remuxer then puts into MKV.
+SINGLE_FILE_SOURCE_FILTERS = {"mp4": "[ext=mp4]", "webm": "[ext=webm]"}
 AUDIO_SOURCE_FILTERS = {"m4a": "[ext=m4a]", "opus": "[acodec^=opus]"}
 # Formats whose bitrate setting has no effect, because they are lossless or kept as they are. M4A and Opus are what
 # YouTube itself serves, and yt-dlp copies a matching source without re-encoding it.
@@ -432,7 +436,8 @@ def build_format_options(options: DownloadOptions, ffmpeg_available: bool) -> di
     if ffmpeg_available:
         audio = f"ba{language}/ba" if language else "ba"
         selectors = [f"bv*+{part}" for part in audio.split("/")]
-        format_opts["format"] = "/".join([*selectors, "b"])
+        single_file = f"b{SINGLE_FILE_SOURCE_FILTERS.get(options.container, '')}"
+        format_opts["format"] = "/".join(dict.fromkeys([*selectors, single_file, "b"]))
         format_opts["merge_output_format"] = MERGE_OUTPUT_FORMATS[options.container]
     else:
         format_opts["format"] = "b[ext=mp4]/b"
