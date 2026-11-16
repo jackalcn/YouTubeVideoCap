@@ -1,6 +1,9 @@
 streamlit>=1.57
-# curl-cffi is left out on purpose: on Windows it made subtitle downloads fail (curl errors 7 and 77),
-# and it did not avoid YouTube's HTTP 429 on machine-translated tracks.
+# curl-cffi, with which yt-dlp connects the way a browser does, is left out on purpose. The public host has no use
+# for it: only this machine's owner downloads from other sites, and installs it from the 系統 page, as
+# "yt-dlp[curl-cffi]". With it yt-dlp sends YouTube's subtitle requests through it, which on Windows once made them
+# fail (curl errors 7 and 77) and did not avoid YouTube's HTTP 429 on machine-translated tracks. The app keeps the
+# package away from YouTube: see videocap/impersonation.py.
 yt-dlp[default,deno]
 # On Linux desktops, yt-dlp needs this to read the Chrome, Edge, Brave, Opera or Vivaldi login from the GNOME keyring.
 secretstorage; sys_platform == "linux"

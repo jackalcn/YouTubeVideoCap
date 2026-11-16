@@ -68,7 +68,7 @@ YOUTUBE_REQUEST_DOMAINS = (
     "google.com",
 )
 
-INSTALL_BUTTON_LABEL = "安裝模擬瀏覽器（下載約 10 MB）"
+INSTALL_BUTTON_LABEL = "安裝模擬瀏覽器（下載不到 10 MB）"
 # What this machine's owner is told to do when a site wants a browser and the app cannot pass for one.
 INSTALL_ADVICE = "請到「系統」頁安裝模擬瀏覽器後再試。"
 SWITCHED_OFF_ADVICE = "模擬瀏覽器目前是停用的，請到「系統」頁啟用後再試。"

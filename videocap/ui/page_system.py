@@ -302,7 +302,7 @@ def render_impersonation(ctx: AppContext) -> None:
     st.caption(
         "有些網站（多半由 Cloudflare 把關）只讓瀏覽器連線，一般的程式會收到 HTTP 403。安裝後，其他網站的連結被這樣拒絕時，"
         "App 會改用瀏覽器的連線方式再試一次。只用在 YouTube 以外的網站；要求真人驗證的網站仍然無法下載。"
-        "需要另外安裝 curl-cffi（約 10 MB），只要裝一次。"
+        "需要另外安裝 curl-cffi（不到 10 MB），只要裝一次。"
     )
     notice = st.session_state.pop(IMPERSONATION_NOTICE_KEY, None)
     if notice is not None:
@@ -358,7 +358,7 @@ def render_impersonation(ctx: AppContext) -> None:
 
 
 def install_impersonation_from_page(ctx: AppContext) -> None:
-    with st.spinner("安裝中，需要下載約 10 MB，可能要一兩分鐘..."):
+    with st.spinner("安裝中，下載不到 10 MB，通常一分鐘內完成..."):
         result = install_impersonation(proxy=network_options(collect_settings(), ctx.limits).proxy)
     if impersonation.problem():
         # The check failed right after the install: the page says so at its top.
