@@ -69,7 +69,8 @@ from videocap.storage import (
     DownloadWindow,
     HistoryEntry,
     Subscription,
-    archive_ids_from_text,
+    YOUTUBE_EXTRACTOR,
+    archive_entries_from_text,
 )
 from videocap.subscription_import import ImportedChannel, subscribed_channel_ids
 from videocap.textfiles import decode_text
@@ -630,14 +631,14 @@ class AppServices:
         self._save_pending_jobs()
 
     def import_download_archive(self, data: bytes, limits: AccessLimits) -> tuple[int, int, int]:
-        """Adds a yt-dlp download archive's YouTube videos to this app's, so they are skipped from now on. Returns how
-        many were new, how many were already there, and how many lines were not YouTube videos."""
+        """Adds a yt-dlp download archive's videos to this app's, so they are skipped from now on. Returns how many
+        were new, how many were already there, and how many lines named no video this app can tell apart."""
         require_owner(limits)
         if not self.storage:
             raise ValueError(OWNER_ONLY_MESSAGE)
-        video_ids, other = archive_ids_from_text(decode_text(data))
-        unique = list(dict.fromkeys(video_ids))
-        added = self.storage.add_to_archive(unique)
+        entries, other = archive_entries_from_text(decode_text(data))
+        unique = list(dict.fromkeys(entries))
+        added = self.storage.add_archive_entries(unique)
         return added, len(unique) - added, other
 
     # Running
@@ -1312,6 +1313,8 @@ def history_rows(outcome: DownloadOutcome, subscription_id: Optional[int] = None
                 "upload_date": item["upload_date"],
                 "thumbnail": item["thumbnail"],
                 "subscription_id": subscription_id,
+                # An item restored from before other sites could be downloaded has none, and was YouTube's.
+                "extractor": item.get("extractor") or YOUTUBE_EXTRACTOR,
             }
         )
     return rows

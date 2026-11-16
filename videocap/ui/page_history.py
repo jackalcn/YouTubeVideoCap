@@ -84,7 +84,7 @@ def render_history_page(ctx: AppContext) -> None:
     render_low_disk_notice()
 
     count, total_size = storage.history_totals()
-    st.caption(f"累計 {count} 個項目，共 {format_bytes(total_size)}；已下載紀錄 {len(storage.archived_video_ids())} 部。")
+    st.caption(f"累計 {count} 個項目，共 {format_bytes(total_size)}；已下載紀錄 {len(storage.archive_entries())} 部。")
 
     search = st.text_input("搜尋標題、頻道或影片 ID", key="keep_history_search")
     entries = storage.list_history(search, limit=HISTORY_TABLE_LIMIT)

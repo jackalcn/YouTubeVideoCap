@@ -469,9 +469,9 @@ def render_backup(ctx: AppContext) -> None:
         if archive is not None and st.button("加入已下載紀錄", key="archive_import_confirm"):
             added, known, other = ctx.services.import_download_archive(archive.getvalue(), ctx.limits)
             if not added and not known:
-                st.error("檔案裡沒有找到 YouTube 影片的紀錄。每行應該像「youtube dQw4w9WgXcQ」。")
+                st.error("檔案裡沒有找到影片的紀錄。每行應該像「youtube dQw4w9WgXcQ」或「vimeo 76979871」。")
             else:
-                message = f"已加入 {added} 部影片" + (f"，{known} 部原本就有" if known else "") + (f"，略過 {other} 行其他網站或無法辨識的內容" if other else "")
+                message = f"已加入 {added} 部影片" + (f"，{known} 部原本就有" if known else "") + (f"，略過 {other} 行無法辨識的內容" if other else "")
                 st.success(message + "。")
 
 

@@ -310,16 +310,18 @@ def test_a_restore_needs_its_own_click_for_each_file() -> None:
 
 def test_a_download_archive_is_imported_from_the_system_page() -> None:
     app = page_with("system", {})
-    upload = "youtube dQw4w9WgXcQ\nsoundcloud 12345\n".encode("utf-8")
+    # Another site's video is kept too. A direct link's bare file name is not: it would match every site's clip.
+    upload = "youtube dQw4w9WgXcQ\nsoundcloud 12345\ngeneric clip\n".encode("utf-8")
     app.file_uploader(key="archive_import_upload").upload("archive.txt", upload, "text/plain").run()
     app.button(key="archive_import_confirm").click().run()
     assert not app.exception, app.exception
-    assert "已加入 1 部影片，略過 1 行" in texts(app.success)
+    assert "已加入 2 部影片，略過 1 行" in texts(app.success)
     assert owner_services().storage.archived_video_ids() == {"dQw4w9WgXcQ"}
+    assert ("soundcloud", "12345") in owner_services().storage.archive_entries()
 
     app.file_uploader(key="archive_import_upload").upload("notes.txt", b"hello\n", "text/plain").run()
     app.button(key="archive_import_confirm").click().run()
-    assert "沒有找到 YouTube 影片的紀錄" in texts(app.error)
+    assert "沒有找到影片的紀錄" in texts(app.error)
 
 
 @pytest.mark.parametrize(
@@ -327,8 +329,8 @@ def test_a_download_archive_is_imported_from_the_system_page() -> None:
     [
         ("youtube dQw4w9WgXcQ\r\nyoutube jNQXAC9IVRw\r\n".encode("utf-16"), "已加入 2 部影片"),
         ("youtube dQw4w9WgXcQ\n# 備註\n".encode("cp950"), "已加入 1 部影片，略過 1 行"),
-        (b"", "沒有找到 YouTube 影片的紀錄"),
-        (b"PK\x03\x04\x00\x00\xff\xfe binary", "沒有找到 YouTube 影片的紀錄"),
+        (b"", "沒有找到影片的紀錄"),
+        (b"PK\x03\x04\x00\x00\xff\xfe binary", "沒有找到影片的紀錄"),
         (b"youtube dQw4w9WgXcQ\n" * 300_000, "已加入 1 部影片"),
     ],
 )

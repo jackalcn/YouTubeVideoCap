@@ -50,6 +50,8 @@ def test_a_direct_link_downloads(new_site: NewSite, tmp_path: Path) -> None:
     assert outcome["errors"] == []
     item = outcome["items"][0]
     assert Path(item["path"]).name == "clip.mp4" and duration_of(Path(item["path"])) == pytest.approx(2, abs=0.3)
+    # Which extractor found it goes into the history with it.
+    assert item["extractor"] == "generic" and item["webpage_url"] == site.url("clip.mp4")
 
 
 def test_a_page_with_a_video_downloads(new_site: NewSite, tmp_path: Path) -> None:
@@ -214,3 +216,29 @@ def test_a_redirecting_file_keeps_its_id_and_two_players_of_one_page_differ() ->
     one = keyed(id="master", extractor_key="Generic", webpage_url=page, formats=[{"url": "https://cdn.example/one/master.m3u8"}])
     two = keyed(id="master", extractor_key="Generic", webpage_url=page, formats=[{"url": "https://cdn.example/two/master.m3u8"}])
     assert one["id"] != two["id"]
+
+
+# What is kept afterwards
+
+
+def test_history_and_the_already_downloaded_check_know_the_site(new_site: NewSite, tmp_path: Path) -> None:
+    from videocap.services import history_rows
+    from videocap.storage import AppStorage
+
+    first, second = new_site(), new_site()
+    first_url, second_url = first.add_clip("clip.mp4", "a"), second.add_clip("clip.mp4", "b")
+    storage = AppStorage(tmp_path / "data")
+    outcome = download(first_url, tmp_path / "out")
+    storage.add_history(history_rows(outcome))
+    entry = storage.list_history()[0]
+    assert entry.site == "generic" and entry.url == first_url
+
+    # The report of the same link finds that download; the other site's file of the same name is new.
+    seen = inspect_link(first_url, owner_options(first_url, tmp_path / "out"))
+    other = inspect_link(second_url, owner_options(second_url, tmp_path / "out"))
+    assert seen["extractor"] == other["extractor"] == "generic"
+    assert seen["site"] == "127.0.0.1（直接連結）"
+    assert storage.find_downloads([seen["video_id"]], seen["extractor"])[seen["video_id"]].path == entry.path
+    assert storage.find_downloads([other["video_id"]], other["extractor"]) == {}
+    # Not to be taken for a YouTube video with that ID.
+    assert storage.find_downloads([seen["video_id"]]) == {}

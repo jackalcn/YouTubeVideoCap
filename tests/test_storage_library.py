@@ -174,8 +174,8 @@ def test_adding_to_the_archive_reads_it_once(tmp_path: Path, monkeypatch: pytest
     storage = AppStorage(tmp_path)
     storage.add_to_archive([f"old{index}" for index in range(100)])
     reads: list[int] = []
-    original = storage.archived_video_ids
-    monkeypatch.setattr(storage, "archived_video_ids", lambda: (reads.append(1), original())[1])
+    original = storage.archive_entries
+    monkeypatch.setattr(storage, "archive_entries", lambda: (reads.append(1), original())[1])
     assert storage.add_to_archive([f"new{index}" for index in range(150)]) == 150
     assert len(reads) == 1
 
@@ -564,3 +564,93 @@ def test_a_download_archive_from_yt_dlp_is_read() -> None:
 
     text = "youtube dQw4w9WgXcQ\nYoutube jNQXAC9IVRw\n\nvimeo 123456\nyoutube too-short\nyoutube dQw4w9WgXcQ\n"
     assert archive_ids_from_text(text) == (["dQw4w9WgXcQ", "jNQXAC9IVRw", "dQw4w9WgXcQ"], 2)
+
+
+# Other sites
+
+
+def test_history_says_which_site_a_download_came_from(tmp_path: Path) -> None:
+    storage = AppStorage(tmp_path)
+    storage.add_history(
+        [
+            history_entry("12345", "From Vimeo", extractor="vimeo", path="v.mp4"),
+            history_entry("12345", "From another site", extractor="dailymotion", path="d.mp4"),
+            history_entry("jNQXAC9IVRw", "From YouTube", path="y.mp4"),
+        ]
+    )
+    by_title = {entry.title: entry for entry in storage.list_history()}
+    assert by_title["From Vimeo"].site == "vimeo" and by_title["From YouTube"].site == "youtube"
+    # Two sites can give their videos the same ID.
+    assert storage.find_downloads(["12345"], "vimeo")["12345"].title == "From Vimeo"
+    assert storage.find_downloads(["12345"], "Dailymotion")["12345"].title == "From another site"
+    assert storage.find_downloads(["12345"]) == {}
+    assert storage.find_downloads(["jNQXAC9IVRw"])["jNQXAC9IVRw"].title == "From YouTube"
+    assert storage.find_by_paths(["v.mp4", "y.mp4", "missing.mp4", ""]) == {"v.mp4": by_title["From Vimeo"], "y.mp4": by_title["From YouTube"]}
+
+
+def test_a_database_from_before_other_sites_gains_the_column_and_its_rows_are_youtubes(tmp_path: Path) -> None:
+    old = sqlite3.connect(tmp_path / "videocap.sqlite3")
+    old.executescript(
+        """
+        CREATE TABLE history (id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0,
+            quality TEXT NOT NULL DEFAULT '', duration REAL, upload_date TEXT NOT NULL DEFAULT '', thumbnail TEXT NOT NULL DEFAULT '',
+            finished_at REAL NOT NULL, subscription_id INTEGER);
+        INSERT INTO history (video_id, title, path, finished_at) VALUES ('jNQXAC9IVRw', 'Old download', 'old.mp4', 1.0);
+        """
+    )
+    old.commit()
+    old.close()
+    storage = AppStorage(tmp_path)
+    entry = storage.list_history()[0]
+    assert entry.extractor == "" and entry.site == "youtube"
+    assert storage.find_downloads(["jNQXAC9IVRw"])["jNQXAC9IVRw"].title == "Old download"
+    storage.add_history([history_entry("777", "New", extractor="vimeo", path="new.mp4")])
+    assert storage.find_downloads(["777"], "vimeo")["777"].title == "New"
+    # Opening it again changes nothing.
+    assert len(AppStorage(tmp_path).list_history()) == 2
+
+
+def test_the_archive_holds_any_sites_videos(tmp_path: Path) -> None:
+    storage = AppStorage(tmp_path)
+    storage.add_to_archive(["jNQXAC9IVRw"])
+    # What yt-dlp itself appends after downloading from other sites; an ID from a page can hold spaces.
+    with storage.archive_path.open("a", encoding="utf-8") as archive:
+        archive.write("vimeo 76979871\ngeneric clip-3f9a1c2e\nhtml5mediaembed My page-1-0a1b2c3d\n\nVimeo 5\n")
+    assert storage.archive_entries() == {
+        ("youtube", "jNQXAC9IVRw"),
+        ("vimeo", "76979871"),
+        ("generic", "clip-3f9a1c2e"),
+        ("html5mediaembed", "My page-1-0a1b2c3d"),
+        ("vimeo", "5"),
+    }
+    # Subscriptions and retention rules deal in YouTube videos only.
+    assert storage.archived_video_ids() == {"jNQXAC9IVRw"}
+    assert storage.add_archive_entries([("vimeo", "76979871"), ("vimeo", "9"), ("vimeo", "9")]) == 1
+    assert storage.add_to_archive(["jNQXAC9IVRw", "dQw4w9WgXcQ"]) == 1
+    assert storage.archive_path.read_text(encoding="utf-8").endswith("vimeo 9\nyoutube dQw4w9WgXcQ\n")
+
+
+def test_an_archive_from_elsewhere_brings_other_sites_videos_but_no_bare_file_names() -> None:
+    from videocap.storage import archive_entries_from_text, archive_ids_from_text
+
+    text = "\n".join(
+        [
+            "youtube jNQXAC9IVRw",
+            "vimeo 76979871",
+            "BiliBili BV1xx411c7mD",
+            # yt-dlp's own name for a direct link: every site's clip.mp4 would match it.
+            "generic clip",
+            "html5mediaembed page-1",
+            # The app's own IDs say which link they came from.
+            "generic clip-3f9a1c2e",
+            "youtube short",
+            "hello world",
+            "",
+            "vimeo",
+        ]
+    )
+    entries, other = archive_entries_from_text(text)
+    assert entries == [("youtube", "jNQXAC9IVRw"), ("vimeo", "76979871"), ("bilibili", "BV1xx411c7mD"), ("generic", "clip-3f9a1c2e")]
+    assert other == 5
+    assert archive_ids_from_text(text) == (["jNQXAC9IVRw"], 8)

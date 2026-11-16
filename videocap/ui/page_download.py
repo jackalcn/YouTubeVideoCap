@@ -32,6 +32,7 @@ from videocap.jobs import ACTIVE_STATES, DONE, Job
 from videocap.options import LoginSource, job_url, network_options, options_from_spec
 from videocap.services import temporary_cookie_file
 from videocap.settings import SETTING_KEY_PREFIX, JobSpec
+from videocap.storage import YOUTUBE_EXTRACTOR
 from videocap.textfiles import decode_text
 from videocap.tooling import format_bytes, get_free_disk_bytes
 from videocap.ui.common import (
@@ -281,7 +282,8 @@ def already_downloaded_note(ctx: AppContext, report: LinkReport) -> Optional[str
     storage = ctx.services.storage
     if not (ctx.trusted and storage and report.get("video_id")):
         return None
-    found = storage.find_downloads([report["video_id"]]).get(report["video_id"])
+    # Two sites can use the same ID, so the site is part of the question.
+    found = storage.find_downloads([report["video_id"]], report.get("extractor") or YOUTUBE_EXTRACTOR).get(report["video_id"])
     if not found:
         return None
     return f"這部影片在 {format_local_time(found.finished_at)} 下載過：{found.path}"

@@ -191,6 +191,8 @@ class OptionalItemFields(TypedDict, total=False):
 
     # When the video went online, to the second.
     timestamp: Optional[float]
+    # The yt-dlp extractor that found it, in lower case as in the download archive: "youtube", "vimeo", "generic".
+    extractor: str
 
 
 class DownloadedItem(OptionalItemFields):
@@ -456,6 +458,7 @@ def item_from_info(
         "thumbnail": str(information.get("thumbnail") or ""),
         "quality": describe_item_quality(information) if path else "",
         "timestamp": information.get("timestamp"),
+        "extractor": str(information.get("extractor_key") or "").lower(),
     }
 
 

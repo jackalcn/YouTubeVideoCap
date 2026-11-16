@@ -1428,9 +1428,11 @@ def test_a_download_archive_from_another_program_is_added(services: AppServices)
     assert services.storage is not None
     services.storage.add_to_archive(["jNQXAC9IVRw"])
     # Notepad's "Unicode" with a BOM, as a Windows tool may have saved it.
-    data = "youtube dQw4w9WgXcQ\r\nyoutube jNQXAC9IVRw\r\nvimeo 76979871\r\n".encode("utf-16")
-    assert services.import_download_archive(data, AccessLimits()) == (1, 1, 1)
+    data = "youtube dQw4w9WgXcQ\r\nyoutube jNQXAC9IVRw\r\nvimeo 76979871\r\ngeneric clip\r\n".encode("utf-16")
+    # Another site's video comes along; a direct link's bare file name would match every site's file of that name.
+    assert services.import_download_archive(data, AccessLimits()) == (2, 1, 1)
     assert services.storage.archived_video_ids() == {"dQw4w9WgXcQ", "jNQXAC9IVRw"}
+    assert services.storage.archive_entries() == {("youtube", "dQw4w9WgXcQ"), ("youtube", "jNQXAC9IVRw"), ("vimeo", "76979871")}
 
 
 def test_a_tool_jobs_warning_survives_a_restart(tmp_path: Path) -> None:

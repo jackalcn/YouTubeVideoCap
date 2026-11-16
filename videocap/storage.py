@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import functools
 import re
 import shlex
 import sqlite3
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Generator, Iterable, Optional
 
 from videocap.settings import DownloadSettings, settings_from_dict
+from videocap.sites import URL_NAMED_EXTRACTORS, dedicated_extractors
 
 
 SCHEMA = """
@@ -33,7 +35,10 @@ CREATE TABLE IF NOT EXISTS history (
     thumbnail TEXT NOT NULL DEFAULT '',
     finished_at REAL NOT NULL,
     -- The subscription whose check downloaded it, so its retention rule knows which files are its own.
-    subscription_id INTEGER
+    subscription_id INTEGER,
+    -- The yt-dlp extractor that found the video, in lower case, such as "vimeo". Empty means YouTube: rows from
+    -- before other sites could be downloaded have none.
+    extractor TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS history_video_id ON history (video_id);
 CREATE INDEX IF NOT EXISTS history_finished_at ON history (finished_at);
@@ -91,12 +96,17 @@ SECRET_YTDLP_OPTIONS = frozenset(
     }
 )
 YOUTUBE_ID_RE = re.compile(r"[0-9A-Za-z_-]{11}")
+# What yt-dlp's archive and the history call YouTube's videos.
+YOUTUBE_EXTRACTOR = "youtube"
+# The end of an ID the app made from a link: see sites.url_keyed_id.
+URL_KEYED_ID_RE = re.compile(r"-[0-9a-f]{8}$")
 NOT_A_BACKUP_MESSAGE = "這不是這個 App 的備份檔。請選擇「備份全部資料」下載的 .zip 檔。"
 DAMAGED_BACKUP_MESSAGE = "備份裡的資料庫已損壞，沒有還原。請改用其他備份檔。"
 # A file that is not a database, or one whose pages are broken. Errors such as a locked database pass by themselves.
 DAMAGED_DATABASE_ERRORS = frozenset({"SQLITE_NOTADB", "SQLITE_CORRUPT"})
 HISTORY_COLUMNS = (
-    "video_id", "title", "channel", "url", "path", "size_bytes", "quality", "duration", "upload_date", "thumbnail", "subscription_id"
+    "video_id", "title", "channel", "url", "path", "size_bytes", "quality", "duration", "upload_date", "thumbnail", "subscription_id",
+    "extractor",
 )
 EDITABLE_SUBSCRIPTION_FIELDS = frozenset(
     {"title", "settings", "output_dir", "max_items", "interval_hours", "enabled", "last_checked_at", "last_result", "keep_latest", "keep_days"}
@@ -104,7 +114,7 @@ EDITABLE_SUBSCRIPTION_FIELDS = frozenset(
 NULLABLE_HISTORY_COLUMNS = frozenset({"duration", "subscription_id"})
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an older database's tables as they were.
 ADDED_COLUMNS = {
-    "history": {"subscription_id": "INTEGER"},
+    "history": {"subscription_id": "INTEGER", "extractor": "TEXT NOT NULL DEFAULT ''"},
     "subscriptions": {"keep_latest": "INTEGER NOT NULL DEFAULT 0", "keep_days": "INTEGER NOT NULL DEFAULT 0"},
 }
 
@@ -124,6 +134,12 @@ class HistoryEntry:
     thumbnail: str
     finished_at: float
     subscription_id: Optional[int] = None
+    extractor: str = ""
+
+    @property
+    def site(self) -> str:
+        """The extractor the video came through; rows written before other sites existed have none."""
+        return self.extractor or YOUTUBE_EXTRACTOR
 
 
 @dataclass
@@ -314,8 +330,9 @@ class AppStorage:
             rows = connection.execute(query, parameters).fetchall()
         return [HistoryEntry(**known_columns(row, HistoryEntry)) for row in rows]
 
-    def find_downloads(self, video_ids: Iterable[str]) -> dict[str, HistoryEntry]:
-        """Returns the latest download of each video, so a report can say it is already on disk."""
+    def find_downloads(self, video_ids: Iterable[str], extractor: str = YOUTUBE_EXTRACTOR) -> dict[str, HistoryEntry]:
+        """Returns the latest download of each of a site's videos, so a report can say it is already on disk. Two
+        sites can use the same ID, so the site is part of the question."""
         ids = [video_id for video_id in dict.fromkeys(video_ids) if video_id]
         if not ids:
             return {}
@@ -324,7 +341,22 @@ class AppStorage:
             rows = connection.execute(
                 f"SELECT * FROM history WHERE video_id IN ({placeholders}) ORDER BY finished_at ASC, id ASC", ids
             ).fetchall()
-        return {row["video_id"]: HistoryEntry(**known_columns(row, HistoryEntry)) for row in rows}
+        entries = [HistoryEntry(**known_columns(row, HistoryEntry)) for row in rows]
+        return {entry.video_id: entry for entry in entries if entry.site == (extractor.lower() or YOUTUBE_EXTRACTOR)}
+
+    def find_by_paths(self, paths: Iterable[str]) -> dict[str, HistoryEntry]:
+        """The download each file came from, for the files that have one."""
+        wanted = [path for path in dict.fromkeys(paths) if path]
+        found: dict[str, HistoryEntry] = {}
+        with self._connect() as connection:
+            # In chunks: SQLite limits how many values one query may name.
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = connection.execute(f"SELECT * FROM history WHERE path IN ({placeholders}) ORDER BY finished_at ASC, id ASC", chunk)
+                for row in rows.fetchall():
+                    found[row["path"]] = HistoryEntry(**known_columns(row, HistoryEntry))
+        return found
 
     def subscription_history(self, subscription_id: int) -> list[HistoryEntry]:
         """What a subscription's checks downloaded, newest first."""
@@ -407,20 +439,33 @@ class AppStorage:
 
     # Download archive
 
-    def archived_video_ids(self) -> set[str]:
-        """yt-dlp's archive file holds one "youtube <id>" per line."""
+    def archive_entries(self) -> set[tuple[str, str]]:
+        """yt-dlp's archive file holds one "<extractor> <id>" per line, such as "youtube jNQXAC9IVRw". Only the first
+        space separates the two: an ID taken from a web page can hold spaces."""
         if not self.archive_path.exists():
             return set()
-        lines = self.archive_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return {line.split()[1] for line in lines if len(line.split()) == 2}
+        entries: set[tuple[str, str]] = set()
+        for line in self.archive_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            extractor, _, video_id = line.strip().partition(" ")
+            if extractor and video_id:
+                entries.add((extractor.lower(), video_id))
+        return entries
+
+    def archived_video_ids(self) -> set[str]:
+        """The YouTube videos in the archive, which is what subscriptions and retention rules deal in."""
+        return {video_id for extractor, video_id in self.archive_entries() if extractor == YOUTUBE_EXTRACTOR}
+
+    def add_archive_entries(self, entries: Iterable[tuple[str, str]]) -> int:
+        existing = self.archive_entries()
+        new_entries = [entry for entry in dict.fromkeys(entries) if entry not in existing]
+        if new_entries:
+            with self._write_lock, self.archive_path.open("a", encoding="utf-8") as archive:
+                archive.writelines(f"{extractor} {video_id}\n" for extractor, video_id in new_entries)
+        return len(new_entries)
 
     def add_to_archive(self, video_ids: Iterable[str]) -> int:
-        existing = self.archived_video_ids()
-        new_ids = [video_id for video_id in dict.fromkeys(video_ids) if video_id not in existing]
-        if new_ids:
-            with self._write_lock, self.archive_path.open("a", encoding="utf-8") as archive:
-                archive.writelines(f"youtube {video_id}\n" for video_id in new_ids)
-        return len(new_ids)
+        """Records YouTube videos as downloaded."""
+        return self.add_archive_entries((YOUTUBE_EXTRACTOR, video_id) for video_id in video_ids)
 
     def clear_archive(self) -> None:
         with self._write_lock:
@@ -692,17 +737,42 @@ def known_columns(row: sqlite3.Row, target: type) -> dict[str, Any]:
     return {key: row[key] for key in row.keys() if key in names}
 
 
-def archive_ids_from_text(text: str) -> tuple[list[str], int]:
-    """The YouTube IDs in a yt-dlp download archive, one "youtube <id>" per line, and how many other lines it has,
-    such as other sites' videos."""
-    video_ids: list[str] = []
+@functools.cache
+def known_archive_extractors() -> frozenset[str]:
+    """The names yt-dlp writes at the start of an archive line: each extractor's key in lower case."""
+    return frozenset(str(ie.ie_key()).lower() for ie in dedicated_extractors()) | URL_NAMED_EXTRACTORS
+
+
+def archive_entries_from_text(text: str) -> tuple[list[tuple[str, str]], int]:
+    """The videos named in a yt-dlp download archive, one "<extractor> <id>" per line, and how many other lines the
+    text has. A line counts only when its first word is one of yt-dlp's extractors, so a file of something else adds
+    nothing.
+
+    yt-dlp names what it finds through a direct link or on an ordinary page after the file or the page, so a bare
+    "generic clip" would mark every site's clip as downloaded. Such lines are left out unless the ID is one this app
+    made from the link."""
+    entries: list[tuple[str, str]] = []
     other = 0
     for line in text.splitlines():
-        parts = line.split()
-        if not parts:
+        extractor, _, video_id = line.strip().partition(" ")
+        extractor, video_id = extractor.lower(), video_id.strip()
+        if not extractor:
             continue
-        if len(parts) == 2 and parts[0].lower() == "youtube" and YOUTUBE_ID_RE.fullmatch(parts[1]):
-            video_ids.append(parts[1])
+        if extractor == YOUTUBE_EXTRACTOR:
+            valid = bool(YOUTUBE_ID_RE.fullmatch(video_id))
+        elif extractor in URL_NAMED_EXTRACTORS:
+            valid = bool(URL_KEYED_ID_RE.search(video_id))
+        else:
+            valid = bool(video_id) and extractor in known_archive_extractors()
+        if valid:
+            entries.append((extractor, video_id))
         else:
             other += 1
-    return video_ids, other
+    return entries, other
+
+
+def archive_ids_from_text(text: str) -> tuple[list[str], int]:
+    """The YouTube IDs in a yt-dlp download archive, and how many other lines it has."""
+    entries, other = archive_entries_from_text(text)
+    youtube = [video_id for extractor, video_id in entries if extractor == YOUTUBE_EXTRACTOR]
+    return youtube, other + len(entries) - len(youtube)

@@ -28,6 +28,7 @@ from videocap.options import (
 )
 from videocap.sidecars import comment_rows, write_csv
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status
+from videocap.sites import site_label
 from videocap.urls import classify_youtube_url
 
 
@@ -61,6 +62,9 @@ class LinkReport(TypedDict, total=False):
     url: str
     error: str
     video_id: str
+    # The yt-dlp extractor that read the link, in lower case, and the site's name for the person.
+    extractor: str
+    site: str
     title: str
     channel: str
     thumbnail: str
@@ -346,6 +350,8 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
         "url": url,
         "error": "",
         "video_id": str(info.get("id") or ""),
+        "extractor": str(info.get("extractor_key") or "").lower(),
+        "site": site_label(str(info.get("extractor_key") or ""), url),
         "title": str(info.get("title") or info.get("id") or url),
         "channel": str(info.get("channel") or info.get("uploader") or ""),
         "thumbnail": get_thumbnail_url(info),
