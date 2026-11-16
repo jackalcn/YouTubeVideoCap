@@ -74,9 +74,12 @@ NOT_SEPARATE_MESSAGE = "模擬瀏覽器沒有和 YouTube 的連線隔開（可�
 
 @dataclass
 class Refusals:
-    """What a run was refused with, which yt-dlp's messages do not say."""
+    """What a site refused a run with, as the answers themselves said it. yt-dlp's messages do not: a stream's
+    refused segments end as "the downloaded file is empty", and a check for a person as one more HTTP 403."""
 
-    # An HTTP 403 with Cloudflare's challenge header: the site wants a person to pass its check.
+    # How many requests were answered HTTP 403.
+    forbidden: int = 0
+    # One of them with Cloudflare's challenge header: the site wants a person to pass its check.
     challenged: bool = False
 
 
@@ -216,18 +219,25 @@ def session_class(base: Any) -> Any:
             try:
                 return super().urlopen(req)
             except HTTPError as error:
-                if self.refusals is not None and is_challenge(error):
-                    self.refusals.challenged = True
+                if self.refusals is not None and error.status == HTTP_FORBIDDEN:
+                    self.refusals.forbidden += 1
+                    self.refusals.challenged = self.refusals.challenged or is_challenge(error)
                 raise
 
     return OtherSiteYoutubeDL
 
 
+def offered_to(url: str, other_sites: bool) -> bool:
+    """Whether this link may be fetched as a browser would: only this machine's owner's link to another site. A link
+    without a host, as written without https://, is read as YouTube's."""
+    return bool(other_sites and _kept and host_of(url) and not is_youtube_url(url))
+
+
 def youtube_dl(base: Any, opts: dict[str, Any], url: str, other_sites: bool, refusals: Optional[Refusals] = None) -> Any:
-    """The YoutubeDL for a link. `base` is yt_dlp.YoutubeDL as the caller's module knows it. Only this machine's
-    owner's link to another site gets one that can pass for a browser. Every other one is yt-dlp's own, and is never
-    told to impersonate. A link without a host, as written without https://, is read as YouTube's."""
-    if other_sites and _kept and host_of(url) and not is_youtube_url(url):
+    """The YoutubeDL for a link. `base` is yt_dlp.YoutubeDL as the caller's module knows it. A link that may be
+    fetched as a browser would gets one that can do it, and that notes in `refusals` what the site refused it with.
+    Every other one is yt-dlp's own, and is never told to impersonate."""
+    if offered_to(url, other_sites):
         session = session_class(base)(opts)
         session.refusals = refusals
         return session

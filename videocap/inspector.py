@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TypedDict, cast
@@ -16,8 +17,16 @@ from videocap.config import (
     LIVE_CHAT_TRACK,
     NO_LOGIN_COOKIES_MESSAGE,
 )
-from videocap.downloader import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DirectLinkTypePP, UrlKeyedIdPP, YtDlpLogCollector, estimate_size
-from videocap.errors import humanize_ytdlp_error
+from videocap.downloader import (
+    AUDIO_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    DirectLinkTypePP,
+    UrlKeyedIdPP,
+    YtDlpLogCollector,
+    estimate_size,
+    refusal_in,
+)
+from videocap.errors import humanize_human_check, humanize_ytdlp_error
 from videocap.options import (
     DownloadOptions,
     LoginSource,
@@ -390,6 +399,22 @@ def preview_extension(info: Mapping[str, Any], options: DownloadOptions, ffmpeg_
 
 
 def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
+    refusals = impersonation.Refusals()
+    report, _ = inspect_once(url, options, refusals)
+    if not report.get("error") or not refusals.forbidden or options.impersonate or not impersonation.offered_to(url, options.other_sites):
+        return report
+    # The site answered HTTP 403, so once more with every request made the way a browser makes it: the download does
+    # the same, in downloader.download_with_ytdlp.
+    refusals = impersonation.Refusals()
+    report, failure = inspect_once(url, replace(options, impersonate=True), refusals)
+    if failure and refusals.challenged:
+        # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
+        report["error"] = humanize_human_check(failure, url)
+    return report
+
+
+def inspect_once(url: str, options: DownloadOptions, refusals: impersonation.Refusals) -> tuple[LinkReport, str]:
+    """One look at the link. Also returns yt-dlp's own words for what it failed with, or ""."""
     ffmpeg_available, _ = get_ffmpeg_status()
     log = YtDlpLogCollector()
     opts = build_base_options(
@@ -412,7 +437,7 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
     clip = {"section_start": options.time_ranges[0][0], "section_end": options.time_ranges[0][1]} if options.time_ranges else {}
     has_media = options.media_type != "none"
     try:
-        with impersonation.youtube_dl(yt_dlp.YoutubeDL, opts, url, options.other_sites) as ydl:
+        with impersonation.youtube_dl(yt_dlp.YoutubeDL, opts, url, options.other_sites, refusals) as ydl:
             if options.other_sites:
                 # The same ID the download will give a direct link's or a page's video, and so the same file name.
                 ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")
@@ -427,11 +452,12 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
                 except Exception:
                     output_name = ""
     except Exception as exc:
-        return {"url": url, "error": humanize_ytdlp_error(str(exc), url)}
+        return {"url": url, "error": humanize_ytdlp_error(str(exc), url)}, refusal_in([str(exc)], log.warnings)
     formats = listed_formats(info)
     if "entries" not in info and not formats:
         # Removed, private, members-only, age-gated or blocked: yt-dlp was told not to fail, so it only warned.
-        return {"url": url, "error": humanize_ytdlp_error(find_unplayable_reason(log.warnings), url)}
+        reason = find_unplayable_reason(log.warnings)
+        return {"url": url, "error": humanize_ytdlp_error(reason, url)}, refusal_in([reason], log.warnings)
 
     report: LinkReport = {
         "url": url,
@@ -457,7 +483,7 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
         # ID, or one the app gives it only after yt-dlp has asked which entries to take, so those go by position.
         is_youtube = report["extractor"].startswith("youtube") if report["extractor"] else is_youtube_url(url)
         report["entries_have_ids"] = is_youtube and all(entry["id"] for entry in report["entries"])
-        return report
+        return report, ""
 
     # Sidecar-only downloads fetch no stream, whatever yt-dlp would pick by default.
     selected_format, selected_size = describe_selected_format(info) if has_media else ("", 0)
@@ -481,7 +507,7 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
     report["tags"] = [str(tag) for tag in info.get("tags") or []]
     report["license"] = str(info.get("license") or "")
     report["audio_languages"] = collect_audio_languages(formats)
-    return report
+    return report, ""
 
 
 def summarize_reports(reports: list[LinkReport]) -> tuple[str, str]:

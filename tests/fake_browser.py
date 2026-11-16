@@ -13,11 +13,9 @@ from yt_dlp.networking.exceptions import HTTPError
 from yt_dlp.networking.impersonate import ImpersonateRequestHandler, ImpersonateTarget
 
 import videocap.impersonation as impersonation
+from offline_web import BROWSER_HEADER
 
 
-# Chrome sends this with every request and so does curl-cffi when it passes for Chrome; yt-dlp's ordinary handlers do
-# not. The sites in offline_web.py tell a browser by it.
-BROWSER_HEADER = "sec-ch-ua"
 # Set where curl-cffi was installed for the run, as in the CI step for it: its tests then fail instead of being skipped.
 EXPECT_CURL_CFFI = bool(os.environ.get("VIDEOCAP_EXPECT_CURL_CFFI"))
 STAND_IN = "stand-in"

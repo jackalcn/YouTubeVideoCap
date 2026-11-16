@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib
+import re
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import pytest
 import yt_dlp
@@ -18,20 +20,36 @@ import videocap
 import videocap.impersonation as impersonation
 from conftest import needs_ffmpeg
 from fake_browser import browser_fixture, real_handler, recording, stand_in_handler  # noqa: F401
-from offline_web import LocalSite
-from offline_youtube import OfflineYouTube, offline_media_fixture, offline_youtube_fixture  # noqa: F401
-from videocap.downloader import run_download
-from videocap.options import AccessLimits, options_from_spec, parse_extra_ytdlp_args
+from offline_web import LocalSite, new_site_fixture, web_media_fixture  # noqa: F401
+from offline_youtube import OfflineYouTube, duration_of, offline_media_fixture, offline_youtube_fixture  # noqa: F401
+from videocap.downloader import BROWSER_RETRY_FAILED_NOTE, BROWSER_RETRY_WORKED_NOTE, refused_as_a_program, run_download
+from videocap.errors import HUMAN_CHECK, failure_kind
+from videocap.inspector import inspect_link
+from videocap.options import OTHER_SITES_OWNER_ONLY_MESSAGE, AccessLimits, DownloadOptions, options_from_spec, parse_extra_ytdlp_args
 from videocap.settings import DownloadSettings, JobSpec
 
 
 YOUTUBE_VIDEO = "https://www.youtube.com/watch?v=abc123def45"
 QUIET = {"quiet": True, "logger": impersonation.Silent()}
+NewSite = Callable[[], LocalSite]
 
 
 class Progress:
     def progress(self, value: float, text: str = "") -> None:
         pass
+
+
+def owner_options(url: str, folder: Path, **settings: Any) -> DownloadOptions:
+    spec = JobSpec(url=url, settings=DownloadSettings(**settings), output_dir=str(folder))
+    return options_from_spec(spec, AccessLimits())
+
+
+def download(url: str, folder: Path, **settings: Any) -> Any:
+    return run_download(url, owner_options(url, folder, **settings), Progress())
+
+
+def inspect(url: str, folder: Path, **settings: Any) -> Any:
+    return inspect_link(url, owner_options(url, folder, **settings))
 
 
 @pytest.fixture(name="data_dir")
@@ -277,6 +295,157 @@ def test_switched_off_the_package_cannot_be_imported_at_the_next_start(data_dir:
         sys.modules.pop("curl_cffi", None)
         if before is not missing:
             sys.modules["curl_cffi"] = before  # type: ignore[assignment]
+
+
+# Refused as a program, tried once more as a browser
+
+
+@needs_ffmpeg
+def test_a_page_behind_a_check_for_bots_downloads_at_the_second_try(browser: Any, new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    site.add_clip("cf/clip.mp4")
+    url = site.add_page("cf/watch.html", title="Checked")
+    assert inspect(url, tmp_path)["error"] == ""
+    outcome = download(url, tmp_path)
+
+    assert outcome["errors"] == [] and BROWSER_RETRY_WORKED_NOTE in outcome["notes"]
+    assert duration_of(Path(outcome["items"][0]["path"])) == pytest.approx(2, abs=0.3)
+    # Inspecting and downloading were each refused once and let in once.
+    assert site.asked_for("cf/watch.html") == 4 and site.asked_as_a_browser("cf/watch.html") == 2
+    # The page's file came as to a browser too, which yt-dlp's own switch for an ordinary page does not do.
+    assert site.asked_as_a_browser("cf/clip.mp4") >= 1
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("folder", ["cf", "browsers-only"], ids=["answered as by Cloudflare", "a bare 403"])
+@pytest.mark.parametrize("kind", ["file", "stream"])
+def test_a_direct_link_only_a_browser_may_fetch_downloads_at_the_second_try(
+    browser: Any, new_site: NewSite, tmp_path: Path, folder: str, kind: str
+) -> None:
+    site = new_site()
+    url = site.add_clip(f"{folder}/clip.mp4") if kind == "file" else site.add_stream(f"{folder}/hls")
+    assert inspect(url, tmp_path)["error"] == ""
+    outcome = download(url, tmp_path)
+
+    assert outcome["errors"] == [] and BROWSER_RETRY_WORKED_NOTE in outcome["notes"]
+    assert duration_of(Path(outcome["items"][0]["path"])) == pytest.approx(2, abs=0.3)
+    if kind == "stream":
+        # The playlist again and every segment: all of them are refused to a program.
+        segments = site.segments(f"{folder}/hls")
+        assert segments and all(site.asked_as_a_browser(segment) == 1 for segment in segments)
+        assert site.asked_as_a_browser(f"{folder}/hls/index.m3u8") >= 2
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("refused", ["the playlist and its segments", "the segments"])
+def test_a_stream_refused_after_its_page_was_read_downloads_at_the_second_try(browser: Any, new_site: NewSite, tmp_path: Path, refused: str) -> None:
+    site = new_site()
+    if refused == "the segments":
+        site.add_stream("hls", segments_in="browsers-only/parts")
+        stream, segments = "hls/index.m3u8", site.segments("browsers-only/parts")
+    else:
+        site.add_stream("browsers-only/hls")
+        stream, segments = "browsers-only/hls/index.m3u8", site.segments("browsers-only/hls")
+    # The page is open to anyone, so nothing yt-dlp says of the failure names a check for bots.
+    url = site.add_page("watch.html", (stream,), title="Open page")
+    outcome = download(url, tmp_path)
+
+    assert outcome["errors"] == [] and BROWSER_RETRY_WORKED_NOTE in outcome["notes"]
+    assert duration_of(Path(outcome["items"][0]["path"])) == pytest.approx(2, abs=0.3)
+    assert segments and all(site.asked_as_a_browser(segment) == 1 for segment in segments)
+    assert site.asked_for("watch.html") == 2
+
+
+@needs_ffmpeg
+def test_a_site_that_wants_a_person_says_so_after_one_more_try(browser: Any, new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    site.add_clip("captcha/clip.mp4")
+    url = site.add_page("captcha/watch.html")
+    report, outcome = inspect(url, tmp_path), download(url, tmp_path)
+
+    for error in (report["error"], *outcome["errors"]):
+        assert error.startswith("這個網站要求真人驗證") and failure_kind(error) == HUMAN_CHECK
+    assert len(outcome["errors"]) == 1 and BROWSER_RETRY_FAILED_NOTE in outcome["notes"]
+    # Once as a program and once as a browser, for each of the two; no third try.
+    assert site.asked_for("captcha/watch.html") == 4 and site.asked_as_a_browser("captcha/watch.html") == 2
+
+
+@needs_ffmpeg
+def test_a_stream_that_wants_a_person_says_so_too(browser: Any, new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    site.add_stream("captcha/hls")
+    (error,) = download(site.add_page("watch.html", ("captcha/hls/index.m3u8",)), tmp_path)["errors"]
+    assert error.startswith("這個網站要求真人驗證")
+
+
+@needs_ffmpeg
+def test_a_plain_refusal_stays_a_plain_refusal_after_one_more_try(browser: Any, new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    url = site.add_clip("forbidden/clip.mp4")
+    report, outcome = inspect(url, tmp_path), download(url, tmp_path)
+
+    for error in (report["error"], *outcome["errors"]):
+        # What a refusal has always been told: a login, an expired link, or a site that does not allow it.
+        assert error.startswith("這個網站拒絕了下載請求（HTTP 403）") and "真人驗證" not in error
+    assert len(outcome["errors"]) == 1 and BROWSER_RETRY_FAILED_NOTE in outcome["notes"]
+    assert site.asked_for("forbidden/clip.mp4") == 4 and site.asked_as_a_browser("forbidden/clip.mp4") == 2
+
+
+@needs_ffmpeg
+def test_without_the_package_a_refused_link_is_tried_once(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    url = site.add_clip("cf/clip.mp4")
+    report, outcome = inspect(url, tmp_path), download(url, tmp_path)
+
+    assert "模擬瀏覽器" in report["error"] and "模擬瀏覽器" in outcome["errors"][0]
+    assert not any("模擬瀏覽器" in note for note in outcome["notes"])
+    assert site.asked_for("cf/clip.mp4") == 2 and site.browser_requests == []
+
+
+def test_a_visitors_link_to_another_site_is_refused_before_any_request(browser: Any, plain_site: LocalSite, tmp_path: Path) -> None:
+    url = plain_site.url("cf/watch.html")
+    spec = JobSpec(url=url, settings=DownloadSettings(), output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match=re.escape(OTHER_SITES_OWNER_ONLY_MESSAGE)):
+        options_from_spec(spec, AccessLimits.for_public_host())
+    # And were the options made all the same, yt-dlp is told of no site but YouTube.
+    outcome = run_download(url, replace(owner_options(url, tmp_path), other_sites=False), Progress())
+    assert outcome["errors"] and not outcome["items"]
+    assert plain_site.requests == [] and browser.built == 0
+
+
+@needs_ffmpeg
+def test_a_refusal_from_youtube_is_never_tried_as_a_browser(browser: Any, offline_youtube: OfflineYouTube, tmp_path: Path) -> None:
+    url = offline_youtube.add_video("abc123def45", "Refused")
+    offline_youtube.refused_unless_client["abc123def45"] = "a client nothing asks for"
+    outcome = run_download(url, owner_options(url, tmp_path, download_subtitles=False), Progress())
+
+    assert any("HTTP 403" in error or "403" in error for error in outcome["errors"])
+    assert browser.built == 0 and not any("模擬瀏覽器" in note for note in outcome["notes"])
+    # YouTube's own second try, with other player clients, still happens.
+    assert len(offline_youtube.extractions) > 1
+
+
+def test_what_is_tried_once_more_as_a_browser(browser: Any, tmp_path: Path) -> None:
+    url = "https://example.com/watch/1"
+    options = owner_options(url, tmp_path)
+    nothing: Any = {"stopped": False, "items": [], "warnings": []}
+    # A stream's refused segments are skipped, and all yt-dlp says in the end is this.
+    failed = [("ERROR: The downloaded file is empty", "")]
+    answered_403, never_refused = impersonation.Refusals(forbidden=3), impersonation.Refusals()
+
+    assert refused_as_a_program(url, options, nothing, failed, answered_403)
+
+    # A failure that no refusal by the site led to, such as a missing page or a full disk.
+    assert not refused_as_a_program(url, options, nothing, failed, never_refused)
+    # A refused extra, such as a cover picture, in a run that did not fail.
+    assert not refused_as_a_program(url, options, nothing, [], answered_403)
+    assert not refused_as_a_program(url, options, {**nothing, "stopped": True}, failed, answered_403)
+    # A list that was partly saved is not read all over again.
+    assert not refused_as_a_program(url, options, {**nothing, "items": [{"path": "saved.mp4"}]}, failed, answered_403)
+    # Once: the try that passed for a browser is the last.
+    assert not refused_as_a_program(url, replace(options, impersonate=True), nothing, failed, answered_403)
+    assert not refused_as_a_program(url, replace(options, other_sites=False), nothing, failed, answered_403)
+    assert not refused_as_a_program(YOUTUBE_VIDEO, owner_options(YOUTUBE_VIDEO, tmp_path), nothing, failed, answered_403)
 
 
 # With the real package

@@ -25,6 +25,8 @@ UNREACHABLE_HINT = "連不上 YouTube，請確認網路或代理伺服器設定�
 # Named, because the queue acts on these by itself: it pauses after the first two and retries after the last two.
 BOT_CHECK = "bot_check"
 RATE_LIMIT = "rate_limit"
+# A site that wants a person to pass its check, which the app can say only after it has tried as a browser.
+HUMAN_CHECK = "human_check"
 CONNECTION_LOST = "connection_lost"
 UNREACHABLE = "unreachable"
 
@@ -116,6 +118,14 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
         ("impersonat",),
         None,
         "{site}需要模擬瀏覽器（impersonation）才能下載，目前這個 App 沒有這項功能，所以無法下載這個網站的影片。",
+    ),
+    # Found in no message: yt-dlp words this refusal as any other HTTP 403. The try that passed for a browser saw
+    # the site answer with its check all the same, and humanize_human_check says so.
+    Hint(
+        HUMAN_CHECK,
+        (),
+        None,
+        "{site}要求真人驗證（例如勾選「我不是機器人」），用模擬瀏覽器連線也過不了。App 不會代為通過驗證，所以無法下載這個網站的影片。",
     ),
     Hint(
         BOT_CHECK,
@@ -374,6 +384,14 @@ def humanize_ytdlp_error(message: str, url: str = "") -> str:
     cleaned = message.removeprefix("ERROR: ").strip()
     matched = matching_hint(cleaned, url)
     return f"{matched[1]}（原始訊息：{cleaned[:200]}）" if matched else cleaned
+
+
+def humanize_human_check(message: str, url: str = "") -> str:
+    """yt-dlp's message for a refusal that the caller knows to be a site's check for a person: the try that passed
+    for a browser was answered with it."""
+    cleaned = message.removeprefix("ERROR: ").strip()
+    hint = next(hint for hint in YTDLP_ERROR_HINTS if hint.kind == HUMAN_CHECK)
+    return f"{hint.text_for(site_in_message(cleaned, url) or UNNAMED_SITE)}（原始訊息：{cleaned[:200]}）"
 
 
 def classify_failure(message: str) -> Optional[tuple[Hint, str]]:

@@ -1,5 +1,6 @@
 """Small web sites on this machine, for testing links to sites other than YouTube with the real yt-dlp and ffmpeg and
-no outside network: a direct media file, a page with a <video> tag, an HLS stream, and addresses that refuse."""
+no outside network: a direct media file, a page with a <video> tag, an HLS stream, addresses that refuse, and
+addresses that let only a browser in."""
 
 from __future__ import annotations
 
@@ -20,10 +21,22 @@ CLIP_VARIANTS = {
     "b": ("testsrc2=size=480x270:rate=10", "sine=frequency=880", "3"),
 }
 REFUSED_PREFIX = "/forbidden/"
+# Chrome sends this header with every request, and so does curl-cffi when yt-dlp passes for Chrome with it. yt-dlp's
+# ordinary connections do not, which is how the addresses below tell a browser from a program. A real site tells them
+# apart by the connection itself, which a test has no way to fake.
+BROWSER_HEADER = "sec-ch-ua"
+# Under this only a browser gets in. Anything else is answered as Cloudflare's check for bots answers it.
+CHECKED_PREFIX = "/cf/"
+# Under this only a browser gets in too, and anything else gets a bare HTTP 403 that names no reason, as a stream's
+# playlist and segments do when the site's page itself is open.
+BROWSERS_ONLY_PREFIX = "/browsers-only/"
+# Under this no one gets in, browser or not: the check wants a person.
+PERSON_ONLY_PREFIX = "/captcha/"
+CHECK_PAGE = b"<!doctype html><html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>"
 
 
 class SiteHandler(http.server.SimpleHTTPRequestHandler):
-    """Serves a folder, remembers what was asked for, and answers 403 under /forbidden/."""
+    """Serves a folder, remembers what was asked for, and refuses under the prefixes above."""
 
     def __init__(self, *args: object, site: LocalSite, **kwargs: object) -> None:
         self.site = site
@@ -34,10 +47,25 @@ class SiteHandler(http.server.SimpleHTTPRequestHandler):
 
     def answer(self, serve: Callable[[], None]) -> None:
         self.site.requests.append(self.path)
-        if self.path.startswith(REFUSED_PREFIX):
+        as_browser = self.headers.get(BROWSER_HEADER) is not None
+        if as_browser:
+            self.site.browser_requests.append(self.path)
+        if self.path.startswith(REFUSED_PREFIX) or (self.path.startswith(BROWSERS_ONLY_PREFIX) and not as_browser):
             self.send_error(403, "Forbidden")
-            return
-        serve()
+        elif self.path.startswith(PERSON_ONLY_PREFIX) or (self.path.startswith(CHECKED_PREFIX) and not as_browser):
+            self.send_check()
+        else:
+            serve()
+
+    def send_check(self) -> None:
+        """Cloudflare's answer to what it takes for a bot: HTTP 403, this header, and a page that checks the browser."""
+        self.send_response(403, "Forbidden")
+        self.send_header("cf-mitigated", "challenge")
+        self.send_header("Content-Type", "text/html; charset=UTF-8")
+        self.send_header("Content-Length", str(len(CHECK_PAGE)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(CHECK_PAGE)
 
     def do_GET(self) -> None:
         self.answer(super().do_GET)
@@ -53,6 +81,8 @@ class LocalSite:
         self.root = root
         self.media = media
         self.requests: list[str] = []
+        # Those of them that came as from a browser.
+        self.browser_requests: list[str] = []
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(SiteHandler, site=self))
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -90,17 +120,34 @@ class LocalSite:
         target.write_text(html, encoding="utf-8")
         return self.url(name)
 
-    def add_stream(self, folder: str = "hls", variant: str = "a") -> str:
-        """An HLS stream: a playlist and its segments."""
+    def add_stream(self, folder: str = "hls", variant: str = "a", segments_in: str = "") -> str:
+        """An HLS stream: a playlist and its segments. `segments_in` puts the segments in a folder of their own, so
+        they can be refused while the playlist is not."""
         target = self.root / folder
         target.mkdir(parents=True, exist_ok=True)
         command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.media[variant]), "-c", "copy", "-f", "hls"]
         subprocess.run([*command, "-hls_time", "1", "-hls_playlist_type", "vod", str(target / "index.m3u8")], check=True)
+        if segments_in:
+            moved = self.root / segments_in
+            moved.mkdir(parents=True, exist_ok=True)
+            for segment in target.glob("*.ts"):
+                shutil.move(str(segment), str(moved / segment.name))
+            playlist = (target / "index.m3u8").read_text(encoding="utf-8")
+            lines = [f"/{segments_in.strip('/')}/{line}" if line.endswith(".ts") else line for line in playlist.splitlines()]
+            (target / "index.m3u8").write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
         return self.url(f"{folder}/index.m3u8")
+
+    def segments(self, folder: str = "hls") -> list[str]:
+        """The paths of a stream's segments, as they are asked for."""
+        return sorted(f"/{path.relative_to(self.root).as_posix()}" for path in (self.root / folder).glob("*.ts"))
 
     def asked_for(self, path: str) -> int:
         """How many requests named this path."""
         return sum(1 for request in self.requests if request.split("?")[0] == f"/{path.lstrip('/')}")
+
+    def asked_as_a_browser(self, path: str) -> int:
+        """How many of them came as from a browser."""
+        return sum(1 for request in self.browser_requests if request.split("?")[0] == f"/{path.lstrip('/')}")
 
     def close(self) -> None:
         self.server.shutdown()

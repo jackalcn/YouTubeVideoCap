@@ -50,6 +50,7 @@ from videocap.errors import (
     JS_RUNTIME_HINT,
     explain_missing_js_runtime,
     extract_failed_video_id,
+    humanize_human_check,
     humanize_ytdlp_error,
     warns_of_missing_js_runtime,
 )
@@ -1100,7 +1101,10 @@ def download_with_ytdlp(
     should_stop: Optional[Callable[[], bool]] = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> DownloadOutcome:
-    outcome, failures = download_once(url, options, progress_ui, status_ui, should_stop, on_log)
+    refusals = impersonation.Refusals()
+    outcome, failures = download_once(url, options, progress_ui, status_ui, should_stop, on_log, refusals)
+    if refused_as_a_program(url, options, outcome, failures, refusals):
+        return download_as_a_browser(url, options, outcome, progress_ui, status_ui, should_stop, on_log)
     forbidden = list(dict.fromkeys(video_id for message, video_id in failures if video_id and FORBIDDEN_MARKER in message.lower()))
     # A client the person picked is a choice to respect, and a stopped job is meant to stop. Only YouTube has other
     # clients to ask, and the retry asks YouTube for the video by its ID.
@@ -1144,6 +1148,55 @@ def download_with_ytdlp(
 
 # yt-dlp words a refused format request this way, in English, whatever the system's language.
 FORBIDDEN_MARKER = "http error 403"
+BROWSER_RETRY_MESSAGE = "這個網站拒絕了連線（HTTP 403），改用模擬瀏覽器再試一次。"
+BROWSER_RETRY_WORKED_NOTE = "這個網站拒絕了一般的連線（HTTP 403），改用模擬瀏覽器後已下載完成。"
+BROWSER_RETRY_FAILED_NOTE = "這個網站拒絕了連線（HTTP 403），已改用模擬瀏覽器重試一次，仍然沒有成功。"
+
+
+def refusal_in(messages: list[str], warnings: list[str]) -> str:
+    """yt-dlp's words for the refusal a run failed with, to quote to the person: the message or the warning that
+    names the HTTP 403, or else the first message."""
+    return next((text for text in [*messages, *warnings] if FORBIDDEN_MARKER in text.lower()), messages[0] if messages else "")
+
+
+def refused_as_a_program(
+    url: str, options: DownloadOptions, outcome: DownloadOutcome, failures: list[tuple[str, str]], refusals: impersonation.Refusals
+) -> bool:
+    """Whether the site refused this run in a way that passing for a browser may get past: a failed run that saved
+    nothing, in which the site answered HTTP 403 to the page, to a stream's playlist or to its segments. Only the
+    owner's link to another site is tried that way, once. A stopped job is meant to stop, and a list that was partly
+    saved is not read all over again."""
+    if options.impersonate or outcome["stopped"] or outcome["items"] or not failures:
+        return False
+    return impersonation.offered_to(url, options.other_sites) and refusals.forbidden > 0
+
+
+def download_as_a_browser(
+    url: str,
+    options: DownloadOptions,
+    first: DownloadOutcome,
+    progress_ui: ProgressUI,
+    status_ui: Optional[StatusUI] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> DownloadOutcome:
+    """The whole link once more, with every request made the way a browser makes it. What the first try failed with
+    is replaced by what this one says."""
+    if on_log:
+        on_log(BROWSER_RETRY_MESSAGE)
+    progress_ui.progress(0.0, text=BROWSER_RETRY_MESSAGE)
+    refusals = impersonation.Refusals()
+    outcome, failures = download_once(url, replace(options, impersonate=True), progress_ui, status_ui, should_stop, on_log, refusals)
+    if failures and refusals.challenged and not outcome["items"]:
+        # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
+        outcome["errors"] = [humanize_human_check(refusal_in([message for message, _ in failures], outcome["warnings"]), url)]
+    for key in ("skipped", "warnings", "notes", "partial_paths"):
+        outcome[key] = [*first[key], *(entry for entry in outcome[key] if entry not in first[key])]  # type: ignore[literal-required]
+    if outcome["items"]:
+        outcome["notes"].append(BROWSER_RETRY_WORKED_NOTE)
+    elif outcome["errors"] and not outcome["stopped"]:
+        outcome["notes"].append(BROWSER_RETRY_FAILED_NOTE)
+    return outcome
 
 
 def options_for_forbidden_retry(options: DownloadOptions, outcome: DownloadOutcome) -> Optional[DownloadOptions]:
@@ -1226,9 +1279,10 @@ def download_once(
     status_ui: Optional[StatusUI] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     on_log: Optional[Callable[[str], None]] = None,
+    refusals: Optional[impersonation.Refusals] = None,
 ) -> tuple[DownloadOutcome, list[tuple[str, str]]]:
     """One yt-dlp run. Also returns yt-dlp's own error messages with their videos, in the order of the outcome's
-    translated ones."""
+    translated ones. `refusals` is where a run that can pass for a browser notes what the site refused it with."""
     options, notes = without_youtube_only_options(options, url)
     options.output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_available, _ = get_ffmpeg_status()
@@ -1417,7 +1471,7 @@ def download_once(
     stopped = False
     expired_wait = ""
     watchdog = FfmpegWatchdog(should_stop or (lambda: False), options.max_bytes, logger)
-    with watchdog, impersonation.youtube_dl(yt_dlp.YoutubeDL, ydl_opts, url, options.other_sites) as ydl:
+    with watchdog, impersonation.youtube_dl(yt_dlp.YoutubeDL, ydl_opts, url, options.other_sites, refusals) as ydl:
         if wait_live:
             watch_live_wait(ydl, progress_ui)
         # With skip_download yt-dlp never reaches post_process, and before_dl is the last step it still runs.
