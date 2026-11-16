@@ -7,7 +7,7 @@ from typing import Optional
 
 
 APP_NAME = "YouTube影片下載平台"
-APP_VERSION = "v2026.11.07.1"
+APP_VERSION = "v2026.11.16.1"
 APP_UPDATED_AT = "2026-11-07"
 DEPLOY_VERIFY_MIN_COMMIT = "7f71b98"
 DEPLOY_MARKER = "build-2026-11-07-01-youtube"
