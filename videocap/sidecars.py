@@ -63,16 +63,28 @@ def comment_time(comment: Mapping[str, Any]) -> str:
     return ""
 
 
+def video_site(information: Mapping[str, Any]) -> str:
+    """The yt-dlp extractor that found the video, in lower case as in the download archive. A video saved before the
+    app kept it can only be YouTube's."""
+    return str(information.get("extractor_key") or "youtube").lower()
+
+
+def comment_link(information: Mapping[str, Any], comment: Mapping[str, Any]) -> str:
+    if video_site(information).startswith("youtube"):
+        return f"https://www.youtube.com/watch?v={information.get('id')}&lc={comment.get('id')}"
+    # Only YouTube links to a single comment; another site's are read on the video's own page.
+    return str(information.get("webpage_url") or information.get("original_url") or "")
+
+
 def comment_rows(information: Mapping[str, Any]) -> list[dict[str, Any]]:
     """The columns of the comment export on the 下載 page, so both files open the same way."""
-    video_id = information.get("id")
     return [
         {
             "作者": str(comment.get("author") or ""),
             "留言": str(comment.get("text") or ""),
             "按讚數": comment.get("like_count") or 0,
             "時間": comment_time(comment),
-            "網址": f"https://www.youtube.com/watch?v={video_id}&lc={comment.get('id')}",
+            "網址": comment_link(information, comment),
         }
         for comment in information.get("comments") or []
     ]
@@ -187,7 +199,8 @@ def nfo_text(information: Mapping[str, Any]) -> str:
     if re.fullmatch(r"\d{8}", upload_date):
         add("aired", f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}")
     add("studio", information.get("channel") or information.get("uploader"))
-    add("uniqueid", information.get("id"), type="youtube", default="true")
+    # Says which site the ID is from, as a media server's own agents do with "imdb" or "tmdb".
+    add("uniqueid", information.get("id"), type=video_site(information), default="true")
     ElementTree.indent(root)
     return NFO_DECLARATION + ElementTree.tostring(root, encoding="unicode") + "\n"
 

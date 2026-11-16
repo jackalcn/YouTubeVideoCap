@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,72 @@ def test_resolutions_use_the_short_side_for_vertical_videos() -> None:
 
 def test_audio_languages() -> None:
     assert collect_audio_languages([AUDIO_ONLY, {**AUDIO_ONLY, "language": "en"}, VIDEO_ONLY]) == ["en", "ja"]
+
+
+# Formats that name no codecs: a direct link's file, which yt-dlp knows only by its extension, and archive.org's files,
+# which have picture sizes as well. None is "not known"; "none" is "not there".
+DIRECT_FILE = {"format_id": "mp4", "url": "https://a.example/clip.mp4", "ext": "mp4", "vcodec": None, "acodec": None, "dynamic_range": "SDR"}
+ARCHIVE_ORG_FORMATS = [
+    {"format_id": "0", "url": "https://archive.org/0.mp4", "ext": "mp4", "width": 321, "height": 240, "vcodec": None, "acodec": None, "filesize": 4340249, "format_note": "derivative"},
+    {"format_id": "1", "url": "https://archive.org/1.mpg", "ext": "mpg", "width": 321, "height": 240, "vcodec": None, "acodec": None, "filesize": 10458000, "format_note": "original"},
+    {"format_id": "2", "url": "https://archive.org/2.ogv", "ext": "ogv", "width": 400, "height": 304, "vcodec": None, "acodec": None, "filesize": 4062895, "format_note": "derivative"},
+]  # fmt: skip
+
+
+def test_a_direct_links_format_is_listed_with_what_is_known() -> None:
+    assert describe_formats([DIRECT_FILE]) == [
+        {"格式ID": "mp4", "類型": "影像", "解析度": "", "FPS": "", "動態範圍": "", "容器": "mp4", "影像編碼": "未知", "音訊編碼": "未知",
+         "語言": "", "大小": "", "位元率": "", "備註": ""},
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("fmt", "kind", "video_codec", "audio_codec"),
+    [
+        # An audio file served as audio says it has no picture, but not which codec its sound is in.
+        ({"format_id": "wav", "ext": "wav", "vcodec": "none", "acodec": None}, "僅音訊", "", "未知"),
+        ({"format_id": "m4a", "ext": "m4a", "vcodec": None, "acodec": None}, "僅音訊", "", "未知"),
+        ({"format_id": "mp3", "ext": "mp3", "vcodec": None, "acodec": "mp3"}, "僅音訊", "", "mp3"),
+        # Nothing at all is known of a file without an extension.
+        ({"format_id": "0", "ext": "unknown_video", "vcodec": None, "acodec": None}, "未知", "未知", "未知"),
+        ({"format_id": "hls", "ext": "mp4", "vcodec": "avc1.4d401f", "acodec": None}, "影像", "avc1", "未知"),
+    ],
+)
+def test_formats_without_codecs_say_what_they_hold(fmt: dict[str, Any], kind: str, video_codec: str, audio_codec: str) -> None:
+    (row,) = describe_formats([fmt])
+    assert (row["類型"], row["影像編碼"], row["音訊編碼"]) == (kind, video_codec, audio_codec)
+
+
+def test_a_site_that_lists_only_picture_sizes_shows_every_file_as_a_video() -> None:
+    rows = describe_formats(ARCHIVE_ORG_FORMATS)
+    assert [row["格式ID"] for row in rows] == ["2", "1", "0"]
+    assert all(row["類型"] == "影像" and row["影像編碼"] == "未知" for row in rows)
+    assert rows[0]["容器"] == "ogv" and rows[0]["解析度"] == "400x304" and rows[0]["大小"]
+    assert collect_resolutions(ARCHIVE_ORG_FORMATS) == [304, 240]
+
+
+@pytest.mark.parametrize(
+    ("info", "label", "size"),
+    [
+        ({**ARCHIVE_ORG_FORMATS[2], "resolution": "400x304"}, "304p ogv", 4062895),
+        # Nothing else is known of a direct link's file, not even its size.
+        (DIRECT_FILE, "mp4", 0),
+        ({"vcodec": "none", "acodec": None, "ext": "wav"}, "wav", 0),
+        ({"vcodec": None, "acodec": "mp3", "ext": "mp3"}, "mp3", 0),
+    ],
+)
+def test_a_picked_file_without_codecs_is_named_by_its_picture_and_container(info: dict[str, Any], label: str, size: int) -> None:
+    assert describe_selected_format(info) == (label, size)
+    assert "None" not in label
+
+
+def test_only_what_yt_dlp_says_makes_another_sites_entry_a_list() -> None:
+    assert inspector.is_container_entry({"_type": "playlist", "id": "album"})
+    assert inspector.is_container_entry({"id": "tab", "entries": []})
+    assert inspector.is_container_entry({"_type": "url", "url": "https://www.youtube.com/playlist?list=PL1"})
+    # Another site's links mean what that site says, so their shape tells nothing.
+    assert not inspector.is_container_entry({"_type": "url", "url": "https://example.com/playlist?list=PL1"})
+    assert not inspector.is_container_entry({"_type": "url", "ie_key": "VimeoChannel", "url": "https://vimeo.com/channels/staffpicks"})
 
 
 def test_subtitle_tracks_hide_live_chat() -> None:
@@ -280,7 +347,94 @@ def test_a_channels_playlists_tab_lists_playlists_to_download_one_by_one(offline
 def test_a_plain_playlist_is_not_mistaken_for_a_list_of_lists(offline_ydl: type[OfflineYDL]) -> None:
     videos = [{"_type": "url", "ie_key": "Youtube", "id": f"video{n:06d}", "url": f"https://www.youtube.com/watch?v=video{n:06d}"} for n in (1, 2)]
     offline_ydl.answer = lambda ydl: {"id": "PL1", "title": "List", "playlist_count": 2, "entries": videos}
-    assert inspector.inspect_link("https://www.youtube.com/playlist?list=PL1", link_options())["is_nested"] is False
+    report = inspector.inspect_link("https://www.youtube.com/playlist?list=PL1", link_options())
+    assert report["is_nested"] is False
+    # YouTube's videos keep their IDs wherever the list moves them, so they are picked by ID.
+    assert report["entries_have_ids"] is True
+
+
+def test_a_youtube_list_with_an_entry_without_an_id_is_picked_by_position(offline_ydl: type[OfflineYDL]) -> None:
+    videos = [flat_video(1), {"_type": "url", "ie_key": "Youtube", "url": "https://www.youtube.com/watch?v=video000002"}]
+    offline_ydl.answer = lambda ydl: {"id": "PL1", "title": "List", "playlist_count": 2, "entries": videos}
+    report = inspector.inspect_link("https://www.youtube.com/playlist?list=PL1", link_options())
+    assert report["entries_have_ids"] is False
+    assert [entry["id"] for entry in report["entries"]] == ["video000001", ""]
+
+
+def test_another_sites_list_keeps_each_entrys_own_link_and_is_picked_by_position(offline_ydl: type[OfflineYDL]) -> None:
+    url = "https://vimeo.com/showcase/123"
+    entries = [
+        {"_type": "url", "ie_key": "Vimeo", "id": "111", "url": "https://vimeo.com/111", "title": "One"},
+        # An 11-character ID, which a YouTube watch link could be made from by mistake.
+        {"_type": "url", "ie_key": "Vimeo", "id": "abcdefghijk", "url": "https://vimeo.com/abcdefghijk", "title": "Two"},
+        {"_type": "url", "ie_key": "Vimeo", "url": "https://vimeo.com/333", "title": "Three"},
+        {"_type": "url", "ie_key": "VimeoAlbum", "url": "https://example.com/playlist?list=PL1", "title": "Four"},
+    ]
+    offline_ydl.answer = {
+        "_type": "playlist", "id": "123", "title": "Showcase", "extractor": "vimeo:showcase", "extractor_key": "VimeoShowcase",
+        "webpage_url": url, "entries": entries,
+    }  # fmt: skip
+    report = inspector.inspect_link(url, link_options(expand_playlist=True))
+    assert report["error"] == "" and report["site"] == "Vimeo"
+    rows = [(entry["index"], entry["id"], entry["url"]) for entry in report["entries"]]
+    assert rows == [
+        (1, "111", "https://vimeo.com/111"),
+        (2, "abcdefghijk", "https://vimeo.com/abcdefghijk"),
+        (3, "", "https://vimeo.com/333"),
+        (4, "", "https://example.com/playlist?list=PL1"),
+    ]
+    assert not any("youtube" in str(entry["url"]) for entry in report["entries"])
+    assert not any("youtube" in str(row["網址"]) for row in inspector.playlist_export_rows(report["entries"]))
+    # Its IDs are its own and may change when the app keys them to their link, so the page picks by position.
+    assert report["is_nested"] is False and report["entries_have_ids"] is False
+
+
+def test_a_fully_read_entrys_link_is_its_page_rather_than_its_stream(offline_ydl: type[OfflineYDL]) -> None:
+    url = "https://site.example/list"
+    entry = {"id": "a1", "title": "A", "webpage_url": "https://site.example/v/a1", "url": "https://cdn.example/a1.mp4?token=x", "ext": "mp4"}
+    offline_ydl.answer = {"_type": "playlist", "id": "list", "title": "List", "extractor_key": "Generic", "webpage_url": url, "entries": [entry]}
+    report = inspector.inspect_link(url, link_options(expand_playlist=True))
+    assert [entry["url"] for entry in report["entries"]] == ["https://site.example/v/a1"]
+
+
+def archive_org_film(ydl: OfflineYDL) -> Any:
+    url = "https://archive.org/details/oldfilm"
+    formats = copy.deepcopy(ARCHIVE_ORG_FORMATS)
+    info = {"id": "oldfilm", "title": "Old film", "extractor": "archive.org", "extractor_key": "ArchiveOrg", "webpage_url": url, "formats": formats}
+    return ydl.process_ie_result(info, download=False)
+
+
+def test_a_site_that_lists_no_codecs_gets_a_format_table_and_a_summary(offline_ydl: type[OfflineYDL]) -> None:
+    offline_ydl.answer = archive_org_film
+    report = inspector.inspect_link("https://archive.org/details/oldfilm", link_options())
+    assert report["error"] == ""
+    assert len(report["format_rows"]) == 3 and all(row["類型"] == "影像" for row in report["format_rows"])
+    # yt-dlp picks the largest picture as one file, which names no codec.
+    assert report["selected_format"] == "304p ogv" and report["selected_size"] == 4062895
+    assert report["resolutions"] == [304, 240]
+    assert report["output_name"] == "Old film.ogv"
+
+
+def test_a_direct_link_without_a_list_of_formats_is_not_called_unplayable(offline_ydl: type[OfflineYDL]) -> None:
+    # A file whose server did not say what it is: yt-dlp gives the result itself as its only format, with no list.
+    url = "https://a.example/video"
+    offline_ydl.answer = {"id": "video", "title": "video", "extractor": "generic", "extractor_key": "Generic", "url": url, "ext": "unknown_video", "direct": True}
+    report = inspector.inspect_link(url, link_options())
+    assert report["error"] == ""
+    assert [(row["類型"], row["容器"], row["大小"]) for row in report["format_rows"]] == [("未知", "unknown_video", "")]
+    assert report["selected_size"] == 0
+
+
+def test_a_drm_protected_video_says_so_rather_than_that_it_has_no_formats(offline_ydl: type[OfflineYDL]) -> None:
+    def protected(ydl: OfflineYDL) -> Any:
+        # yt-dlp's words when the extractor dropped every format for DRM: the last one is then not "No video formats found!".
+        ydl.report_warning("[vimeo] 76979871: This video is DRM protected")
+        ydl.report_warning("This video is DRM protected")
+        return {"id": "76979871", "title": "Film", "formats": []}
+
+    offline_ydl.answer = protected
+    report = inspector.inspect_link("https://vimeo.com/76979871", link_options())
+    assert report["error"].startswith("此影片受 DRM 保護，無法下載")
 
 
 def flat_video(number: int, **fields: Any) -> dict[str, Any]:

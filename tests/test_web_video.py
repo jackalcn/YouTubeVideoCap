@@ -15,6 +15,7 @@ from videocap.downloader import UrlKeyedIdPP, run_download
 from videocap.inspector import inspect_link
 from videocap.options import AccessLimits, DownloadOptions, options_from_spec
 from videocap.settings import DownloadSettings, JobSpec
+from videocap.sites import media_extension_from_bytes
 
 
 pytestmark = needs_ffmpeg
@@ -24,8 +25,11 @@ KEYED_ID_RE = re.compile(r".+-[0-9a-f]{8}")
 
 
 class Progress:
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
     def progress(self, value: float, text: str = "") -> None:
-        pass
+        self.texts.append(text)
 
 
 def owner_options(url: str, output_dir: Path, archive: Optional[Path] = None, **settings: Any) -> DownloadOptions:
@@ -33,8 +37,12 @@ def owner_options(url: str, output_dir: Path, archive: Optional[Path] = None, **
     return options_from_spec(spec, AccessLimits(), archive_path=archive)
 
 
-def download(url: str, output_dir: Path, archive: Optional[Path] = None, **settings: Any) -> Any:
-    return run_download(url, owner_options(url, output_dir, archive, **settings), Progress())
+def download(url: str, output_dir: Path, archive: Optional[Path] = None, progress: Optional[Progress] = None, **settings: Any) -> Any:
+    return run_download(url, owner_options(url, output_dir, archive, **settings), progress or Progress())
+
+
+def inspect(url: str, output_dir: Path, **settings: Any) -> Any:
+    return inspect_link(url, owner_options(url, output_dir, **settings))
 
 
 def media_files(folder: Path) -> list[Path]:
@@ -157,6 +165,151 @@ def test_inspection_shows_the_id_and_name_the_download_will_have(new_site: NewSi
     assert report["video_id"] == outcome["items"][0]["video_id"]
     assert report["output_name"] == Path(outcome["items"][0]["path"]).name
     assert KEYED_ID_RE.fullmatch(report["video_id"])
+
+
+def test_a_direct_links_report_lists_its_one_format_with_what_is_known(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    report = inspect(site.add_clip("clip.mp4"), tmp_path)
+    assert report["error"] == "" and report["is_playlist"] is False
+    # The server says only that it is an MP4 file: no codecs, no picture size, and here not even a size.
+    (row,) = report["format_rows"]
+    assert (row["類型"], row["容器"], row["影像編碼"], row["音訊編碼"]) == ("影像", "mp4", "未知", "未知")
+    assert row["大小"] == "" and row["解析度"] == ""
+    assert report["selected_format"] == "mp4"
+    # No size is shown, rather than 0 B: the page leaves out the size of a selected_size of 0.
+    assert report["selected_size"] == 0
+
+
+def test_a_file_that_does_not_say_what_it_is_is_named_by_how_it_starts(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    # No extension, so the server sends it as application/octet-stream, and yt-dlp alone would save ".unknown_video".
+    url = site.add_clip("video")
+    report = inspect(url, tmp_path)
+    assert report["error"] == ""
+    assert [(row["類型"], row["容器"]) for row in report["format_rows"]] == [("影像", "mp4")]
+    assert report["output_name"] == "video.mp4"
+
+    outcome = download(url, tmp_path)
+    assert outcome["errors"] == []
+    saved = Path(outcome["items"][0]["path"])
+    # Under a name a player opens, and through the steps that write into the file, which fail on an unknown kind.
+    assert saved.name == "video.mp4" and duration_of(saved) == pytest.approx(2, abs=0.3)
+    assert not list(tmp_path.glob("*.unknown_video"))
+
+
+def test_a_file_of_no_known_kind_is_not_called_unplayable(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    (site.root / "data").write_bytes(bytes(range(256)) * 8)
+    report = inspect(site.url("data"), tmp_path)
+    assert report["error"] == ""
+    assert [(row["類型"], row["容器"]) for row in report["format_rows"]] == [("未知", "unknown_video")]
+
+
+FILE_STARTS = [
+    (b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00", "mp4"),
+    (b"\x00\x00\x00\x14ftypqt  ", "mov"),
+    (b"\x00\x00\x00\x1cftypM4A ", "m4a"),
+    (b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x84webm", "webm"),
+    (b"\x1a\x45\xdf\xa3\x9f\x42\x82\x88matroska", "mkv"),
+    (b"OggS\x00\x02" + bytes(22) + b"\x80theora", "ogv"),
+    (b"OggS\x00\x02" + bytes(22) + b"OpusHead", "opus"),
+    (b"OggS\x00\x02" + bytes(22) + b"\x01vorbis", "ogg"),
+    (b"RIFF\x00\x00\x00\x00AVI LIST", "avi"),
+    (b"RIFF\x00\x00\x00\x00WAVEfmt ", "wav"),
+    (b"FLV\x01\x05", "flv"),
+    (b"fLaC\x00\x00\x00\x22", "flac"),
+    (b"ID3\x04\x00", "mp3"),
+    (b"\xff\xfb\x90\x64", "mp3"),
+    (b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9", "wmv"),
+    (b"\x00\x00\x01\xba\x44", "mpg"),
+    (b"\x47" + bytes(187) + b"\x47" + bytes(187), "ts"),
+    # Not media, or not a kind told apart here: left as yt-dlp had it.
+    (b"<!doctype html><html>", ""),
+    (b"RIFF\x00\x00\x00\x00WEBPVP8 ", ""),
+    (b"\xff\xf1\x50\x80", ""),
+    (b"\x47" + bytes(40), ""),
+    (b"", ""),
+]
+
+
+@pytest.mark.parametrize(("start", "extension"), FILE_STARTS)
+def test_a_files_first_bytes_say_what_kind_it_is(start: bytes, extension: str) -> None:
+    assert media_extension_from_bytes(start) == extension
+
+
+def test_every_kind_read_from_a_file_is_one_yt_dlp_will_write() -> None:
+    from yt_dlp.utils._utils import _UnsafeExtensionError
+
+    # yt-dlp refuses to save a file under an extension that is not on its list.
+    assert {extension for _, extension in FILE_STARTS if extension} <= _UnsafeExtensionError.ALLOWED_EXTENSIONS
+
+
+@pytest.mark.parametrize(("name", "label"), [("clip.mp4", "影像"), ("song.m4a", "音訊")])
+def test_a_direct_links_progress_names_the_file_not_subtitles(new_site: NewSite, tmp_path: Path, name: str, label: str) -> None:
+    site = new_site()
+    progress = Progress()
+    outcome = download(site.add_clip(name), tmp_path, progress=progress, download_subtitles=False)
+    assert outcome["errors"] == []
+    assert f"{label}下載完成" in progress.texts
+    # It used to show 下載字幕... for as long as the file took: a codec yt-dlp was not told looked like a subtitle's.
+    assert not any(text.startswith("下載字幕") or text == "字幕下載完成" for text in progress.texts)
+
+
+def test_a_page_with_two_videos_lists_both_by_position(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    one, two = site.add_clip("one.mp4", "a"), site.add_clip("two.mp4", "b")
+    report = inspect(site.add_page("both.html", sources=("one.mp4", "two.mp4")), tmp_path, expand_playlist=True)
+    assert report["error"] == "" and report["is_playlist"] is True and report["is_nested"] is False
+    entries = report["entries"]
+    assert [entry["index"] for entry in entries] == [1, 2]
+    # Each player's own file is its link; the page is both of theirs.
+    assert [entry["url"] for entry in entries] == [one, two]
+    assert all(re.fullmatch(r"both-[12]-[0-9a-f]{8}", entry["id"]) for entry in entries)
+    # yt-dlp asks which entries to take before the app gives them these IDs, so they are picked by position.
+    assert report["entries_have_ids"] is False
+
+
+# What a failure on another site says
+
+
+def test_a_refusal_from_another_site_names_that_site_and_suggests_a_login(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    site.add_clip("forbidden/clip.mp4")
+    url = site.url("forbidden/clip.mp4")
+    for error in (inspect(url, tmp_path)["error"], *download(url, tmp_path)["errors"]):
+        assert error.startswith("這個網站拒絕了下載請求（HTTP 403）") and "會員登入" in error
+        # Not YouTube's own advice about its player clients, cloud hosts and updates.
+        assert "YouTube" not in error.partition("（原始訊息：")[0]
+
+
+def test_a_refusal_while_fetching_the_file_is_the_sites_too(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    site.add_clip("forbidden/clip.mp4")
+    # The page can be read; its player's file is refused. yt-dlp's message for that names no site at all.
+    url = site.add_page("watch.html", ("forbidden/clip.mp4",))
+    (error,) = download(url, tmp_path)["errors"]
+    assert "[" not in error.partition("（原始訊息：")[2][:1]
+    assert error.startswith("這個網站拒絕了下載請求（HTTP 403）")
+    assert "YouTube" not in error.partition("（原始訊息：")[0]
+
+
+def test_a_missing_file_on_another_site_says_the_link_is_gone(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    for url in (site.url("missing.mp4"), site.url("gone/page.html")):
+        assert inspect(url, tmp_path)["error"].startswith("找不到這部影片（HTTP 404）")
+        assert download(url, tmp_path)["errors"][0].startswith("找不到這部影片（HTTP 404）")
+
+
+def test_a_site_that_cannot_be_reached_is_named_and_not_retried_as_a_dropped_connection(new_site: NewSite, tmp_path: Path) -> None:
+    from videocap.errors import is_network_loss, is_unreachable
+
+    site = new_site()
+    url = site.add_clip("clip.mp4")
+    site.close()
+    (error,) = download(url, tmp_path)["errors"]
+    assert error.startswith("連不上這個網站")
+    # The queue's automatic retry tells this apart from a connection lost halfway.
+    assert is_network_loss(error) and is_unreachable(error)
 
 
 # Who may not

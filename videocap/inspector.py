@@ -15,7 +15,7 @@ from videocap.config import (
     LIVE_CHAT_TRACK,
     NO_LOGIN_COOKIES_MESSAGE,
 )
-from videocap.downloader import UrlKeyedIdPP, YtDlpLogCollector, estimate_size
+from videocap.downloader import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, DirectLinkTypePP, UrlKeyedIdPP, YtDlpLogCollector, estimate_size
 from videocap.errors import humanize_ytdlp_error
 from videocap.options import (
     DownloadOptions,
@@ -28,11 +28,15 @@ from videocap.options import (
 )
 from videocap.sidecars import comment_rows, write_csv
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status
-from videocap.sites import site_label
+from videocap.sites import is_youtube_url, site_label
 from videocap.urls import classify_youtube_url
 
 
 NO_FORMATS_MARKER = "no video formats found"
+# yt-dlp says this instead when the extractor dropped every format for being encrypted.
+DRM_MARKER = "drm protected"
+# What the format table says of a codec, or a kind of stream, that yt-dlp was not told.
+UNKNOWN = "未知"
 # The extension yt-dlp gives audio it takes out of its container without converting it.
 ORIGINAL_AUDIO_EXTENSIONS = {"opus": "opus", "mp4a": "m4a", "vorbis": "ogg", "mp3": "mp3", "flac": "flac"}
 
@@ -77,6 +81,8 @@ class LinkReport(TypedDict, total=False):
     entry_count: Optional[int]
     is_nested: bool
     entries: list[PlaylistEntry]
+    # Whether picked entries can be downloaded by their IDs, as YouTube's can; otherwise by their positions in the list.
+    entries_have_ids: bool
     format_rows: list[FormatRow]
     selected_format: str
     selected_size: int
@@ -133,10 +139,61 @@ def get_thumbnail_url(info: Mapping[str, Any]) -> str:
     return str(info.get("thumbnail") or fallback or "")
 
 
+def has_codec(codec: Any) -> bool:
+    # yt-dlp's "none" says a stream is not there; None, that it was not told.
+    return codec not in (None, "none")
+
+
+def has_picture(fmt: Mapping[str, Any]) -> Optional[bool]:
+    """Whether a format holds a picture, or None when nothing says. Without codecs, as for a direct link's file or a
+    site that lists only its files, the picture size or the file's extension tells."""
+    vcodec = fmt.get("vcodec")
+    if vcodec is not None:
+        return vcodec != "none"
+    extension = str(fmt.get("ext") or "").lower()
+    if fmt.get("width") or fmt.get("height") or extension in VIDEO_EXTENSIONS:
+        return True
+    if extension in AUDIO_EXTENSIONS or has_codec(fmt.get("acodec")):
+        return False
+    return None
+
+
+def has_sound(fmt: Mapping[str, Any]) -> Optional[bool]:
+    acodec = fmt.get("acodec")
+    return None if acodec is None else acodec != "none"
+
+
+def stream_kind(picture: Optional[bool], sound: Optional[bool]) -> str:
+    """The 類型 column. Empty for a format with neither, such as a storyboard's pictures."""
+    if picture is None:
+        return UNKNOWN
+    if picture:
+        return "影像＋音訊" if sound else "僅影像" if sound is False else "影像"
+    return "" if sound is False else "僅音訊"
+
+
+def codec_name(codec: Any) -> str:
+    return str(codec).split(".")[0] if has_codec(codec) else UNKNOWN
+
+
+def picture_size(fmt: Mapping[str, Any]) -> str:
+    width, height = fmt.get("width"), fmt.get("height")
+    return str(fmt.get("resolution") or (f"{width}x{height}" if width and height else ""))
+
+
+def listed_formats(info: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The formats yt-dlp found. A result that is its own only format, such as a file whose server did not say what it
+    is, comes without a list: yt-dlp leaves it out rather than have the result hold itself."""
+    formats = cast(Optional[list[dict[str, Any]]], info.get("formats"))
+    if formats:
+        return formats
+    return [cast(dict[str, Any], info)] if info.get("url") and info.get("_type", "video") == "video" else []
+
+
 def collect_resolutions(formats: list[dict[str, Any]] | None) -> list[int]:
     resolutions: set[int] = set()
     for fmt in formats or []:
-        if fmt.get("vcodec") in (None, "none"):
+        if not has_picture(fmt):
             continue
         # YouTube names a quality after the shorter side, which matters for vertical videos.
         sides = [side for side in (fmt.get("width"), fmt.get("height")) if side]
@@ -174,22 +231,24 @@ def describe_formats(formats: list[dict[str, Any]] | None) -> list[FormatRow]:
     for fmt in reversed(formats or []):
         if not is_downloadable_format(fmt):
             continue
-        has_video, has_audio = fmt.get("vcodec") not in (None, "none"), fmt.get("acodec") not in (None, "none")
-        kind = "影像＋音訊" if has_video and has_audio else "僅影像" if has_video else "僅音訊" if has_audio else ""
+        picture, sound = has_picture(fmt), has_sound(fmt)
+        kind = stream_kind(picture, sound)
         if not kind:
             continue
+        # A size yt-dlp was not told stays empty, rather than showing as 0 B.
         size = fmt.get("filesize") or fmt.get("filesize_approx")
         bitrate = fmt.get("tbr")
         rows.append(
             {
                 "格式ID": str(fmt.get("format_id") or ""),
                 "類型": kind,
-                "解析度": str(fmt.get("resolution") or "") if has_video else "",
-                "FPS": str(int(fmt["fps"])) if has_video and fmt.get("fps") else "",
-                "動態範圍": str(fmt.get("dynamic_range") or "") if has_video else "",
+                "解析度": picture_size(fmt) if picture else "",
+                "FPS": str(int(fmt["fps"])) if picture and fmt.get("fps") else "",
+                # yt-dlp guesses SDR for any stream not marked as sound alone, also one it knows nothing of.
+                "動態範圍": str(fmt.get("dynamic_range") or "") if has_codec(fmt.get("vcodec")) else "",
                 "容器": str(fmt.get("ext") or ""),
-                "影像編碼": str(fmt.get("vcodec") or "").split(".")[0] if has_video else "",
-                "音訊編碼": str(fmt.get("acodec") or "").split(".")[0] if has_audio else "",
+                "影像編碼": codec_name(fmt.get("vcodec")) if picture is not False else "",
+                "音訊編碼": codec_name(fmt.get("acodec")) if sound is not False else "",
                 "語言": str(fmt.get("language") or ""),
                 "大小": format_bytes(size) if size else "",
                 "位元率": f"{bitrate:.0f} kbps" if bitrate else "",
@@ -209,14 +268,19 @@ def describe_selected_format(info: Mapping[str, Any]) -> tuple[str, int]:
 
     parts: list[str] = []
     for source in sources:
-        if source.get("vcodec") not in (None, "none"):
+        vcodec, acodec = source.get("vcodec"), source.get("acodec")
+        if has_codec(vcodec):
             height, fps = source.get("height"), source.get("fps")
             quality = f"{height}p" if height else str(source.get("resolution") or "")
             dynamic_range = str(source.get("dynamic_range") or "SDR")
             hdr = "" if dynamic_range == "SDR" else f" {dynamic_range}"
-            parts.append(f"{quality}{int(fps) if fps and fps > 30 else ''} {str(source.get('vcodec')).split('.')[0]}{hdr}")
-        if source.get("acodec") not in (None, "none"):
-            parts.append(str(source.get("acodec")).split(".")[0])
+            parts.append(f"{quality}{int(fps) if fps and fps > 30 else ''} {str(vcodec).split('.')[0]}{hdr}")
+        if has_codec(acodec):
+            parts.append(str(acodec).split(".")[0])
+        if not has_codec(vcodec) and not has_codec(acodec):
+            # A file that names no codec, as a direct link's does: its picture size and its container are what is known.
+            height = source.get("height") if vcodec is None else None
+            parts.append(" ".join(part for part in (f"{height}p" if height else "", str(source.get("ext") or "")) if part))
     return " + ".join(part for part in parts if part), size
 
 
@@ -230,12 +294,24 @@ def collect_audio_languages(formats: list[dict[str, Any]] | None) -> list[str]:
 
 
 def is_container_entry(entry: Mapping[str, Any]) -> bool:
-    """A listed entry that is itself a list: a channel tab, or a playlist on a channel's /playlists tab."""
-    if "entries" in entry:
+    """A listed entry that is itself a list: a channel tab, or a playlist on a channel's /playlists tab. Only YouTube's
+    links tell by their shape; another site's entry is a list only when yt-dlp says so."""
+    if "entries" in entry or entry.get("_type") == "playlist":
         return True
     if entry.get("_type") not in ("url", "url_transparent"):
         return False
     return entry.get("ie_key") == "YoutubeTab" or classify_youtube_url(str(entry.get("url") or "")) in ("playlist", "channel")
+
+
+def entry_link(entry: Mapping[str, Any], list_page: str) -> str:
+    """An entry's own link. A fully read entry's "url" is the stream yt-dlp picked for it, which may expire, so its page
+    is its link. The players of an ordinary page all have that page, though, so each one's file is its link."""
+    if entry.get("_type") in ("url", "url_transparent"):
+        return str(entry.get("url") or "")
+    page = str(entry.get("webpage_url") or "")
+    if page and page != list_page:
+        return page
+    return str(entry.get("url") or page)
 
 
 def entry_upload_date(entry: Mapping[str, Any]) -> str:
@@ -253,7 +329,10 @@ def entry_upload_date(entry: Mapping[str, Any]) -> str:
 
 
 def build_playlist_entries(info: Mapping[str, Any]) -> list[PlaylistEntry]:
+    """Each entry with its position, and its own ID and link when it has them ("" when not). Nothing is made up from
+    an ID: another site's would make no YouTube link."""
     entries: list[PlaylistEntry] = []
+    list_page = str(info.get("webpage_url") or "")
     for index, entry in enumerate(iter_video_entries(info), start=1):
         video_id = str(entry.get("id") or "")
         entries.append(
@@ -261,7 +340,7 @@ def build_playlist_entries(info: Mapping[str, Any]) -> list[PlaylistEntry]:
                 "index": index,
                 "id": video_id,
                 "title": str(entry.get("title") or video_id),
-                "url": str(entry.get("url") or entry.get("webpage_url") or ""),
+                "url": entry_link(entry, list_page),
                 "duration": format_duration(entry.get("duration")),
                 "channel": str(entry.get("channel") or entry.get("uploader") or ""),
                 "views": entry.get("view_count"),
@@ -289,8 +368,11 @@ def playlist_export_rows(entries: Iterable[Mapping[str, Any]]) -> list[dict[str,
 
 def find_unplayable_reason(warnings: list[str]) -> str:
     """With ignore_no_formats_error, yt-dlp turns YouTube's reason for refusing a video into a warning just before its
-    own "No video formats found!", which says nothing about why."""
+    own "No video formats found!", which says nothing about why. A video whose every format is encrypted ends with
+    "This video is DRM protected" instead, which the site's own warning says first."""
     for index, warning in enumerate(warnings):
+        if DRM_MARKER in warning.lower():
+            return warning
         if NO_FORMATS_MARKER in warning.lower():
             reasons = [earlier for earlier in warnings[:index] if earlier.startswith("[")]
             return reasons[-1] if reasons else warning
@@ -331,6 +413,7 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
             if options.other_sites:
                 # The same ID the download will give a direct link's or a page's video, and so the same file name.
                 ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")
+                ydl.add_post_processor(DirectLinkTypePP(), when="pre_process")
             info = cast(dict[str, Any], ydl.extract_info(url, download=False))
             output_name = ""
             if "entries" not in info and has_media:
@@ -341,10 +424,11 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
                 except Exception:
                     output_name = ""
     except Exception as exc:
-        return {"url": url, "error": humanize_ytdlp_error(str(exc))}
-    if "entries" not in info and not info.get("formats"):
+        return {"url": url, "error": humanize_ytdlp_error(str(exc), url)}
+    formats = listed_formats(info)
+    if "entries" not in info and not formats:
         # Removed, private, members-only, age-gated or blocked: yt-dlp was told not to fail, so it only warned.
-        return {"url": url, "error": humanize_ytdlp_error(find_unplayable_reason(log.warnings))}
+        return {"url": url, "error": humanize_ytdlp_error(find_unplayable_reason(log.warnings), url)}
 
     report: LinkReport = {
         "url": url,
@@ -366,9 +450,12 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
         report["is_nested"] = is_nested
         report["entry_count"] = None if is_nested else info.get("playlist_count")
         report["entries"] = build_playlist_entries(info)
+        # Only YouTube's videos are picked by ID, which stays put as a channel adds videos. Another site's may have no
+        # ID, or one the app gives it only after yt-dlp has asked which entries to take, so those go by position.
+        is_youtube = report["extractor"].startswith("youtube") if report["extractor"] else is_youtube_url(url)
+        report["entries_have_ids"] = is_youtube and all(entry["id"] for entry in report["entries"])
         return report
 
-    formats = cast(Optional[list[dict[str, Any]]], info.get("formats"))
     # Sidecar-only downloads fetch no stream, whatever yt-dlp would pick by default.
     selected_format, selected_size = describe_selected_format(info) if has_media else ("", 0)
     if clip and selected_size:

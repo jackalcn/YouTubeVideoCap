@@ -615,6 +615,7 @@ def test_link_kinds(url: str, kind: str) -> None:
         ("BiliBili", "https://www.bilibili.com/video/BV1", "Bilibili"),
         ("Twitter", "https://x.com/a/status/1", "X（Twitter）"),
         ("TwitchVod", "https://www.twitch.tv/videos/1", "Twitch"),
+        ("ArchiveOrg", "https://archive.org/details/x", "Internet Archive"),
         ("TedTalk", "https://www.ted.com/talks/x", "TedTalk"),
         ("Generic", "https://cdn.example.com/a.mp4?sig=1", "cdn.example.com（直接連結）"),
         ("HTML5MediaEmbed", "https://example.com/page.html", "example.com（一般網頁）"),

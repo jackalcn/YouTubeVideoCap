@@ -598,6 +598,33 @@ def test_subtitle_progress_does_not_move_the_bar() -> None:
     assert tracker.finished_streams == 0
 
 
+@pytest.mark.parametrize(
+    ("info", "label"),
+    [
+        # A direct link: yt-dlp knows the file only by its extension.
+        ({"format_id": "mp4", "ext": "mp4", "vcodec": None, "acodec": None}, "影像"),
+        ({"format_id": "0", "ext": "unknown_video", "vcodec": None, "acodec": None}, "影像"),
+        ({"format_id": "m4a", "ext": "m4a", "vcodec": None, "acodec": None}, "音訊"),
+        ({"format_id": "mp3", "ext": "mp3", "vcodec": None, "acodec": "mp3"}, "音訊"),
+        # How archive.org lists its files: picture sizes, but no codecs.
+        ({"format_id": "2", "ext": "ogv", "vcodec": None, "acodec": None, "width": 400, "height": 304}, "影像"),
+        # A subtitle track is no format of the video, and has no format ID.
+        ({"ext": "vtt", "url": "https://x/sub.vtt", "name": "English"}, "字幕"),
+        ({"ext": "json", "url": "https://x/chat", "video_id": "jNQXAC9IVRw", "protocol": "youtube_live_chat_replay"}, "字幕"),
+    ],
+)
+def test_a_stream_without_codecs_is_named_by_what_it_is(info: dict[str, Any], label: str) -> None:
+    progress = Progress()
+    tracker = ProgressTracker(progress)
+    tracker.start_item({"title": "T"})
+    tracker.on_stream_progress({"status": "downloading", "downloaded_bytes": 50, "total_bytes": 100, "info_dict": info})
+    assert progress.calls[-1][1].startswith(f"下載{label}")
+    tracker.on_stream_progress({"status": "finished", "downloaded_bytes": 100, "total_bytes": 100, "info_dict": info})
+    assert progress.calls[-1][1] == f"{label}下載完成"
+    # Only the video's own streams fill the bar.
+    assert tracker.finished_streams == (0 if label == "字幕" else 1)
+
+
 def test_unknown_size_shows_bytes_instead_of_a_percentage() -> None:
     progress = Progress()
     tracker = ProgressTracker(progress)
@@ -1786,6 +1813,38 @@ def test_a_media_server_gets_an_nfo_and_a_thumb_beside_the_video(offline_youtube
     assert stream_codecs(thumb) == ["mjpeg"]
 
 
+def test_sidecars_name_the_videos_own_site() -> None:
+    from xml.etree import ElementTree
+
+    from videocap.sidecars import comment_rows, nfo_text
+
+    comments = [{"id": "c1", "author": "A", "text": "hi"}]
+    youtube = {"id": "jNQXAC9IVRw", "extractor_key": "Youtube", "webpage_url": "https://www.youtube.com/watch?v=jNQXAC9IVRw", "comments": comments}
+    vimeo = {"id": "76979871", "extractor_key": "Vimeo", "webpage_url": "https://vimeo.com/76979871", "comments": comments}
+    # Saved before the app kept the extractor, so YouTube's.
+    older = {"id": "jNQXAC9IVRw", "comments": comments}
+    assert comment_rows(youtube)[0]["網址"] == comment_rows(older)[0]["網址"] == "https://www.youtube.com/watch?v=jNQXAC9IVRw&lc=c1"
+    # Only YouTube links to one comment; another site's comments are read on the video's own page.
+    assert comment_rows(vimeo)[0]["網址"] == "https://vimeo.com/76979871"
+
+    def uniqueid_type(information: dict[str, Any]) -> str:
+        return ElementTree.fromstring(nfo_text(information).encode("utf-8")).find("uniqueid").attrib["type"]  # type: ignore[union-attr]
+
+    assert uniqueid_type(youtube) == uniqueid_type(older) == "youtube"
+    assert uniqueid_type(vimeo) == "vimeo"
+    assert uniqueid_type({"id": "clip-3f9a1c2e", "extractor_key": "Generic"}) == "generic"
+
+
+def test_another_sites_nfo_says_which_site_its_id_is_from(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:
+    from xml.etree import ElementTree
+
+    url = offline_youtube.add_video("vimeoNfo01", "Film", url="https://vimeo.com/123456789")
+    outcome = download_link(url, tmp_path, write_nfo=True, download_subtitles=False)
+    assert outcome["errors"] == []
+    uniqueid = ElementTree.parse(Path(outcome["items"][0]["path"]).with_suffix(".nfo")).getroot().find("uniqueid")
+    assert uniqueid is not None and uniqueid.text == "vimeoNfo01" and uniqueid.attrib == {"type": "vimeo", "default": "true"}
+
+
 def test_no_thumb_without_a_saved_cover(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:
     url = offline_youtube.add_video("nfoVideo002", "Plain", thumbnail=True)
     outcome = download_link(url, tmp_path, write_nfo=True, embed_thumbnail=True, download_subtitles=False)
@@ -1848,6 +1907,31 @@ def test_another_sites_403_is_not_retried_as_a_youtube_video(offline_youtube: Of
     assert outcome["failed_ids"] == ["refusedClip"] and outcome["failed_urls"] == [url]
     assert offline_youtube.extractions == [url]
     assert not any("YouTube 用戶端" in line for line in log)
+
+
+def archive_org_formats(offline_youtube: OfflineYouTube) -> list[dict[str, Any]]:
+    """How archive.org lists a film's files: picture sizes and file sizes, but no codecs."""
+    video = offline_youtube.url_of("v.mp4")
+    no_codecs = {"url": video, "vcodec": None, "acodec": None, "protocol": "https", "filesize": (offline_youtube.media / "v.mp4").stat().st_size}
+    return [
+        {**no_codecs, "format_id": "0", "ext": "mp4", "width": 400, "height": 304, "format_note": "derivative"},
+        {**no_codecs, "format_id": "1", "ext": "mpg", "width": 321, "height": 240, "format_note": "original"},
+        {**no_codecs, "format_id": "2", "ext": "ogv", "width": 320, "height": 240, "format_note": "derivative"},
+    ]
+
+
+def test_a_site_that_names_no_codecs_shows_its_file_downloading_as_the_video(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:
+    url = offline_youtube.add_video("oldfilm", "Old film", formats=archive_org_formats(offline_youtube), url="https://archive.org/details/oldfilm")
+    spec = JobSpec(url=url, settings=DownloadSettings(download_subtitles=False), output_dir=str(tmp_path))
+    progress = Progress()
+    outcome = run_download(url, options_from_spec(spec, AccessLimits()), progress)
+    assert outcome["errors"] == []
+    item = outcome["items"][0]
+    assert Path(item["path"]).suffix == ".mp4" and item["extractor"] == "archiveorg"
+    texts = [text for _, text in progress.calls]
+    assert "影像下載完成" in texts
+    # Not stuck on 下載字幕... while the film itself downloads.
+    assert not any("字幕" in text for text in texts)
 
 
 def test_a_chosen_player_client_is_not_replaced(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:

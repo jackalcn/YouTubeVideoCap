@@ -47,6 +47,10 @@ PROTECTED_HOSTS = (
 PROTECTED_EXTRACTOR = "KnownDRM"
 # yt-dlp names what these find after the file or the page, so two sites can give the same name.
 URL_NAMED_EXTRACTORS = frozenset({"generic", "html5mediaembed"})
+# How much of a file says what kind it is: enough for two packets of a transport stream.
+MEDIA_SNIFF_BYTES = 512
+TS_PACKET_BYTES = 188
+TS_SYNC_BYTE = 0x47
 # The name part of a URL-keyed ID. yt-dlp's own can be a whole address, and the ID goes into file names.
 URL_KEYED_NAME_LENGTH = 40
 # How the sites people ask for most are shown; yt-dlp's extractor names start with these.
@@ -63,6 +67,11 @@ SITE_NAMES = (
     ("dailymotion", "Dailymotion"),
     ("niconico", "Niconico"),
     ("soundcloud", "SoundCloud"),
+    ("reddit", "Reddit"),
+    ("bluesky", "Bluesky"),
+    ("weibo", "微博"),
+    ("xiaohongshu", "小紅書"),
+    ("archiveorg", "Internet Archive"),
 )
 
 
@@ -180,3 +189,33 @@ def url_keyed_id(raw_id: str, page_url: str, media_url: str = "") -> str:
         parts.append(media_path)
     digest = hashlib.sha1("\n".join(parts).encode("utf-8", errors="replace")).hexdigest()[:8]
     return f"{raw_id[:URL_KEYED_NAME_LENGTH]}-{digest}"
+
+
+def media_extension_from_bytes(data: bytes) -> str:
+    """The extension for a media file that starts with these bytes, or "" when they are no kind known here. For a
+    direct link whose address has no extension and whose server calls the file plain data."""
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        return "mov" if brand == b"qt  " else "m4a" if brand in (b"M4A ", b"M4B ") else "mp4"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        # Matroska and WebM start alike, and name themselves a few bytes in.
+        return "webm" if b"webm" in data[:64] else "mkv"
+    if data.startswith(b"OggS"):
+        return "ogv" if b"theora" in data else "opus" if b"OpusHead" in data else "ogg"
+    if data.startswith(b"RIFF"):
+        return {b"AVI ": "avi", b"WAVE": "wav"}.get(data[8:12], "")
+    if data.startswith(b"FLV"):
+        return "flv"
+    if data.startswith(b"fLaC"):
+        return "flac"
+    # An MP3 starts with its tags, or with a frame: eleven set bits, then the layer.
+    if data.startswith(b"ID3") or (len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE6) == 0xE2):
+        return "mp3"
+    if data.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11"):
+        return "wmv"
+    if data.startswith(b"\x00\x00\x01\xba"):
+        return "mpg"
+    # A transport stream is a run of 188-byte packets, each starting with the same byte.
+    if len(data) > TS_PACKET_BYTES and data[0] == TS_SYNC_BYTE and data[TS_PACKET_BYTES] == TS_SYNC_BYTE:
+        return "ts"
+    return ""

@@ -17,11 +17,12 @@ from typing import Any, Callable, Mapping, Optional, Protocol, TypedDict, cast
 import yt_dlp
 import yt_dlp.downloader.external as ytdlp_external
 import yt_dlp.postprocessor.ffmpeg as ytdlp_ffmpeg
+from yt_dlp.networking import Request
 from yt_dlp.postprocessor import get_postprocessor
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 from yt_dlp.postprocessor.metadataparser import MetadataParserPP
-from yt_dlp.utils import DownloadCancelled, MaxDownloadsReached, PostProcessingError
+from yt_dlp.utils import MEDIA_EXTENSIONS, DownloadCancelled, MaxDownloadsReached, PostProcessingError
 
 from videocap.chinese import (
     TRADITIONAL_LANGUAGE,
@@ -65,14 +66,18 @@ from videocap.options import (
 )
 from videocap.processes import end_process_tree, remove_when_released, tie_to_app, tied_popen_options
 from videocap.sidecars import release_time, set_file_times, write_comments_csv, write_live_chat_csv, write_music_tags, write_nfo
-from videocap.sites import URL_NAMED_EXTRACTORS, is_youtube_url, url_keyed_id
+from videocap.sites import MEDIA_SNIFF_BYTES, URL_NAMED_EXTRACTORS, is_youtube_url, media_extension_from_bytes, url_keyed_id
 from videocap.subtitles import READABLE_SUBTITLE_EXTENSIONS, cues_to_srt, cues_to_vtt, cut_cues, read_subtitle_file, write_transcript
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status, get_free_disk_bytes
 
 
-# Subtitle tracks also reach the progress hook, and they are the only downloads without a vcodec.
-STREAM_LABELS: dict[Optional[str], str] = {"none": "音訊", None: "字幕"}
+VIDEO_STREAM_LABEL = "影像"
+AUDIO_STREAM_LABEL = "音訊"
 SUBTITLE_STREAM_LABEL = "字幕"
+# What a stream that came without codecs holds, by its extension: a direct link's file, or a site such as archive.org
+# that lists only its files' picture sizes.
+VIDEO_EXTENSIONS = frozenset(MEDIA_EXTENSIONS.video)
+AUDIO_EXTENSIONS = frozenset(MEDIA_EXTENSIONS.audio)
 # Keyed by each step's pp_key(): its class name without "PP", and without a leading "FFmpeg". The owner's 進階 yt-dlp
 # 參數 can add any of yt-dlp's own steps, so each of those has a label too.
 POSTPROCESSOR_LABELS = {
@@ -100,6 +105,7 @@ POSTPROCESSOR_LABELS = {
     "FixupTimestamp": "正在修正檔案...",
     "ScrubText": "正在整理文字...",
     "UrlKeyedId": "正在整理文字...",
+    "DirectLinkType": "正在確認檔案類型...",
     "CutClipSubtitles": "正在對齊片段字幕...",
     "MetadataParser": "正在整理影片資訊...",
     "MetadataFromField": "正在整理影片資訊...",
@@ -140,6 +146,8 @@ SIDECAR_PATHS_FIELD = "__videocap_sidecars"
 ITEM_INDEX_FIELD = "__videocap_item_index"
 # Marks a video whose ID UrlKeyedIdPP has already rewritten.
 URL_KEYED_FIELD = "__videocap_url_keyed"
+# The extension yt-dlp gives a direct link's file when nothing says what kind it is.
+UNKNOWN_VIDEO_EXTENSION = "unknown_video"
 # YouTube tracks that already are Taiwan Traditional, or close enough that a converted copy would add nothing.
 REAL_TRADITIONAL_TRACKS = frozenset({"zh-tw", "zh-hant"})
 
@@ -600,6 +608,36 @@ class UrlKeyedIdPP(PostProcessor):
         return [], information
 
 
+class DirectLinkTypePP(PostProcessor):
+    """Finds out what kind of file a direct link leads to when neither the link nor its server says: no extension in
+    the address, and the file sent as plain data. yt-dlp then saves it as ".unknown_video", which no player opens and
+    which ffmpeg cannot write tags or a cover to. How the file starts says what it is.
+
+    Runs at pre_process, before yt-dlp names the file, and for the preview too, which then shows the same name."""
+
+    def run(self, information: Any) -> tuple[list[str], Any]:
+        if information.get("direct") and information.get("ext") == UNKNOWN_VIDEO_EXTENSION and information.get("url"):
+            extension = self.read_extension(str(information["url"]))
+            if extension:
+                information["ext"] = extension
+        return [], information
+
+    def read_extension(self, url: str) -> str:
+        ydl = self._downloader
+        if ydl is None:
+            return ""
+        try:
+            # Through yt-dlp, so the proxy, the cookies and the headers are the download's own.
+            response = ydl.urlopen(Request(url, headers={"Range": f"bytes=0-{MEDIA_SNIFF_BYTES - 1}"}))
+            try:
+                return media_extension_from_bytes(response.read(MEDIA_SNIFF_BYTES))
+            finally:
+                response.close()
+        except Exception:
+            # The download itself will say what is wrong with the link.
+            return ""
+
+
 class CutClipSubtitlesPP(PostProcessor):
     """A clip's subtitle file is written for the whole video, so a player that loads it by name would show every
     line early. yt-dlp has written the file by before_dl, and the clip's own range sits in the section fields."""
@@ -887,6 +925,19 @@ class KeptFileCutPP(PostProcessor):
             return [], information
 
 
+def stream_label(info: Mapping[str, Any]) -> str:
+    """What a download that reaches the progress hook is: the video's picture, its sound, or a subtitle track."""
+    vcodec = info.get("vcodec")
+    if vcodec == "none":
+        return AUDIO_STREAM_LABEL
+    if vcodec is not None:
+        return VIDEO_STREAM_LABEL
+    # Subtitle tracks have no vcodec either, but every one of the video's formats has a format ID and they have none.
+    if not info.get("format_id"):
+        return SUBTITLE_STREAM_LABEL
+    return AUDIO_STREAM_LABEL if str(info.get("ext") or "").lower() in AUDIO_EXTENSIONS else VIDEO_STREAM_LABEL
+
+
 class ProgressTracker:
     """Combines yt-dlp's per-stream callbacks into one bar across a video's streams and a playlist's videos."""
 
@@ -917,7 +968,7 @@ class ProgressTracker:
 
     def on_stream_progress(self, data: dict[str, Any]) -> None:
         info = cast(dict[str, Any], data.get("info_dict") or {})
-        stream = STREAM_LABELS.get(info.get("vcodec"), "影像")
+        stream = stream_label(info)
         status = data.get("status")
 
         if status == "finished":
@@ -1374,6 +1425,7 @@ def download_once(
         if options.other_sites:
             # Only these options can reach the extractors whose IDs need it.
             ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")
+            ydl.add_post_processor(DirectLinkTypePP(), when="pre_process")
         if options.time_ranges and options.download_subtitles:
             ydl.add_post_processor(CutClipSubtitlesPP(), when="before_dl")
         if options.save_live_chat:
@@ -1435,7 +1487,7 @@ def download_once(
     for item in items:
         finish_item_sidecars(item, options, notes)
 
-    humanized = [humanize_ytdlp_error(message) for message in errors]
+    humanized = [humanize_ytdlp_error(message, url) for message in errors]
     if wanted_wait and not wait_live and any(marker in message.lower() for message in errors for marker in UPCOMING_MARKERS):
         notes.append(LIVE_WAIT_NEEDS_FFMPEG_NOTE)
     if any(WHOLE_VIDEO_CUT_MARKER in warning for warning in logger.warnings):
@@ -1640,7 +1692,7 @@ def run_download(
         outcome = download_with_ytdlp(url, options, progress_ui, status_ui, should_stop, on_log)
     except Exception as exc:
         outcome = empty_outcome()
-        outcome["errors"].append(humanize_ytdlp_error(str(exc)))
+        outcome["errors"].append(humanize_ytdlp_error(str(exc), url))
         return outcome
 
     if any("account cookies are no longer valid" in message for message in outcome["warnings"]):
