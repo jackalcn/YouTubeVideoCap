@@ -43,6 +43,8 @@ from videocap.config import (
     VIDEO_QUALITY_OPTIONS,
     YOUTUBE_EXTRACTORS,
 )
+# Imported by everything that builds a YoutubeDL: importing it is what keeps impersonation away from YouTube.
+from videocap import impersonation
 from videocap.settings import DownloadSettings, JobSpec
 from videocap.sites import is_youtube_url
 from videocap.urls import apply_channel_tab, parse_date_filter, parse_time_ranges, url_identity, validate_playlist_items
@@ -99,6 +101,8 @@ APP_MANAGED_YTDLP_KEYS = frozenset(
         "max_downloads",
         # yt-dlp's own wait lets neither pause nor cancel through and never gives up; 等待開播 does both.
         "wait_for_video",
+        # Every request of the job would pass for a browser, YouTube's too: see videocap.impersonation.
+        "impersonate",
     }
 )
 # With any of these yt-dlp only lists information, or saves no complete file, and the job would end as done without one.
@@ -286,6 +290,9 @@ class DownloadOptions:
     # Whether links to sites other than YouTube may be fetched: see OTHER_SITES_OWNER_ONLY_MESSAGE. Off unless
     # options_from_spec turns it on for this machine's owner, because AccessLimits() itself is trusted by default.
     other_sites: bool = False
+    # Sends every request of the run the way a browser would, which a site's check for bots may insist on. Set only
+    # for the one retry of the owner's link to another site, after the site refused the first try.
+    impersonate: bool = False
 
 
 class YtDlpLogger(Protocol):
@@ -351,6 +358,7 @@ def build_base_options(
     network: Optional[NetworkOptions] = None,
     noplaylist: bool = True,
     other_sites: bool = False,
+    impersonate: bool = False,
 ) -> dict[str, Any]:
     network = network or NetworkOptions()
     base_opts: dict[str, Any] = {
@@ -379,6 +387,10 @@ def build_base_options(
     youtube_args = youtube_extractor_args(network, login)
     if youtube_args:
         base_opts["extractor_args"] = {"youtube": youtube_args}
+    if impersonate and other_sites and impersonation.ready():
+        # yt-dlp's option for the whole run, because its generic extractor's own switch covers only the first request
+        # and leaves out a stream's playlist and segments. impersonation.youtube_dl drops it again for a YouTube link.
+        base_opts["impersonate"] = impersonation.any_browser()
     return base_opts
 
 
@@ -540,7 +552,9 @@ def build_late_postprocessors(options: DownloadOptions, ffmpeg_available: bool) 
 
 
 def build_ydl_options(options: DownloadOptions, ffmpeg_available: bool, logger: YtDlpLogger) -> dict[str, Any]:
-    ydl_opts = build_base_options(logger, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites)
+    ydl_opts = build_base_options(
+        logger, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites, options.impersonate
+    )
     ydl_opts.update(
         {
             "paths": {"home": str(options.output_dir)},

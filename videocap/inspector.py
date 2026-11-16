@@ -9,6 +9,7 @@ from typing import Any, Optional, TypedDict, cast
 
 import yt_dlp
 
+from videocap import impersonation
 from videocap.config import (
     COMMENT_EXPORT_MAX,
     EXPIRED_LOGIN_MESSAGE,
@@ -391,7 +392,9 @@ def preview_extension(info: Mapping[str, Any], options: DownloadOptions, ffmpeg_
 def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
     ffmpeg_available, _ = get_ffmpeg_status()
     log = YtDlpLogCollector()
-    opts = build_base_options(log, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites)
+    opts = build_base_options(
+        log, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites, options.impersonate
+    )
     opts.update(build_format_options(options, ffmpeg_available))
     opts.update(
         {
@@ -409,7 +412,7 @@ def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
     clip = {"section_start": options.time_ranges[0][0], "section_end": options.time_ranges[0][1]} if options.time_ranges else {}
     has_media = options.media_type != "none"
     try:
-        with yt_dlp.YoutubeDL(cast(Any, opts)) as ydl:
+        with impersonation.youtube_dl(yt_dlp.YoutubeDL, opts, url, options.other_sites) as ydl:
             if options.other_sites:
                 # The same ID the download will give a direct link's or a page's video, and so the same file name.
                 ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")

@@ -24,6 +24,7 @@ from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 from yt_dlp.utils import MEDIA_EXTENSIONS, DownloadCancelled, MaxDownloadsReached, PostProcessingError
 
+from videocap import impersonation
 from videocap.chinese import (
     TRADITIONAL_LANGUAGE,
     ChineseConversionUnavailable,
@@ -1416,7 +1417,7 @@ def download_once(
     stopped = False
     expired_wait = ""
     watchdog = FfmpegWatchdog(should_stop or (lambda: False), options.max_bytes, logger)
-    with watchdog, yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
+    with watchdog, impersonation.youtube_dl(yt_dlp.YoutubeDL, ydl_opts, url, options.other_sites) as ydl:
         if wait_live:
             watch_live_wait(ydl, progress_ui)
         # With skip_download yt-dlp never reaches post_process, and before_dl is the last step it still runs.

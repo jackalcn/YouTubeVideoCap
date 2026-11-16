@@ -31,6 +31,17 @@ def isolated_engine(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytes
 
 
 @pytest.fixture(autouse=True)
+def no_impersonation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """curl-cffi may or may not be installed where the tests run, and that must not change what a test sees: none has
+    模擬瀏覽器 unless it asks for it, with the browser fixture of fake_browser.py."""
+    import videocap.impersonation as impersonation
+
+    monkeypatch.setattr(impersonation, "_kept", ())
+    monkeypatch.setattr(impersonation, "_problem", "")
+    monkeypatch.setattr(impersonation, "_unsupported", "")
+
+
+@pytest.fixture(autouse=True)
 def no_real_recycle_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests delete only their own temp files, which the library already removes for good; this keeps the real
     recycle bin out of it even when pytest's temp folder is moved somewhere else."""
