@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from videocap.errors import humanize_ytdlp_error, is_network_loss, is_rate_limited
+from videocap.errors import failure_hint, failure_kind, humanize_ytdlp_error, is_network_loss, is_rate_limited, is_unreachable
 
 
 # Messages as yt-dlp words them (or as Windows words them in Traditional Chinese), with the hint each should get.
@@ -144,7 +144,7 @@ def test_a_title_in_a_postprocessing_error_does_not_pick_the_hint() -> None:
         ("ERROR: [youtube] jNQXAC9IVRw: Private video. Sign in if you've been granted access to this video", False, False),
         ("ERROR: HTTP Error 403: Forbidden", False, False),
         # A title in a path names neither: the disk is full.
-        ("ERROR: unable to write data: [Errno 28] No space left on device: 'D:\Videos\Too Many Requests, Try Again Later.mp4'", False, False),
+        ("ERROR: unable to write data: [Errno 28] No space left on device: 'D:\\Videos\\Too Many Requests, Try Again Later.mp4'", False, False),
     ],
 )
 def test_rate_limits_and_lost_connections_are_told_apart(message: str, rate_limited: bool, network_loss: bool) -> None:
@@ -163,3 +163,261 @@ def test_a_long_message_keeps_its_kind_after_it_is_cut_short() -> None:
     assert "429" not in humanized
     assert is_rate_limited(humanized) and not is_network_loss(humanized)
     assert not is_rate_limited("") and not is_network_loss("")
+
+
+# Other sites. yt-dlp starts an extractor's message with its name, which is how the hint knows the site.
+
+COOKIES_HOWTO = "See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies"
+COOKIES_ADVICE = f"Use --cookies-from-browser or --cookies for the authentication. {COOKIES_HOWTO}"
+CREDENTIALS_ADVICE = f"Use --cookies, --cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (vimeo) to provide account credentials. {COOKIES_HOWTO}"
+REPORT_ADVICE = (
+    "please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. "
+    "Confirm you are on the latest version using  yt-dlp -U"
+)
+CLOUDFLARE = (
+    "ERROR: [generic] page: Got HTTP Error 403 caused by Cloudflare anti-bot challenge; see  https://github.com/yt-dlp/yt-dlp#impersonation  "
+    'for how to install the required impersonation dependency, and try again with  --extractor-args "generic:impersonate"'
+)
+
+
+def hint_of(message: str) -> str:
+    """The app's words, without the original quoted after them."""
+    return humanize_ytdlp_error(message).partition("（原始訊息：")[0]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("ERROR: Unsupported URL: https://example.com/about", "找不到可以下載的影片"),
+        ("ERROR: No suitable extractor found for URL https://example.com/about", "找不到可以下載的影片"),
+        (f"ERROR: [facebook] 1234567890: This video is only available for registered users. {COOKIES_ADVICE}", "Facebook 需要登入"),
+        (f"ERROR: [vimeo] 76979871: This video is only available for registered users. {CREDENTIALS_ADVICE}", "Vimeo 需要登入"),
+        (
+            "ERROR: [instagram] C1a2b3c4d5e: The webpage request was redirected to the login page. "
+            f"You have exceeded the rate-limit for accessing posts anonymously. {COOKIES_ADVICE}",
+            "Instagram 需要登入",
+        ),
+        (f"ERROR: [twitter] 1700000000000000000: NSFW tweet requires authentication. {COOKIES_ADVICE}", "X（Twitter）需要登入"),
+        ("ERROR: [generic] members: Login required to download: members only", "這個網站需要登入"),
+        (
+            "ERROR: [BiliBili] BV1xx411c7mD: This video is not available from your location due to geo restriction\n"
+            "This video is available in Japan.\nYou might want to use a VPN or a proxy server (with --proxy) to workaround.",
+            "所在地區無法觀看",
+        ),
+        ("ERROR: [vimeo] 76979871: The uploader has not made this video available in your country.", "所在地區無法觀看"),
+        ("ERROR: [generic] missing: Unable to download webpage: HTTP Error 404: File not found (caused by <HTTPError 404: File not found>)", "找不到這部影片"),
+        ("ERROR: [vimeo] 76979871: Unable to download JSON metadata: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)", "連結可能已失效或打錯了"),
+        ("ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)", "這個網站拒絕了下載請求"),
+        ("ERROR: [vimeo] 76979871: Unable to download JSON metadata: HTTP Error 403: Forbidden", "Vimeo 拒絕了下載請求"),
+        (
+            "ERROR: [DRM] watch: The requested site is known to use DRM protection. It will NOT be supported.\n"
+            "Please DO NOT open an issue, unless you have evidence that the video is not DRM protected",
+            "DRM",
+        ),
+        ("ERROR: [vimeo] 76979871: This video is DRM protected", "受 DRM 保護，無法下載"),
+        (
+            "ERROR: [Piracy] watch: This website is no longer supported since it has been determined to be primarily used for piracy.\n"
+            "DO NOT open issues for it",
+            "yt-dlp 不支援這個網站",
+        ),
+        (CLOUDFLARE, "這個網站需要模擬瀏覽器"),
+        (
+            "ERROR: [vimeo] 76979871: The extractor is attempting impersonation, but no impersonate target is available. "
+            "See  https://github.com/yt-dlp/yt-dlp#impersonation  for information on installing the required dependencies",
+            "Vimeo 需要模擬瀏覽器",
+        ),
+        ("ERROR: [vimeo] 76979871: Unable to download JSON metadata: HTTP Error 429: Too Many Requests", "Vimeo 暫時限制了請求頻率"),
+        ("ERROR: [generic] Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo failed>", "連不上這個網站"),
+        (f"ERROR: [vimeo] 76979871: An extractor error has occurred. (caused by KeyError('config')); {REPORT_ADVICE}", "讀不懂 Vimeo 這次的回應"),
+        # A name that comes with its extractor's key: archive.org is ArchiveOrg.
+        ("ERROR: [archive.org] oldfilm: Unable to download JSON metadata: HTTP Error 403: Forbidden", "Internet Archive 拒絕了下載請求"),
+    ],
+)
+def test_other_sites_errors_get_a_hint_of_their_own(message: str, expected: str) -> None:
+    humanized = humanize_ytdlp_error(message)
+    assert expected in humanized and "原始訊息" in humanized
+    hint = hint_of(message)
+    # Nothing that holds only for YouTube: its player clients, its rate limits, or its cloud-host advice.
+    assert "YouTube" not in hint and "用戶端" not in hint and "雲端主機" not in hint
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)",
+        CLOUDFLARE,
+    ],
+)
+def test_another_sites_refusal_suggests_a_login_rather_than_an_update(message: str) -> None:
+    hint = hint_of(message)
+    assert "檢查新版本" not in hint and "更新" not in hint
+    # Nothing to install either: the app leaves out what impersonation needs on purpose.
+    assert "安裝" not in hint and "pip" not in hint
+
+
+def test_protected_and_refused_sites_are_not_worked_around() -> None:
+    drm = hint_of("ERROR: [vimeo] 76979871: This video is DRM protected")
+    site = hint_of("ERROR: [DRM] watch: The requested site is known to use DRM protection. It will NOT be supported.")
+    for hint in (drm, site):
+        assert "無法下載" in hint
+        assert not any(word in hint for word in ("登入", "VPN", "代理", "cookies", "再試"))
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # YouTube's own messages carry yt-dlp's advice about cookies too, yet each keeps the hint that names its reason.
+        (f"ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. {COOKIES_ADVICE}", "YouTube 要求驗證身分"),
+        (f"ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm your age. This video may be inappropriate for some users. {COOKIES_ADVICE}", "年齡限制"),
+        (f"ERROR: [youtube] jNQXAC9IVRw: Private video. Sign in if you've been granted access to this video. {COOKIES_ADVICE}", "私人影片"),
+        (
+            "ERROR: [youtube] jNQXAC9IVRw: This content isn't available, try again later. The current session has been rate-limited by YouTube "
+            "for up to an hour. It is recommended to use `-t sleep` to add a delay between video requests to avoid exceeding the rate limit.",
+            "YouTube 暫時限制了請求頻率",
+        ),
+        (f"ERROR: [youtube:tab] FEsubscriptions: Login details are needed to download this content. {COOKIES_ADVICE}", "需要登入 YouTube"),
+        # A tag of one of yt-dlp's own steps names no site.
+        ("ERROR: [download] Got error: HTTP Error 403: Forbidden", "YouTube 拒絕了下載請求"),
+        ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "YouTube 拒絕了下載請求"),
+        ("ERROR: Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo failed>", "連不上 YouTube"),
+        ("ERROR: No suitable extractor found for URL https://www.youtube.com/about", "無法辨識這個網址"),
+        ("ERROR: No suitable extractor found for URL youtu.be/jNQXAC9IVRw", "無法辨識這個網址"),
+        # YouTube's videos in a web archive are still YouTube's.
+        ("ERROR: [web.archive:youtube] jNQXAC9IVRw: HTTP Error 403: Forbidden", "YouTube 拒絕了下載請求"),
+    ],
+)
+def test_youtubes_messages_keep_youtubes_words(message: str, expected: str) -> None:
+    hint = hint_of(message)
+    assert expected in hint and "這個網站" not in hint
+
+
+@pytest.mark.parametrize(
+    ("youtube", "youtube_words", "other"),
+    [
+        ("[youtube] jNQXAC9IVRw: HTTP Error 429: Too Many Requests", "YouTube 暫時限制", "[vimeo] 76979871: HTTP Error 429: Too Many Requests"),
+        ("[youtube] jNQXAC9IVRw: Sign in to confirm you're not a bot", "YouTube 要求驗證身分", "[vimeo] 76979871: Sign in to confirm you're not a bot"),
+        ("[youtube] jNQXAC9IVRw: HTTP Error 403: Forbidden", "YouTube 拒絕", "[vimeo] 76979871: HTTP Error 403: Forbidden"),
+        ("[youtube] jNQXAC9IVRw: No video formats found!", "YouTube 沒有提供", "[vimeo] 76979871: No video formats found!"),
+        ("[youtube] jNQXAC9IVRw: Your IP is likely being blocked by Youtube", "YouTube 封鎖", "[vimeo] 76979871: Your IP is likely being blocked"),
+        ("[youtube] jNQXAC9IVRw: Join this channel to get access to members-only content", "頻道會員", "[vimeo] 76979871: members-only content"),
+        (f"[youtube] jNQXAC9IVRw: Oops. {REPORT_ADVICE}", "讀不懂 YouTube", f"[vimeo] 76979871: Oops. {REPORT_ADVICE}"),
+    ],
+)
+def test_a_hint_names_the_site_its_message_came_from(youtube: str, youtube_words: str, other: str) -> None:
+    youtube_hint, other_hint = hint_of(youtube), hint_of(other)
+    assert youtube_words in youtube_hint and "Vimeo" not in youtube_hint
+    assert "Vimeo" in other_hint and "YouTube" not in other_hint
+    # One kind of failure, whichever site it named.
+    assert failure_kind(youtube) == failure_kind(other) is not None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR: [vimeo] 76979871: The page needs to be reloaded.",
+        "ERROR: [vimeo] 76979871: This channel does not have a videos tab",
+        "ERROR: [vimeo] 76979871: No supported JavaScript runtime could be found",
+    ],
+)
+def test_youtubes_own_advice_is_not_given_for_another_site(message: str) -> None:
+    hint = hint_of(message)
+    assert "用戶端" not in hint and "頻道內容" not in hint and "Deno" not in hint
+
+
+def test_a_404_while_downloading_a_youtube_stream_still_gets_no_hint() -> None:
+    # Only another site's 404 says the link is gone; YouTube's own are its channels', which have their hint.
+    assert humanize_ytdlp_error("ERROR: [youtube] jNQXAC9IVRw: HTTP Error 404: Not Found") == "[youtube] jNQXAC9IVRw: HTTP Error 404: Not Found"
+    assert hint_of("ERROR: [youtube:tab] @nobody: Unable to download API page: HTTP Error 404: Not Found").startswith("找不到這個頻道")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # A title in a file's path cannot pick the hint, on any site.
+        ("ERROR: unable to write data: [Errno 28] No space left on device: 'D:\\Videos\\Login required [clip-3f9a1c2e].mp4'", "硬碟空間不足"),
+        ("ERROR: Unable to rename file: [WinError 5] 存取被拒。: 'D:\\Videos\\HTTP Error 404 [clip-3f9a1c2e].mp4.part'", "沒有權限"),
+        # Cloudflare's check is an HTTP 403 that impersonation would get past.
+        (CLOUDFLARE, "模擬瀏覽器"),
+        # The DRM list's own words also say "will NOT be supported".
+        ("ERROR: [DRM] watch: The requested site is known to use DRM protection. It will NOT be supported.", "DRM"),
+        # A reason that is not a login comes before yt-dlp's advice about cookies.
+        (f"ERROR: [vimeo] 76979871: This video is DRM protected. {COOKIES_ADVICE}", "DRM"),
+        (f"ERROR: [vimeo] 76979871: Private video. Login if you have permissions to watch. {COOKIES_ADVICE}", "私人影片"),
+        ("ERROR: [vimeo] 76979871: HTTP Error 429: Too Many Requests. Login required to avoid this", "暫時限制了請求頻率"),
+    ],
+)
+def test_the_first_matching_hint_wins_for_other_sites_too(message: str, expected: str) -> None:
+    assert expected in hint_of(message)
+
+
+# What the queue acts on, for other sites: they name their site in the hint, and it is still the same kind of failure.
+@pytest.mark.parametrize(
+    ("message", "rate_limited", "network_loss", "unreachable"),
+    [
+        ("ERROR: [vimeo] 76979871: Unable to download JSON metadata: HTTP Error 429: Too Many Requests", True, False, False),
+        ("ERROR: [vimeo] 76979871: Sign in to confirm you're not a bot", True, False, False),
+        ("ERROR: [generic] Unable to download webpage: <urlopen error [WinError 10061] 無法連線，因為目標電腦拒絕連線。>", False, True, True),
+        ("ERROR: [generic] clip: Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo failed>", False, True, True),
+        ("ERROR: [archive.org] oldfilm: Unable to download webpage: [WinError 10060] 連線嘗試失敗", False, True, True),
+        ("ERROR: [WinError 10054] 遠端主機已強制關閉一個現存的連線。", False, True, False),
+        ("ERROR: Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo failed>", False, True, True),
+        ("ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden", False, False, False),
+        ("ERROR: [generic] missing: Unable to download webpage: HTTP Error 404: File not found", False, False, False),
+        (CLOUDFLARE, False, False, False),
+    ],
+)
+def test_other_sites_failures_keep_their_kind_once_put_in_words(message: str, rate_limited: bool, network_loss: bool, unreachable: bool) -> None:
+    humanized = humanize_ytdlp_error(message)
+    for text in (message, humanized):
+        assert is_rate_limited(text) is rate_limited
+        assert is_network_loss(text) is network_loss
+        assert is_unreachable(text) is unreachable
+    assert failure_kind(humanized) == failure_kind(message)
+    assert failure_hint(humanized) == failure_hint(message) and humanized.startswith(str(failure_hint(message)))
+
+
+def test_another_sites_long_message_keeps_its_kind_after_it_is_cut_short() -> None:
+    message = f"ERROR: [vimeo] 76979871: {'x' * 300} HTTP Error 429: Too Many Requests"
+    humanized = humanize_ytdlp_error(message)
+    assert humanized.startswith("Vimeo 暫時限制了請求頻率") and "429" not in humanized
+    assert is_rate_limited(humanized) and not is_network_loss(humanized)
+
+
+# A message that names no site
+
+UNNAMED_REFUSAL = "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+
+
+@pytest.mark.parametrize(
+    ("url", "start"),
+    [
+        ("https://vimeo.com/76979871", "Vimeo 拒絕了下載請求（HTTP 403）"),
+        ("https://cdn.example.com/files/a.mp4?sig=1", "這個網站拒絕了下載請求（HTTP 403）"),
+        ("https://example.com/article", "這個網站拒絕了下載請求（HTTP 403）"),
+        ("https://www.youtube.com/watch?v=jNQXAC9IVRw", "YouTube 拒絕了下載請求。"),
+        ("https://youtu.be/jNQXAC9IVRw", "YouTube 拒絕了下載請求。"),
+        # No link is known, as for a message put in words long after: it reads as it always has.
+        ("", "YouTube 拒絕了下載請求。"),
+    ],
+)
+def test_a_failure_that_names_no_site_is_about_the_site_of_its_link(url: str, start: str) -> None:
+    assert humanize_ytdlp_error(UNNAMED_REFUSAL, url).startswith(start)
+
+
+def test_a_step_tag_names_no_site_either() -> None:
+    message = "ERROR: [download] Got error: HTTP Error 429: Too Many Requests"
+    assert humanize_ytdlp_error(message, "https://vimeo.com/76979871").startswith("Vimeo 暫時限制了請求頻率")
+    assert humanize_ytdlp_error(message, "https://youtu.be/jNQXAC9IVRw").startswith("YouTube 暫時限制了請求頻率")
+
+
+def test_the_site_a_message_names_counts_before_its_links() -> None:
+    # A page elsewhere that plays a YouTube video fails as YouTube does.
+    embedded = "ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot"
+    assert humanize_ytdlp_error(embedded, "https://example.com/post").startswith("YouTube 要求驗證身分")
+    named = "ERROR: [vimeo] 76979871: Unable to download JSON metadata: HTTP Error 403: Forbidden"
+    assert humanize_ytdlp_error(named, "https://example.com/post").startswith("Vimeo 拒絕了下載請求（HTTP 403）")
+
+
+def test_a_failure_keeps_its_kind_whichever_site_its_link_names() -> None:
+    limited = humanize_ytdlp_error("ERROR: unable to download video data: HTTP Error 429: Too Many Requests", "https://vimeo.com/1")
+    assert failure_kind(limited) == "rate_limit" and is_rate_limited(limited)
