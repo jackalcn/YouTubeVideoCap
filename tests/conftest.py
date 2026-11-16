@@ -39,6 +39,7 @@ def no_impersonation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(impersonation, "_kept", ())
     monkeypatch.setattr(impersonation, "_problem", "")
     monkeypatch.setattr(impersonation, "_unsupported", "")
+    monkeypatch.setattr(impersonation, "installed_version", lambda: "")
 
 
 @pytest.fixture(autouse=True)

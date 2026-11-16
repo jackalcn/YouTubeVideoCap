@@ -6,6 +6,7 @@ from typing import Any
 
 import streamlit as st
 
+from videocap import impersonation
 from videocap.config import (
     AUDIO_BITRATE_OPTIONS,
     AUDIO_FORMAT_OPTIONS,
@@ -684,6 +685,9 @@ def render_tool_warnings(ctx: AppContext) -> None:
     if not ctx.js_runtime_available:
         st.warning(f"未偵測到 Deno，目前可用格式可能受限。{JS_RUNTIME_HINT}")
         st.caption(f"Deno 狀態：{ctx.js_runtime_status}")
+    if ctx.trusted and impersonation.problem():
+        # Said on every page, not only on 系統: until the restart, YouTube's subtitles may fail to download.
+        st.warning(impersonation.NOT_SEPARATE_MESSAGE)
 
 
 def render_settings_sidebar(ctx: AppContext) -> None:

@@ -206,6 +206,100 @@ def test_requirements_speech_lists_what_the_buttons_install() -> None:
     assert [line.removeprefix("# ") for line in lines if line.removeprefix("# ") in tooling.GPU_INSTALL_TARGETS] == list(tooling.GPU_INSTALL_TARGETS)
 
 
+# Installing, removing and keeping 模擬瀏覽器
+
+
+@pytest.fixture
+def browser_pip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakePip:
+    """Stands in for pip installing or removing curl-cffi, on a machine that has none. What is on disk and in memory
+    afterwards is each test's to say; the switch in the data folder is the real one."""
+    import videocap.impersonation as impersonation
+
+    monkeypatch.setenv("VIDEOCAP_DATA_DIR", str(tmp_path / "data"))
+    fake = FakePip("")
+    monkeypatch.setattr(tooling.subprocess, "run", fake)
+    monkeypatch.setattr(impersonation, "_taken", {})
+    monkeypatch.setattr(impersonation, "package_is_loaded", lambda: False)
+    monkeypatch.setattr(impersonation, "installed_version", lambda: "")
+    return fake
+
+
+def test_impersonation_installs_the_curl_cffi_that_the_installed_yt_dlp_asks_for(browser_pip: FakePip, monkeypatch: pytest.MonkeyPatch) -> None:
+    import videocap.impersonation as impersonation
+
+    # yt-dlp's handler for the package loads once pip is done.
+    monkeypatch.setattr(impersonation, "load", lambda: monkeypatch.setattr(impersonation, "_kept", (object(),)))
+    result = tooling.install_impersonation(proxy="http://proxy.example:8080")
+    assert result.succeeded and not result.restart_required
+    command = browser_pip.pip_command
+    # yt-dlp's own extra, so that pip picks a version this yt-dlp takes, whichever yt-dlp it is.
+    assert command[:4] == [sys.executable, "-m", "pip", "install"] and command[-1] == "yt-dlp[curl-cffi]"
+    # --upgrade would also replace yt-dlp, which the running app has imported.
+    assert "--upgrade" not in command
+    assert command[command.index("--proxy") + 1] == "http://proxy.example:8080"
+
+
+def test_an_impersonation_install_that_yt_dlp_cannot_load_yet_asks_for_a_restart(browser_pip: FakePip) -> None:
+    result = tooling.install_impersonation()
+    assert result.succeeded and result.restart_required
+    assert "--proxy" not in browser_pip.pip_command
+
+
+def test_a_failed_impersonation_install_shows_pips_output(browser_pip: FakePip) -> None:
+    browser_pip.returncode = 1
+    assert tooling.install_impersonation() == tooling.UpdateResult(False, "Requirement already satisfied")
+    with tooling._pip_lock:
+        assert tooling.install_impersonation() == tooling.UpdateResult(False, tooling.PIP_BUSY_MESSAGE)
+        assert tooling.remove_impersonation() == tooling.UpdateResult(False, tooling.PIP_BUSY_MESSAGE)
+
+
+@pytest.mark.parametrize("files_are_locked", [False, True])
+def test_impersonation_is_removed_with_pip_and_nothing_stays_switched_off(browser_pip: FakePip, monkeypatch: pytest.MonkeyPatch, files_are_locked: bool) -> None:
+    import videocap
+    import videocap.impersonation as impersonation
+
+    # Switched off since the app started, so the package was never loaded and Windows has nothing to hold on to.
+    monkeypatch.setattr(tooling, "LOADED_FILES_ARE_LOCKED", files_are_locked)
+    impersonation.write_switch(impersonation.BY_OWNER)
+    result = tooling.remove_impersonation()
+    assert result.succeeded and not result.restart_required
+    assert browser_pip.pip_command == [sys.executable, "-m", "pip", "uninstall", "--yes", "curl-cffi"]
+    # A later install starts switched on.
+    assert not videocap.impersonation_switch().exists()
+
+
+def test_on_windows_a_loaded_package_is_switched_off_and_removed_after_a_restart(browser_pip: FakePip, monkeypatch: pytest.MonkeyPatch) -> None:
+    import videocap.impersonation as impersonation
+
+    monkeypatch.setattr(tooling, "LOADED_FILES_ARE_LOCKED", True)
+    monkeypatch.setattr(impersonation, "package_is_loaded", lambda: True)
+    monkeypatch.setattr(impersonation, "check", lambda: "")
+    result = tooling.remove_impersonation()
+    assert result == tooling.UpdateResult(False, tooling.REMOVE_AFTER_RESTART_MESSAGE, restart_required=True)
+    # pip would fail half-way on the file Windows will not let go of, and leave the package broken.
+    assert browser_pip.commands == []
+    assert impersonation.switched_off() == (impersonation.BY_OWNER, "")
+
+    # Elsewhere a loaded file can be deleted, so it is removed at once.
+    monkeypatch.setattr(tooling, "LOADED_FILES_ARE_LOCKED", False)
+    assert tooling.remove_impersonation().succeeded and impersonation.switched_off() == ("", "")
+
+
+def test_a_yt_dlp_update_takes_curl_cffi_along_only_when_it_is_installed(running_ytdlp: Callable[[str, str, str], FakePip], monkeypatch: pytest.MonkeyPatch) -> None:
+    import videocap.impersonation as impersonation
+
+    monkeypatch.setattr(impersonation, "installed_version", lambda: "")
+    fake = running_ytdlp("2026.10.21", "2026.10.26", "2026.10.26")
+    tooling.install_ytdlp_update()
+    assert fake.pip_command[-2:] == ["--upgrade", "yt-dlp[default,deno]"]
+
+    # With yt-dlp's extra for it, pip keeps a curl-cffi the new yt-dlp takes and replaces one it does not.
+    monkeypatch.setattr(impersonation, "installed_version", lambda: "0.17.0")
+    fake = running_ytdlp("2026.10.21", "2026.10.26", "2026.10.26")
+    tooling.install_ytdlp_update()
+    assert fake.pip_command[-2:] == ["--upgrade", "yt-dlp[default,deno,curl-cffi]"]
+
+
 def test_a_user_install_that_made_the_user_folder_is_importable_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """In Docker pip installs into PYTHONUSERBASE, whose site-packages Python only adds at start when it exists."""
     import site
@@ -411,11 +505,14 @@ def test_no_tool_opens_a_console_window(monkeypatch: pytest.MonkeyPatch, tmp_pat
     tooling.installed_ytdlp_version()
     tooling.install_ytdlp_update()
     tooling.install_speech_recognition()
+    monkeypatch.setenv("VIDEOCAP_DATA_DIR", str(tmp_path / "data"))
+    tooling.install_impersonation()
+    tooling.remove_impersonation()
     monkeypatch.delenv("SOURCE_COMMIT", raising=False)
     monkeypatch.delenv("GITHUB_SHA", raising=False)
     environment.detect_runtime_commit_short()
     expected = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    assert len(flags) >= 6 and set(flags) == {expected}
+    assert len(flags) >= 8 and set(flags) == {expected}
 
 
 # Starting with Windows

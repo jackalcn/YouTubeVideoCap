@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from yt_dlp.version import __version__ as YT_DLP_VERSION
 
+from videocap import impersonation
 from videocap.config import LOCAL_RUN_GUIDE_URL
 
 try:
@@ -39,16 +40,21 @@ except ImportError:
 JS_RUNTIMES = (("deno", "--version"), ("node", "--version"), ("bun", "--version"))
 PYPI_YT_DLP_URL = "https://pypi.org/pypi/yt-dlp/json"
 YT_DLP_INSTALL_TARGET = "yt-dlp[default,deno]"
+# With yt-dlp's own extra for curl-cffi, which the update asks for once 模擬瀏覽器 is installed.
+YT_DLP_WITH_IMPERSONATION_TARGET = "yt-dlp[default,deno,curl-cffi]"
 # The same as requirements-speech.txt, which the Docker image does not carry.
 SPEECH_INSTALL_TARGET = "faster-whisper>=1.1"
 # What CTranslate2 needs to run Whisper on an NVIDIA card: cuBLAS for CUDA 12. Its Windows and Linux builds call no cuDNN.
 GPU_INSTALL_TARGETS = ("nvidia-cublas-cu12",)
 PIP_BUSY_MESSAGE = "另一個安裝或更新還在進行，請等它完成後再試一次。"
+REMOVE_AFTER_RESTART_MESSAGE = "Windows 無法刪除執行中的 App 已經載入的檔案，所以先把模擬瀏覽器停用了。請重新啟動 App，再按一次「移除模擬瀏覽器」。"
 GITHUB_API = "https://api.github.com"
 # GitHub refuses API requests without one.
 APP_USER_AGENT = "YouTube-VideoCap"
 # A hidden copy started at sign-in must not flash a console window for every tool it runs.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+# Windows refuses to delete or replace a file that a running program has loaded, such as a package in use.
+LOADED_FILES_ARE_LOCKED = os.name == "nt"
 
 
 def probe_executable(name: str, version_flag: str, search_path: Optional[str] = None) -> tuple[bool, str]:
@@ -185,9 +191,13 @@ _pip_lock = threading.Lock()
 
 
 def run_pip_install(arguments: list[str], timeout: float, proxy: str = "") -> tuple[Optional[int], str]:
-    """pip install into the running interpreter's environment, one at a time: two at once can leave it half
-    installed. Returns pip's exit code and the end of its output, or None and why pip did not run."""
-    command = [sys.executable, "-m", "pip", "install", *arguments]
+    return run_pip("install", arguments, timeout, proxy)
+
+
+def run_pip(action: str, arguments: list[str], timeout: float, proxy: str = "") -> tuple[Optional[int], str]:
+    """pip in the running interpreter's environment, one at a time: two at once can leave it half installed. Returns
+    pip's exit code and the end of its output, or None and why pip did not run."""
+    command = [sys.executable, "-m", "pip", action, *arguments]
     if proxy:
         command[4:4] = ["--proxy", proxy]
     if not _pip_lock.acquire(blocking=False):
@@ -235,10 +245,49 @@ def install_gpu_support(timeout: float = 1800, proxy: str = "") -> UpdateResult:
     return UpdateResult(True, output)
 
 
+def install_impersonation(timeout: float = 600, proxy: str = "") -> UpdateResult:
+    """Installs curl-cffi for 模擬瀏覽器, in a version the yt-dlp that is installed takes: pip reads the range from
+    yt-dlp's own extra. Like the speech install it replaces nothing the app has imported, so yt-dlp's handler for the
+    package is loaded right away and no restart is needed."""
+    code, output = run_pip_install([impersonation.INSTALL_TARGET], timeout, proxy)
+    if code is None:
+        return UpdateResult(False, output if output == PIP_BUSY_MESSAGE else f"安裝失敗：{output}")
+    if code != 0:
+        return UpdateResult(False, output)
+    refresh_import_paths()
+    impersonation.load()
+    # Installed, yet yt-dlp has no handler for it in this process: another version of the package is still in memory.
+    return UpdateResult(True, output, restart_required=not impersonation.ready() and not impersonation.switched_off()[0])
+
+
+def remove_impersonation(timeout: float = 300) -> UpdateResult:
+    """Uninstalls curl-cffi. Windows cannot delete a file that a running program has loaded, and a pip that gives up
+    half-way leaves the package broken. So there it is switched off instead: after a restart the switch has kept the
+    package from being loaded at all, and it can be removed."""
+    if LOADED_FILES_ARE_LOCKED and impersonation.package_is_loaded():
+        impersonation.switch_off()
+        return UpdateResult(False, REMOVE_AFTER_RESTART_MESSAGE, restart_required=True)
+    code, output = run_pip("uninstall", ["--yes", impersonation.PACKAGE], timeout)
+    if code is None:
+        return UpdateResult(False, output if output == PIP_BUSY_MESSAGE else f"移除失敗：{output}")
+    if code != 0:
+        return UpdateResult(False, output)
+    refresh_import_paths()
+    # Nothing is left to be switched off, and a later install starts switched on.
+    impersonation.switch_on()
+    return UpdateResult(True, output)
+
+
+def ytdlp_install_target() -> str:
+    """What the yt-dlp update installs. With curl-cffi installed, yt-dlp's extra for it comes along: pip then leaves
+    the package alone while the new yt-dlp still takes its version, and changes it for one that fits when not."""
+    return YT_DLP_WITH_IMPERSONATION_TARGET if impersonation.installed_version() else YT_DLP_INSTALL_TARGET
+
+
 def install_ytdlp_update(timeout: float = 300, proxy: str = "") -> UpdateResult:
     """Installs into the running interpreter's environment. Until a restart, the running app mixes the old copy in
     memory with new files read from disk, which breaks YouTube downloads; AppServices.update_ytdlp guards this."""
-    code, output = run_pip_install(["--upgrade", YT_DLP_INSTALL_TARGET], timeout, proxy)
+    code, output = run_pip_install(["--upgrade", ytdlp_install_target()], timeout, proxy)
     if code is None:
         return UpdateResult(False, output if output == PIP_BUSY_MESSAGE else f"更新失敗：{output}")
     if code != 0:

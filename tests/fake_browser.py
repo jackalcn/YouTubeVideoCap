@@ -20,6 +20,8 @@ from offline_web import BROWSER_HEADER
 EXPECT_CURL_CFFI = bool(os.environ.get("VIDEOCAP_EXPECT_CURL_CFFI"))
 STAND_IN = "stand-in"
 CURL_CFFI = "curl-cffi"
+# What is really installed. conftest.py hides it from every test that does not ask for the package.
+INSTALLED_VERSION = impersonation.installed_version
 
 
 def stand_in_handler() -> Any:
@@ -71,20 +73,21 @@ def recording(handler: Any) -> Any:
     return RecordingRH
 
 
-def real_handler() -> Any:
-    """yt-dlp's own handler for curl-cffi, which videocap.impersonation took out of yt-dlp's list. Skips the test
-    where the package is not installed."""
+def real_handler(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """yt-dlp's own handler for curl-cffi, which videocap.impersonation took out of yt-dlp's list, with the package
+    no longer hidden from the test. Skips the test where the package is not installed."""
     taken = list(impersonation._taken.values())
     if not taken:
         if EXPECT_CURL_CFFI:
             pytest.fail("curl-cffi was to be installed for this run, and yt-dlp has no handler for it")
         pytest.skip("curl-cffi is not installed")
+    monkeypatch.setattr(impersonation, "installed_version", INSTALLED_VERSION)
     return taken[0]
 
 
 @pytest.fixture(name="browser", params=[STAND_IN, CURL_CFFI])
 def browser_fixture(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Any:
     """模擬瀏覽器 installed and ready. Returns the handler, which says what it was sent."""
-    handler = recording(stand_in_handler() if request.param == STAND_IN else real_handler())
+    handler = recording(stand_in_handler() if request.param == STAND_IN else real_handler(monkeypatch))
     monkeypatch.setattr(impersonation, "_kept", (impersonation.leaving_youtube_alone(handler),))
     return handler

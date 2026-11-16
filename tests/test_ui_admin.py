@@ -1103,6 +1103,204 @@ def test_only_this_machines_owner_sees_speech_recognition(public: bool, speech_i
 
 
 
+# 模擬瀏覽器 on the system page
+
+
+@pytest.fixture
+def browser_machine(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Stands in for curl-cffi on this machine: for pip, which would change the machine's own install, and for what
+    videocap.impersonation finds of it."""
+    import videocap.impersonation as impersonation
+    import videocap.ui.page_system as page_system
+    from videocap.tooling import UpdateResult
+
+    machine: dict[str, Any] = {
+        "version": "",
+        "ready": False,
+        "problem": "",
+        "unsupported": "",
+        "switched_off": ("", ""),
+        "proxies": [],
+        "install_result": UpdateResult(True, "Successfully installed curl-cffi-0.17.0"),
+        "remove_result": UpdateResult(True, "Successfully uninstalled curl-cffi-0.17.0"),
+    }
+
+    def fake_install(timeout: float = 600, proxy: str = "") -> UpdateResult:
+        result: UpdateResult = machine["install_result"]
+        machine["proxies"].append(proxy)
+        if result.succeeded:
+            machine.update(version="0.17.0", ready=not result.restart_required, unsupported="")
+        return result
+
+    def fake_remove(timeout: float = 300) -> UpdateResult:
+        result: UpdateResult = machine["remove_result"]
+        if result.succeeded:
+            machine.update(version="", ready=False, switched_off=("", ""))
+        elif result.restart_required:
+            machine.update(ready=False, switched_off=(impersonation.BY_OWNER, ""))
+        return result
+
+    monkeypatch.setattr(page_system, "install_impersonation", fake_install)
+    monkeypatch.setattr(page_system, "remove_impersonation", fake_remove)
+    monkeypatch.setattr(impersonation, "installed_version", lambda: machine["version"])
+    monkeypatch.setattr(impersonation, "ready", lambda: machine["ready"])
+    monkeypatch.setattr(impersonation, "problem", lambda: machine["problem"])
+    monkeypatch.setattr(impersonation, "unsupported", lambda: machine["unsupported"])
+    monkeypatch.setattr(impersonation, "switched_off", lambda: machine["switched_off"])
+    monkeypatch.setattr(impersonation, "switch_off", lambda: machine.update(ready=False, switched_off=(impersonation.BY_OWNER, "")))
+    monkeypatch.setattr(impersonation, "switch_on", lambda: machine.update(ready=bool(machine["version"]), switched_off=("", "")))
+    return machine
+
+
+def page_words(app: AppTest) -> str:
+    return texts(app.markdown) + texts(app.caption) + texts(app.info) + texts(app.success) + texts(app.error) + texts(app.warning)
+
+
+def test_the_owner_installs_impersonation_from_the_system_page(browser_machine: dict[str, Any]) -> None:
+    from videocap.impersonation import INSTALL_BUTTON_LABEL
+    from videocap.ui.page_system import IMPERSONATION_OFF_LABEL, IMPERSONATION_REMOVE_LABEL
+
+    app = system_page_with({"opt_proxy": "http://127.0.0.1:7890"})
+    assert "模擬瀏覽器" in texts(app.markdown) and INSTALL_BUTTON_LABEL in labels(app)
+    button(app, INSTALL_BUTTON_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert browser_machine["proxies"] == ["http://127.0.0.1:7890"]
+    assert "模擬瀏覽器安裝完成，不需要重新啟動" in texts(app.success)
+    assert "Successfully installed curl-cffi-0.17.0" in texts(app.code)
+    # Installed now: it can be switched off or removed, and not installed again.
+    assert "已安裝**（curl-cffi 0.17.0）" in page_words(app)
+    assert {IMPERSONATION_OFF_LABEL, IMPERSONATION_REMOVE_LABEL} <= set(labels(app)) and INSTALL_BUTTON_LABEL not in labels(app)
+
+
+def test_a_failed_impersonation_install_shows_what_pip_said(browser_machine: dict[str, Any]) -> None:
+    from videocap.impersonation import INSTALL_BUTTON_LABEL
+    from videocap.tooling import PIP_BUSY_MESSAGE, UpdateResult
+
+    browser_machine["install_result"] = UpdateResult(False, "ERROR: No matching distribution found for curl-cffi")
+    app = system_page_with({})
+    button(app, INSTALL_BUTTON_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert "安裝失敗" in texts(app.error) and "No matching distribution" in texts(app.code)
+    assert INSTALL_BUTTON_LABEL in labels(app)
+
+    browser_machine["install_result"] = UpdateResult(False, PIP_BUSY_MESSAGE)
+    button(app, INSTALL_BUTTON_LABEL).click().run()
+    assert PIP_BUSY_MESSAGE in texts(app.error) and "No matching distribution" not in texts(app.code)
+
+
+def test_an_impersonation_install_that_needs_a_restart_says_so(browser_machine: dict[str, Any]) -> None:
+    from videocap.impersonation import INSTALL_BUTTON_LABEL
+    from videocap.tooling import UpdateResult
+
+    browser_machine["install_result"] = UpdateResult(True, "Successfully installed curl-cffi-0.17.0", restart_required=True)
+    app = system_page_with({})
+    button(app, INSTALL_BUTTON_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert "要重新啟動 App 才能使用" in texts(app.warning) and "不需要重新啟動" not in texts(app.success)
+
+
+def test_the_owner_switches_impersonation_off_and_on(browser_machine: dict[str, Any]) -> None:
+    from videocap.ui.page_system import IMPERSONATION_OFF_LABEL, IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL
+
+    browser_machine.update(version="0.17.0", ready=True)
+    app = system_page_with({})
+    button(app, IMPERSONATION_OFF_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert "模擬瀏覽器已停用" in texts(app.success) and "已停用**（curl-cffi 0.17.0）" in page_words(app)
+    assert {IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL} <= set(labels(app)) and IMPERSONATION_OFF_LABEL not in labels(app)
+
+    button(app, IMPERSONATION_ON_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert "模擬瀏覽器已啟用，不需要重新啟動" in texts(app.success) and "已安裝**（curl-cffi 0.17.0）" in page_words(app)
+
+
+def test_the_owner_removes_impersonation(browser_machine: dict[str, Any]) -> None:
+    from videocap.impersonation import INSTALL_BUTTON_LABEL
+    from videocap.ui.page_system import IMPERSONATION_REMOVE_LABEL
+
+    browser_machine.update(version="0.17.0", ready=True)
+    app = system_page_with({})
+    button(app, IMPERSONATION_REMOVE_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert "模擬瀏覽器已移除" in texts(app.success) and "Successfully uninstalled curl-cffi-0.17.0" in texts(app.code)
+    assert "未安裝" in page_words(app) and INSTALL_BUTTON_LABEL in labels(app)
+
+
+def test_on_windows_removing_a_loaded_impersonation_switches_it_off_first(browser_machine: dict[str, Any]) -> None:
+    from videocap.tooling import REMOVE_AFTER_RESTART_MESSAGE, UpdateResult
+    from videocap.ui.page_system import IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL
+
+    browser_machine.update(version="0.17.0", ready=True, remove_result=UpdateResult(False, REMOVE_AFTER_RESTART_MESSAGE, restart_required=True))
+    app = system_page_with({})
+    button(app, IMPERSONATION_REMOVE_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert REMOVE_AFTER_RESTART_MESSAGE in texts(app.warning)
+    # Switched off, and after a restart the same button removes it.
+    assert "已停用**（curl-cffi 0.17.0）" in page_words(app)
+    assert {IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL} <= set(labels(app))
+
+    browser_machine["remove_result"] = UpdateResult(False, "ERROR: Cannot uninstall curl-cffi")
+    button(app, IMPERSONATION_REMOVE_LABEL).click().run()
+    assert "移除失敗" in texts(app.error) and "Cannot uninstall" in texts(app.code)
+
+
+def test_a_curl_cffi_this_yt_dlp_does_not_take_can_be_installed_again(browser_machine: dict[str, Any]) -> None:
+    from videocap.impersonation import INSTALL_BUTTON_LABEL
+    from videocap.ui.page_system import IMPERSONATION_REINSTALL_LABEL, IMPERSONATION_REMOVE_LABEL
+
+    browser_machine.update(version="0.19.0", unsupported="Only curl_cffi versions 0.5.10 and 0.10.x through 0.17.x are supported")
+    app = system_page_with({})
+    assert "不接受這個版本" in page_words(app) and "through 0.17.x are supported" in texts(app.code)
+    assert {IMPERSONATION_REINSTALL_LABEL, IMPERSONATION_REMOVE_LABEL} <= set(labels(app)) and INSTALL_BUTTON_LABEL not in labels(app)
+    button(app, IMPERSONATION_REINSTALL_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert browser_machine["proxies"] == [""] and "已安裝**（curl-cffi 0.17.0）" in page_words(app)
+
+
+def test_impersonation_that_reaches_youtube_is_named_on_the_page_and_in_the_sidebar(browser_machine: dict[str, Any]) -> None:
+    from videocap.impersonation import BY_CHECK, NOT_SEPARATE_MESSAGE
+    from videocap.ui.page_system import IMPERSONATION_OFF_LABEL, IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL
+
+    # What videocap.impersonation's own check leaves behind when it fails: switched off, and a restart to come.
+    found = "一般的 yt-dlp 連線也找得到模擬瀏覽器"
+    browser_machine.update(version="0.17.0", ready=False, problem=found, switched_off=(BY_CHECK, found))
+    app = system_page_with({})
+    # The page still opens, and says it first.
+    assert texts(app.error).startswith(NOT_SEPARATE_MESSAGE)
+    assert "已自動停用" in page_words(app) and found in texts(app.code)
+    # Nothing to switch: it is off already, and switching it on would only find the same.
+    assert IMPERSONATION_REMOVE_LABEL in labels(app) and not {IMPERSONATION_OFF_LABEL, IMPERSONATION_ON_LABEL} & set(labels(app))
+
+    # The pages that start downloads say it in the sidebar, where a missing Deno is told too.
+    for page_name in ("download", "search", "history", "subscriptions"):
+        assert NOT_SEPARATE_MESSAGE in texts(run_page(page_name).sidebar.warning), page_name
+
+    # After the restart nothing is wrong any more, and the page says why it is off.
+    browser_machine.update(problem="")
+    app = system_page_with({})
+    assert texts(app.error) == "" and NOT_SEPARATE_MESSAGE not in texts(run_page("download").sidebar.warning)
+    assert "自動停用了。現在是安全的" in texts(app.warning) and found in texts(app.code)
+    assert {IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL} <= set(labels(app))
+
+
+@pytest.mark.parametrize("public", [False, True])
+def test_only_this_machines_owner_sees_impersonation(public: bool, browser_machine: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    import videocap.impersonation as impersonation
+    from videocap.impersonation import INSTALL_BUTTON_LABEL, NOT_SEPARATE_MESSAGE
+
+    browser_machine.update(problem="一般的 yt-dlp 連線也找得到模擬瀏覽器")
+    if public:
+        monkeypatch.setenv("VIDEOCAP_MODE", "cloud")
+        monkeypatch.delenv("VIDEOCAP_TRUST_REMOTE")
+        monkeypatch.setattr(impersonation, "installed_version", lambda: pytest.fail("a visitor's page looked for curl-cffi"))
+    app = system_page_with({})
+    assert ("模擬瀏覽器" in texts(app.markdown)) is not public
+    # A visitor can do nothing about it, and is told nothing of this machine's packages.
+    assert (NOT_SEPARATE_MESSAGE in texts(app.error)) is not public
+    assert (NOT_SEPARATE_MESSAGE in texts(run_page("download").sidebar.warning)) is not public
+    assert INSTALL_BUTTON_LABEL not in labels(app)
+
+
 def test_a_second_app_on_the_same_data_folder_is_named(tmp_path: Path) -> None:
     from videocap.services import acquire_engine_lock, release_engine_lock
 

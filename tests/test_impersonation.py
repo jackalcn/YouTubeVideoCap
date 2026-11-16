@@ -472,8 +472,8 @@ def test_what_is_tried_once_more_as_a_browser(browser: Any, tmp_path: Path) -> N
 # With the real package
 
 
-def test_ytdlp_takes_the_installed_curl_cffi(data_dir: Path) -> None:
-    handler = real_handler()
+def test_ytdlp_takes_the_installed_curl_cffi(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = real_handler(monkeypatch)
     impersonation.load()
     assert impersonation.unsupported() == "" and impersonation.problem() == ""
     assert impersonation.ready() and impersonation.installed_version()

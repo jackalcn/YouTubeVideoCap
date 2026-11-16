@@ -12,7 +12,7 @@ from typing import Any
 import streamlit as st
 from yt_dlp.version import __version__ as YT_DLP_VERSION
 
-from videocap import speech
+from videocap import impersonation, speech
 from videocap.config import (
     APP_UPDATE_CHECK_SECONDS,
     APP_UPDATED_AT,
@@ -45,8 +45,10 @@ from videocap.tooling import (
     get_free_disk_bytes,
     get_js_runtime_status,
     install_gpu_support,
+    install_impersonation,
     install_speech_recognition,
     read_tool_version,
+    remove_impersonation,
     reset_tool_status,
 )
 from videocap.ui.common import escape_markdown, format_local_time, page_header
@@ -59,6 +61,11 @@ SETTINGS_UPLOAD_MAX_MB = 1
 APP_UPDATE_CHECK_KEY = "app_update_check"
 SPEECH_INSTALL_NOTICE_KEY = "speech_install_notice"
 GPU_INSTALL_NOTICE_KEY = "gpu_install_notice"
+IMPERSONATION_NOTICE_KEY = "impersonation_notice"
+IMPERSONATION_REINSTALL_LABEL = "重新安裝相容的版本"
+IMPERSONATION_OFF_LABEL = "停用模擬瀏覽器"
+IMPERSONATION_ON_LABEL = "啟用模擬瀏覽器"
+IMPERSONATION_REMOVE_LABEL = "移除模擬瀏覽器"
 
 def render_meta_badges(
     version_text: str,
@@ -281,6 +288,124 @@ def install_speech(ctx: AppContext) -> None:
     else:
         st.error("安裝失敗。")
         st.code(result.message, language=None)
+
+
+def render_impersonation_problem(ctx: AppContext) -> None:
+    # At the top of the page: until a restart, YouTube's subtitle downloads may go wrong.
+    if ctx.trusted and impersonation.problem():
+        st.error(impersonation.NOT_SEPARATE_MESSAGE)
+        render_restart_steps()
+
+
+def render_impersonation(ctx: AppContext) -> None:
+    st.markdown("### 模擬瀏覽器")
+    st.caption(
+        "有些網站（多半由 Cloudflare 把關）只讓瀏覽器連線，一般的程式會收到 HTTP 403。安裝後，其他網站的連結被這樣拒絕時，"
+        "App 會改用瀏覽器的連線方式再試一次。只用在 YouTube 以外的網站；要求真人驗證的網站仍然無法下載。"
+        "需要另外安裝 curl-cffi（約 10 MB），只要裝一次。"
+    )
+    notice = st.session_state.pop(IMPERSONATION_NOTICE_KEY, None)
+    if notice is not None:
+        level, text, output = notice
+        (st.success if level == "success" else st.warning)(text)
+        if level != "success":
+            render_restart_steps()
+        if output:
+            st.code(output, language=None)
+
+    version = impersonation.installed_version()
+    switched_off_by, found = impersonation.switched_off()
+    actions: tuple[str, ...]
+    if impersonation.problem():
+        st.write(f"目前：**已自動停用**（curl-cffi {version or '未知'}），見本頁最上方的說明。")
+        st.code(impersonation.problem(), language=None)
+        actions = (IMPERSONATION_REMOVE_LABEL,)
+    elif not version:
+        st.write("目前：未安裝")
+        actions = (impersonation.INSTALL_BUTTON_LABEL,)
+    elif switched_off_by == impersonation.BY_CHECK:
+        st.write(f"目前：**已停用**（curl-cffi {version}）")
+        st.warning(
+            "App 上次執行時發現模擬瀏覽器沒有和 YouTube 的連線隔開，所以自動停用了。現在是安全的。"
+            "更新 App 之後可以按「啟用模擬瀏覽器」再試；還是不行的話，App 會再自動停用。"
+        )
+        if found:
+            st.code(found, language=None)
+        actions = (IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL)
+    elif switched_off_by:
+        st.write(f"目前：**已停用**（curl-cffi {version}）")
+        actions = (IMPERSONATION_ON_LABEL, IMPERSONATION_REMOVE_LABEL)
+    elif impersonation.unsupported():
+        st.write(f"目前：已安裝 curl-cffi {version}，但目前的 yt-dlp 不接受這個版本，所以沒有作用。")
+        st.code(impersonation.unsupported(), language=None)
+        actions = (IMPERSONATION_REINSTALL_LABEL, IMPERSONATION_REMOVE_LABEL)
+    elif impersonation.ready():
+        st.write(f"目前：**已安裝**（curl-cffi {version}）")
+        actions = (IMPERSONATION_OFF_LABEL, IMPERSONATION_REMOVE_LABEL)
+    else:
+        st.write(f"目前：已安裝 curl-cffi {version}，要重新啟動 App 才能使用。")
+        render_restart_steps()
+        actions = (IMPERSONATION_REMOVE_LABEL,)
+
+    for label in actions:
+        if st.button(label, key=f"impersonation_{actions.index(label)}_{label}"):
+            if label in (impersonation.INSTALL_BUTTON_LABEL, IMPERSONATION_REINSTALL_LABEL):
+                install_impersonation_from_page(ctx)
+            elif label == IMPERSONATION_REMOVE_LABEL:
+                remove_impersonation_from_page()
+            else:
+                switch_impersonation(on=label == IMPERSONATION_ON_LABEL)
+
+
+def install_impersonation_from_page(ctx: AppContext) -> None:
+    with st.spinner("安裝中，需要下載約 10 MB，可能要一兩分鐘..."):
+        result = install_impersonation(proxy=network_options(collect_settings(), ctx.limits).proxy)
+    if impersonation.problem():
+        # The check failed right after the install: the page says so at its top.
+        st.rerun()
+    if result.succeeded and not result.restart_required:
+        text = "模擬瀏覽器安裝完成，不需要重新啟動。其他網站的連結被拒絕（HTTP 403）時，App 會自動用它再試一次。"
+        st.session_state[IMPERSONATION_NOTICE_KEY] = ("success", text, result.message)
+        st.rerun()
+    # pip's own output goes in a code block, where nothing in it is read as formatting.
+    if result.message == PIP_BUSY_MESSAGE:
+        st.error(result.message)
+    elif result.succeeded:
+        st.session_state[IMPERSONATION_NOTICE_KEY] = ("warning", "模擬瀏覽器已安裝，但要重新啟動 App 才能使用。", result.message)
+        st.rerun()
+    else:
+        st.error("安裝失敗。")
+        st.code(result.message, language=None)
+
+
+def remove_impersonation_from_page() -> None:
+    with st.spinner("移除中..."):
+        result = remove_impersonation()
+    if result.succeeded:
+        st.session_state[IMPERSONATION_NOTICE_KEY] = ("success", "模擬瀏覽器已移除。", result.message)
+        st.rerun()
+    if result.restart_required:
+        # Switched off instead, which the status has to show.
+        st.session_state[IMPERSONATION_NOTICE_KEY] = ("warning", result.message, "")
+        st.rerun()
+    if result.message == PIP_BUSY_MESSAGE:
+        st.error(result.message)
+    else:
+        st.error("移除失敗。")
+        st.code(result.message, language=None)
+
+
+def switch_impersonation(on: bool) -> None:
+    if on:
+        impersonation.switch_on()
+    else:
+        impersonation.switch_off()
+    if not impersonation.problem():
+        text = "模擬瀏覽器已啟用，不需要重新啟動。" if on else "模擬瀏覽器已停用。其他網站被拒絕（HTTP 403）時，App 不會再用它重試。"
+        if on and not impersonation.ready():
+            text = "模擬瀏覽器已啟用，但要重新啟動 App 才能使用。"
+        st.session_state[IMPERSONATION_NOTICE_KEY] = ("success" if not on or impersonation.ready() else "warning", text, "")
+    st.rerun()
 
 
 def render_gpu_support(ctx: AppContext) -> None:
@@ -569,6 +694,7 @@ def render_autostart(ctx: AppContext) -> None:
 def render_system_page(ctx: AppContext) -> None:
     page_header("系統", "檢查環境、更新工具與備份設定。" if ctx.trusted else "查看相依工具、測試連線，以及匯出或匯入下載設定。")
     render_restart_notice(ctx)
+    render_impersonation_problem(ctx)
     render_shared_data_folder(ctx)
     deploy_target = "雲端（main 分支自動部署）" if ctx.is_cloud else "本機"
     if ctx.trusted:
@@ -592,6 +718,8 @@ def render_system_page(ctx: AppContext) -> None:
         render_ytdlp_update(ctx)
         # Installs into this machine's Python and names its folders, so only for the owner.
         render_speech_recognition(ctx)
+        # For other sites, which a visitor does not get.
+        render_impersonation(ctx)
     render_connection_test(ctx)
     if ctx.trusted:
         render_storage_status(ctx)
