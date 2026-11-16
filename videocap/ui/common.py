@@ -44,6 +44,7 @@ from videocap.services import (
     temporary_cookie_file,
 )
 from videocap.settings import JobSpec
+from videocap.sites import is_youtube_url
 from videocap.storage import LAST_SETTINGS_KEY, OUTPUT_DIR_KEY
 from videocap.tooling import format_bytes, get_free_disk_bytes
 from videocap.ui.context import (
@@ -405,6 +406,14 @@ def render_low_disk_notice() -> None:
         st.warning(notice)
 
 
+def find_login_problem_for(urls: list[str], login: LoginSource) -> str:
+    """Says why this login cannot work for these links, or returns an empty string. Only a YouTube login can be read
+    from cookies, so links to other sites go unchecked: the cookies may well hold their site's login."""
+    if not any(is_youtube_url(url) for url in urls):
+        return ""
+    return find_login_problem(login)
+
+
 def submit_downloads(
     ctx: AppContext,
     urls: list[str],
@@ -461,7 +470,7 @@ def queue_downloads(
         return []
 
     with temporary_cookie_file(cookie_bytes) as cookie_file:
-        problem = find_login_problem(LoginSource(cookie_file, browser))
+        problem = find_login_problem_for(urls, LoginSource(cookie_file, browser))
     if problem:
         st.error(escape_markdown(problem))
         return []

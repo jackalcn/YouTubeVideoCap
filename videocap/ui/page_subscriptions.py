@@ -11,14 +11,14 @@ from videocap.config import LOCAL_MAX_PLAYLIST_LIMIT, SUBSCRIPTION_INTERVALS
 from videocap.errors import humanize_ytdlp_error
 from videocap.library import RECYCLED_TEXT, folder_creation_problem, recycle_bin_available
 from videocap.options import LoginSource, network_options
-from videocap.services import temporary_cookie_file
+from videocap.services import SUBSCRIPTION_YOUTUBE_ONLY_MESSAGE, temporary_cookie_file
 from videocap.settings import DownloadSettings
 from videocap.storage import AppStorage, Subscription
 from videocap.subscription_import import ImportedChannel, parse_subscription_file, subscribed_channel_ids
 from videocap.ui.common import escape_markdown, format_local_time, page_header, render_active_jobs
 from videocap.ui.context import AppContext, collect_settings, current_browser, current_cookie_bytes, current_output_dir
 from videocap.ui.sidebar import render_settings_sidebar
-from videocap.urls import classify_youtube_url, parse_youtube_urls
+from videocap.urls import classify_youtube_url, parse_links
 
 
 SUBSCRIPTION_FORM_KEYS = ("subscription_url", "subscription_max_items", "subscription_interval", "subscription_skip_existing")
@@ -69,10 +69,12 @@ def typed_folder(raw: str) -> str:
 
 def add_subscription(ctx: AppContext, storage: AppStorage, raw_url: str, max_items: int, interval: int, skip_existing: bool) -> bool:
     """Shows what went wrong and returns False, or leaves the result in SUBSCRIPTION_NOTICES_KEY and returns True."""
-    urls, _ = parse_youtube_urls(raw_url)
+    # Read as a visitor's links are, so another site's link comes back as one, and can be answered as such.
+    found = parse_links(raw_url)
+    urls = found.urls
     try:
         if not urls:
-            raise ValueError("請輸入頻道或播放清單的連結。")
+            raise ValueError(SUBSCRIPTION_YOUTUBE_ONLY_MESSAGE if found.blocked else "請輸入頻道或播放清單的連結。")
         url = subscription_url(urls[0])
         settings = sidebar_subscription_settings()
         output_dir = str(current_output_dir(ctx))

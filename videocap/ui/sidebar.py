@@ -66,10 +66,23 @@ PRESET_FOLDER_KEY = "output_dir"
 PRESET_FOLDER_CHECKBOX_KEY = "preset_remember_folder"
 LOGIN_METHOD_LABELS = {"none": LOGIN_NONE, "browser": LOGIN_BROWSER, "cookies": LOGIN_COOKIES}
 CONNECTION_SETTINGS = ("player_client", "ytdlp_extra_args")
+OWNER_LOGIN_HELP = (
+    "下載會員專屬、年齡限制或私人影片，或部分網站要登入才有的高畫質時使用。"
+    "瀏覽器的登入狀態或 cookies.txt 對正在下載的網站都有效：先在瀏覽器登入那個網站，或匯出那個網站的 cookies.txt。"
+    "YouTube 等網站不開放第三方用帳號密碼登入，所以這裡使用瀏覽器的登入狀態。"
+)
+VISITOR_LOGIN_HELP = "下載已加入會員的頻道影片、年齡限制或私人影片時需要登入。YouTube 不開放第三方用帳號密碼登入，所以這裡使用瀏覽器的登入狀態。"
+BROWSER_COOKIES_NOTE = f"選「{LOGIN_BROWSER}」時，這個瀏覽器的 cookies 會交給 yt-dlp，用來登入正在下載的網站。"
+YOUTUBE_ONLY_NOTE = "只對 YouTube 有效。"
 
 
 def opt(name: str) -> str:
     return f"{SETTING_KEY_PREFIX}{name}"
+
+
+def youtube_only(ctx: AppContext, help_text: str) -> str:
+    # Only this machine's owner can download from other sites; to anyone else every link is YouTube's.
+    return f"{help_text}{YOUTUBE_ONLY_NOTE}" if ctx.trusted else help_text
 
 
 def setting(name: str) -> Any:
@@ -308,7 +321,7 @@ def render_clip_settings(ctx: AppContext) -> None:
             format_func=SPONSORBLOCK_MODES.get,
             key=opt("sponsorblock_mode"),
             disabled=not ctx.ffmpeg_available,
-            help="查詢 sponsor.ajay.app 的社群資料。移除時會重新封裝影片，並非所有影片都有資料。",
+            help=youtube_only(ctx, "查詢 sponsor.ajay.app 的社群資料。移除時會重新封裝影片，並非所有影片都有資料。"),
         )
         if setting("sponsorblock_mode") != "off":
             render_sponsorblock_categories()
@@ -385,7 +398,7 @@ def render_comment_settings(ctx: AppContext) -> None:
         options=list(COMMENTS_MODE_OPTIONS),
         format_func=COMMENTS_MODE_OPTIONS.get,
         key=opt("comments_mode"),
-        help="把留言另存成檔案。留言很多時會多花一些時間。",
+        help=youtube_only(ctx, "把留言另存成檔案。留言很多時會多花一些時間。"),
     )
     if setting("comments_mode") != "off":
         # A public host shares its few slots, so its visitors get the same cap as the comment export.
@@ -397,7 +410,7 @@ def render_comment_settings(ctx: AppContext) -> None:
         st.checkbox(
             "另存直播聊天室紀錄",
             key=opt("save_live_chat"),
-            help="已結束的直播才有聊天室重播。聊天室很長時需要較久的時間。",
+            help=youtube_only(ctx, "已結束的直播才有聊天室重播。聊天室很長時需要較久的時間。"),
         )
 
 
@@ -441,8 +454,11 @@ def render_playlist_settings(ctx: AppContext) -> None:
                 key=opt("wait_for_live"),
                 # The stream is recorded once it starts, and without ffmpeg that would fail only after the wait.
                 disabled=not ctx.ffmpeg_available,
-                help="只對單一影片的連結有效，播放清單與頻道不會等待。任務會在佇列中等到開播，開播後直接開始錄製，"
-                "不受「遇到直播」影響。預定 24 小時後才開播，或等了 24 小時仍未開播時，會停止等待。等待時會佔用一個同時下載名額。需要 ffmpeg。",
+                help=youtube_only(
+                    ctx,
+                    "只對單一影片的連結有效，播放清單與頻道不會等待。任務會在佇列中等到開播，開播後直接開始錄製，"
+                    "不受「遇到直播」影響。預定 24 小時後才開播，或等了 24 小時仍未開播時，會停止等待。等待時會佔用一個同時下載名額。需要 ffmpeg。",
+                ),
             )
 
 
@@ -483,7 +499,7 @@ def render_output_settings(ctx: AppContext) -> None:
         st.checkbox(
             "優先使用繁體中文標題與說明",
             key=opt("prefer_traditional_metadata"),
-            help="作者有提供繁體中文翻譯時，檔名與影片資訊使用翻譯後的標題和說明；沒有翻譯時維持原文。",
+            help=youtube_only(ctx, "作者有提供繁體中文翻譯時，檔名與影片資訊使用翻譯後的標題和說明；沒有翻譯時維持原文。"),
         )
 
         if ctx.trusted:
@@ -536,7 +552,9 @@ def render_network_settings(ctx: AppContext) -> None:
             options=list(PLAYER_CLIENT_OPTIONS),
             format_func=PLAYER_CLIENT_OPTIONS.get,
             key=opt("player_client"),
-            help="遇到 HTTP 403 或可選的畫質變少時，可以換一個試試。不同用戶端取得的格式與字幕可能不同。登入時 visionos 無法使用，會改用預設。",
+            help=youtube_only(
+                ctx, "遇到 HTTP 403 或可選的畫質變少時，可以換一個試試。不同用戶端取得的格式與字幕可能不同。登入時 visionos 無法使用，會改用預設。"
+            ),
         )
         if ctx.trusted:
             st.text_input("代理伺服器", key=opt("proxy"), placeholder="http://127.0.0.1:7890", help="公司或校園網路需要時才填。")
@@ -573,11 +591,12 @@ def render_login_settings(ctx: AppContext) -> None:
     if st.session_state.get("keep_login_method") not in methods:
         st.session_state["keep_login_method"] = "none"
     st.radio(
-        "YouTube 帳號",
+        # A visitor can only download from YouTube, so their login is a YouTube login.
+        "影片網站帳號" if ctx.trusted else "YouTube 帳號",
         options=methods,
         format_func=LOGIN_METHOD_LABELS.get,
         key="keep_login_method",
-        help="下載已加入會員的頻道影片、年齡限制或私人影片時需要登入。YouTube 不開放第三方用帳號密碼登入，所以這裡使用瀏覽器的登入狀態。",
+        help=OWNER_LOGIN_HELP if ctx.trusted else VISITOR_LOGIN_HELP,
     )
     method = st.session_state["keep_login_method"]
     if method == "browser":
@@ -587,6 +606,8 @@ def render_login_settings(ctx: AppContext) -> None:
             format_func=LOGIN_BROWSERS.get,
             key="keep_login_browser",
         )
+        # yt-dlp reads the browser's whole cookie store, so the person should know where its logins go.
+        st.caption(BROWSER_COOKIES_NOTE)
         if sys.platform == "win32":
             st.caption("Windows 上的 Chrome、Edge 常因加密或檔案鎖定而讀不到，建議使用 Firefox 或 cookies.txt。")
         elif sys.platform.startswith("linux") and st.session_state.get("keep_login_browser") != "firefox":
@@ -602,6 +623,8 @@ def render_login_settings(ctx: AppContext) -> None:
             "確認登入狀態",
             width="stretch",
             disabled=method == "cookies" and current_cookie_bytes() is None,
+            # It asks YouTube's own home page; other sites differ too much for one check.
+            help="只檢查 YouTube 的登入狀態。" + ("其他網站的登入無法在這裡確認，請直接解析連結或下載試試。" if ctx.trusted else ""),
         )
         if check_login:
             with public_request_slot(ctx) as allowed:
@@ -645,6 +668,8 @@ def render_cookie_upload(ctx: AppContext) -> None:
         st.button("移除 cookies", key="cookies_clear", width="stretch", on_click=forget_uploaded_cookies, args=(ctx,))
     with st.expander("如何匯出 cookies.txt"):
         st.markdown(COOKIE_EXPORT_STEPS)
+        if ctx.trusted:
+            st.caption("其他網站的做法相同：登入那個網站後，在它的頁面用同一個擴充功能匯出 cookies。第 2 步只適用於 YouTube。")
 
 
 def render_tool_warnings(ctx: AppContext) -> None:

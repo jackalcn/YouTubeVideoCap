@@ -525,13 +525,21 @@ def render_subtitle_converter() -> None:
         render_bilingual_merger()
 
 
-def render_bookmarklet() -> None:
-    st.markdown("### 從 YouTube 頁面一鍵送到這裡")
+def render_bookmarklet(ctx: AppContext) -> None:
+    # Only this machine's owner can download from other sites; a visitor's other links are left out on the 下載 page.
+    st.markdown("### 從影片網頁一鍵送到這裡" if ctx.trusted else "### 從 YouTube 頁面一鍵送到這裡")
     base_url = (st.context.url or "").split("?")[0].rstrip("/")
     for suffix in ("/tools", "/queue", "/search", "/library", "/subscriptions", "/history", "/system"):
         base_url = base_url.removesuffix(suffix)
     bookmarklet = f"javascript:void(window.open('{base_url}/?url='+encodeURIComponent(location.href)))"
-    st.caption("在瀏覽器新增一個書籤，網址填入下面這行。在 YouTube 影片頁點一下書籤，連結就會帶到下載頁（不會自動開始）。")
+    steps = "在瀏覽器新增一個書籤，網址填入下面這行。"
+    if ctx.trusted:
+        st.caption(f"{steps}在影片網頁（YouTube 或其他網站）點一下書籤，連結就會帶到下載頁（不會自動開始）。")
+    else:
+        st.caption(
+            f"{steps}在 YouTube 影片頁點一下書籤，連結就會帶到下載頁（不會自動開始）。"
+            "這個主機只能下載 YouTube，其他網站的頁面送過來也無法下載。"
+        )
     st.code(bookmarklet, language=None, wrap_lines=True)
 
 
@@ -552,4 +560,4 @@ def render_tools_page(ctx: AppContext) -> None:
         render_active_jobs(ctx)
         render_tool_results(ctx)
     render_subtitle_converter()
-    render_bookmarklet()
+    render_bookmarklet(ctx)

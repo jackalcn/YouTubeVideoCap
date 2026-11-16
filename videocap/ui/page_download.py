@@ -20,23 +20,25 @@ from videocap.config import (
 )
 from videocap.errors import humanize_ytdlp_error
 from videocap.inspector import (
+    UNKNOWN,
     LinkReport,
     fetch_comments,
-    find_login_problem,
     inspect_link,
     playlist_export_rows,
     rows_to_csv,
     summarize_reports,
 )
 from videocap.jobs import ACTIVE_STATES, DONE, Job
-from videocap.options import LoginSource, job_url, network_options, options_from_spec
+from videocap.options import OTHER_SITES_OWNER_ONLY_MESSAGE, LoginSource, job_url, network_options, options_from_spec
 from videocap.services import temporary_cookie_file
 from videocap.settings import SETTING_KEY_PREFIX, JobSpec
+from videocap.sites import is_youtube_url, site_of_url
 from videocap.storage import YOUTUBE_EXTRACTOR
 from videocap.textfiles import decode_text
 from videocap.tooling import format_bytes, get_free_disk_bytes
 from videocap.ui.common import (
     escape_markdown,
+    find_login_problem_for,
     format_local_time,
     health_panel_html,
     item_paths,
@@ -53,7 +55,7 @@ from videocap.ui.common import (
 )
 from videocap.ui.context import AppContext, collect_settings, current_browser, current_cookie_bytes, current_output_dir
 from videocap.ui.sidebar import render_settings_sidebar
-from videocap.urls import DOMAIN_LIKE_RE, describe_url_counts, extract_video_id, format_timestamp, parse_youtube_urls
+from videocap.urls import DOMAIN_LIKE_RE, ParsedLinks, describe_url_counts, extract_video_id, format_timestamp, parse_links
 
 
 INSPECT_WORKERS = 4
@@ -64,6 +66,18 @@ CLOUD_MAX_IMPORT_LINKS = 20
 LOCAL_MAX_INPUT_CHARS = 100_000
 CLOUD_MAX_INPUT_CHARS = 10_000
 SCHEDULE_ROUND_KEY = "schedule_round"
+PARSED_INPUT_KEY = "parsed_link_input"
+# Kept across pages like the link box itself. The second holds the pages the tick was given for.
+INCLUDE_PAGES_KEY = "keep_include_pages"
+INCLUDE_PAGES_FOR_KEY = "keep_include_pages_for"
+LISTED_LINKS = 10
+VISITOR_PLACEHOLDER = "每行一個，或直接貼上包含連結的整段文字\nhttps://www.youtube.com/watch?v=...\nhttps://www.youtube.com/playlist?list=...\n@頻道代號"
+OWNER_PLACEHOLDER = f"{VISITOR_PLACEHOLDER}\nhttps://vimeo.com/...\nhttps://example.com/video.mp4"
+VISITOR_LINK_HINT = "支援影片、Shorts、播放清單與頻道連結，也可以直接貼影片 ID 或 @頻道代號。"
+OWNER_LINK_HINT = (
+    "支援 YouTube 的影片、Shorts、播放清單與頻道連結（也可以直接貼影片 ID 或 @頻道代號），"
+    "以及其他影片網站的連結和 .mp4、.webm、.m3u8 等直接連結。"
+)
 
 
 def render_hero(ctx: AppContext) -> None:
@@ -74,7 +88,7 @@ def render_hero(ctx: AppContext) -> None:
     )
     st.caption(
         "請僅下載你擁有權利或已獲授權的內容（例如自己上傳的影片、Creative Commons 授權內容），"
-        "並遵守 YouTube 服務條款與當地著作權法。"
+        "並遵守各網站的服務條款與當地著作權法。"
     )
     if ctx.is_cloud:
         st.warning(
@@ -106,29 +120,39 @@ def append_links_from_file(ctx: AppContext) -> None:
     uploaded = st.session_state.get("link_file_upload")
     if uploaded is None:
         return
-    # Excel, Notepad and Windows PowerShell save lists with a byte order mark, as UTF-16, or as Big5.
-    urls, rejected = parse_youtube_urls(decode_text(uploaded.getvalue()), expand_playlist=expand_playlist_chosen())
+    # Excel, Notepad and Windows PowerShell save lists with a byte order mark, as UTF-16, or as Big5. Ordinary pages
+    # go into the box too, which sets them aside again if they came with video links.
+    found = parse_links(decode_text(uploaded.getvalue()), expand_playlist_chosen(), other_sites=ctx.trusted, include_pages=True)
+    urls = found.urls
     max_links = LOCAL_MAX_IMPORT_LINKS if ctx.trusted else CLOUD_MAX_IMPORT_LINKS
     existing = str(st.session_state.get("keep_url_input") or "").strip()
     st.session_state["keep_url_input"] = "\n".join(part for part in [existing, *urls[:max_links]] if part)
-    notice = f"從 {uploaded.name} 找到 {len(urls)} 個 YouTube 連結"
+    notice = f"從 {uploaded.name} 找到 {len(urls)} 個{'' if ctx.trusted else ' YouTube '}連結"
     if len(urls) > max_links:
         notice += f"，只加入前 {max_links} 個"
     # Header words such as "title,url" are not worth mentioning, but a link that was dropped is.
-    other_links = [entry for entry in rejected if "://" in entry or DOMAIN_LIKE_RE.match(entry)]
-    if other_links:
+    other_links = [entry for entry in found.rejected if "://" in entry or DOMAIN_LIKE_RE.match(entry)]
+    if other_links and ctx.trusted:
+        notice += f"；另有 {len(other_links)} 個連結無法使用（其他網站的連結請以 http:// 或 https:// 開頭）"
+    elif other_links:
         notice += f"；另有 {len(other_links)} 個連結不是可下載的 YouTube 連結"
+    if found.blocked:
+        notice += f"；另有 {len(found.blocked)} 個其他網站的連結沒有加入，這個主機只能下載 YouTube"
+    if found.protected:
+        notice += f"；另有 {len(found.protected)} 個串流平台的連結沒有加入，它們的影片有加密保護（DRM），無法下載"
     st.session_state["link_file_notice"] = notice + "。"
 
 
-def parse_link_input(text: str, expand_playlist: bool) -> tuple[list[str], list[str]]:
-    # Every click anywhere reruns this page, and a pasted list can hold thousands of links.
-    cached = st.session_state.get("parsed_link_input")
-    if cached and cached[0] == (text, expand_playlist):
-        return cached[1]
-    parsed = parse_youtube_urls(text, expand_playlist=expand_playlist)
-    st.session_state["parsed_link_input"] = ((text, expand_playlist), parsed)
-    return parsed
+def parse_link_input(ctx: AppContext, text: str, expand_playlist: bool, include_pages: bool = False) -> ParsedLinks:
+    # Every click anywhere reruns this page, and a pasted list can hold thousands of links. Both readings of the text,
+    # with and without the pages set aside, are kept until it changes.
+    reading = (text, expand_playlist, ctx.trusted)
+    cached = st.session_state.get(PARSED_INPUT_KEY)
+    found: dict[bool, ParsedLinks] = cached[1] if cached and cached[0] == reading else {}
+    if include_pages not in found:
+        found[include_pages] = parse_links(text, expand_playlist, other_sites=ctx.trusted, include_pages=include_pages)
+        st.session_state[PARSED_INPUT_KEY] = (reading, found)
+    return found[include_pages]
 
 
 def list_parameter_note(ctx: AppContext, urls: list[str], expand_playlist: bool) -> str:
@@ -140,33 +164,74 @@ def list_parameter_note(ctx: AppContext, urls: list[str], expand_playlist: bool)
     return "影片網址帶有 list 參數時，只下載該部影片。"
 
 
-def rejected_links_message(rejected: list[str]) -> str:
-    # Besides other sites, these include YouTube's own pages that hold no video, such as its home page.
-    return "以下內容不是可下載的 YouTube 影片、播放清單或頻道連結：" + "、".join(escape_markdown(entry) for entry in rejected)
+def rejected_links_message(ctx: AppContext, rejected: list[str]) -> str:
+    # Besides typos, these include YouTube's own pages that hold no video, such as its home page.
+    message = "以下內容不是可下載的 YouTube 影片、播放清單或頻道連結：" + "、".join(escape_markdown(entry) for entry in rejected)
+    if ctx.trusted:
+        # Other sites' links count only with their scheme, so that a site's name in a sentence is not taken for one.
+        message += "。其他網站的連結請以 http:// 或 https:// 開頭。"
+    return message
 
 
-def render_link_input(ctx: AppContext) -> tuple[list[str], list[str]]:
+def blocked_links_message(count: int) -> str:
+    # Said whenever it happens, because a link that silently does nothing would look like a fault of the app.
+    return (
+        f"已略過 {count} 個其他網站的連結。{escape_markdown(OTHER_SITES_OWNER_ONLY_MESSAGE)}"
+        f"做法請見[在自己的電腦上執行]({LOCAL_RUN_GUIDE_URL})。"
+    )
+
+
+def listed_links(links: list[str]) -> str:
+    shown = "、".join(escape_markdown(link) for link in links[:LISTED_LINKS])
+    return f"{shown} 等 {len(links)} 個" if len(links) > LISTED_LINKS else shown
+
+
+def protected_links_message(links: list[str]) -> str:
+    return f"以下是串流平台的連結，影片都有加密保護（DRM），無法下載，已略過：{listed_links(links)}"
+
+
+def set_aside_pages_caption(pages: list[str]) -> str:
+    return f"和影片連結貼在一起的一般網頁先不下載，它們可能沒有影片（例如說明欄裡的其他連結）：{listed_links(pages)}"
+
+
+def render_link_input(ctx: AppContext) -> ParsedLinks:
     st.text_area(
-        "YouTube 網址",
+        "影片網址",
         key="keep_url_input",
         height=110,
         max_chars=LOCAL_MAX_INPUT_CHARS if ctx.trusted else CLOUD_MAX_INPUT_CHARS,
-        placeholder="每行一個，或直接貼上包含連結的整段文字\nhttps://www.youtube.com/watch?v=...\nhttps://www.youtube.com/playlist?list=...\n@頻道代號",
+        placeholder=OWNER_PLACEHOLDER if ctx.trusted else VISITOR_PLACEHOLDER,
     )
     # The sidebar is drawn first, so this is the setting as it now stands.
     expand_playlist = expand_playlist_chosen()
-    urls, rejected = parse_link_input(str(st.session_state.get("keep_url_input") or ""), expand_playlist)
+    text = str(st.session_state.get("keep_url_input") or "")
+    found = parse_link_input(ctx, text, expand_playlist)
+    set_aside = found.pages
+    if st.session_state.get(INCLUDE_PAGES_FOR_KEY) != set_aside:
+        # A tick is for the pages it was given with; other pages start left out again.
+        st.session_state[INCLUDE_PAGES_FOR_KEY] = list(set_aside)
+        st.session_state[INCLUDE_PAGES_KEY] = False
+    if set_aside and st.session_state.get(INCLUDE_PAGES_KEY):
+        found = parse_link_input(ctx, text, expand_playlist, include_pages=True)
+    urls = found.urls
     if urls:
         counts = describe_url_counts(urls, expand_playlist=expand_playlist)
         st.caption(f"偵測到 {counts}。{list_parameter_note(ctx, urls, expand_playlist)}")
     else:
-        st.caption("支援影片、Shorts、播放清單與頻道連結，也可以直接貼影片 ID 或 @頻道代號。")
-    if rejected:
-        st.warning(rejected_links_message(rejected[:10]))
+        st.caption(OWNER_LINK_HINT if ctx.trusted else VISITOR_LINK_HINT)
+    if set_aside:
+        st.checkbox(f"也嘗試這 {len(set_aside)} 個一般網頁", key=INCLUDE_PAGES_KEY)
+        st.caption(set_aside_pages_caption(set_aside))
+    if found.blocked:
+        st.warning(blocked_links_message(len(found.blocked)))
+    if found.protected:
+        st.warning(protected_links_message(found.protected))
+    if found.rejected:
+        st.warning(rejected_links_message(ctx, found.rejected[:10]))
     notice = st.session_state.pop("link_file_notice", None)
     if notice:
         st.caption(notice)
-    return urls, rejected
+    return found
 
 
 def clear_one_off_settings() -> None:
@@ -232,7 +297,7 @@ def render_free_space(ctx: AppContext) -> None:
 
 
 def run_link_inspection(ctx: AppContext, urls: list[str]) -> None:
-    # Every link is a request from this server to YouTube.
+    # Every link is a request from this server to the site it names.
     max_links = LOCAL_MAX_INSPECT_LINKS if ctx.trusted else CLOUD_MAX_INSPECT_LINKS
     if len(urls) > max_links:
         st.error(f"一次最多解析 {max_links} 個連結，請分批進行。")
@@ -242,7 +307,7 @@ def run_link_inspection(ctx: AppContext, urls: list[str]) -> None:
     browser = current_browser()
     specs = [JobSpec(url=url, settings=settings, output_dir=output_dir, multiple_links=len(urls) > 1, browser=browser or "") for url in urls]
     with temporary_cookie_file(current_cookie_bytes()) as cookie_file:
-        problem = find_login_problem(LoginSource(cookie_file, browser))
+        problem = find_login_problem_for(urls, LoginSource(cookie_file, browser))
         if problem:
             st.error(escape_markdown(problem))
             return
@@ -255,7 +320,7 @@ def run_link_inspection(ctx: AppContext, urls: list[str]) -> None:
         # A playlist can list more than one download fetches, so the picker offers more to choose from.
         picker_limit = PLAYLIST_PICKER_MAX_ITEMS if ctx.trusted else ctx.limits.max_playlist
         progress = st.progress(0.0, text="解析連結中...")
-        # Parallel because each link is mostly waiting on YouTube, and a batch would otherwise take minutes.
+        # Parallel because each link is mostly waiting on its site, and a batch would otherwise take minutes.
         pool = ThreadPoolExecutor(max_workers=INSPECT_WORKERS)
         try:
             # People should be able to pick from more of a playlist than the download limit lets them fetch at once.
@@ -268,7 +333,7 @@ def run_link_inspection(ctx: AppContext, urls: list[str]) -> None:
                 reports.append(future.result())
                 progress.progress(index / len(futures), text=f"已解析 {index}/{len(futures)} 個連結")
         finally:
-            # Leaving the page or pressing Stop raises above; the links not yet started must not still go to YouTube,
+            # Leaving the page or pressing Stop raises above; the links not yet started must not still be fetched,
             # and the page must not wait for the ones already running.
             pool.shutdown(wait=False, cancel_futures=True)
         progress.empty()
@@ -317,9 +382,20 @@ def render_format_picker(ctx: AppContext, report: LinkReport, key: str) -> None:
 
     video_rows = [row for row in rows if row["類型"] != "僅音訊"]
     audio_rows = [row for row in rows if row["類型"] == "僅音訊"]
+    # The container tells one file from another when a site, or a direct link, says nothing of codecs.
     labels = {
         row["格式ID"]: " · ".join(
-            part for part in (row["格式ID"], row["解析度"], row["FPS"] and f"{row['FPS']}fps", row["影像編碼"], row["音訊編碼"], row["語言"], row["大小"]) if part
+            part
+            for part in (
+                row["格式ID"],
+                row["解析度"],
+                row["FPS"] and f"{row['FPS']}fps",
+                row["影像編碼"] if row["影像編碼"] != UNKNOWN else row["容器"],
+                row["音訊編碼"] if row["音訊編碼"] != UNKNOWN else "",
+                row["語言"],
+                row["大小"],
+            )
+            if part
         )
         for row in rows
     }
@@ -398,9 +474,17 @@ def render_comment_export(ctx: AppContext, report: LinkReport, key: str) -> None
         )
 
 
+def is_youtube_report(report: LinkReport) -> bool:
+    # By the link, which is what comments and list picks are fetched with, rather than by what a page turned out to embed.
+    return is_youtube_url(report.get("url", ""))
+
+
 def render_video_report(ctx: AppContext, report: LinkReport, key: str) -> None:
+    # Comments are read with a call that only has YouTube's extractors.
+    with_comments = is_youtube_report(report)
+    names = ["格式", "字幕", "章節", "說明與標籤", *(["留言"] if with_comments else [])]
     # Tracked by key, because otherwise a button inside a tab sends the person back to the first tab.
-    tabs = st.tabs(["格式", "字幕", "章節", "說明與標籤", "留言"], key=f"{key}_tabs", on_change="rerun")
+    tabs = st.tabs(names, key=f"{key}_tabs", on_change="rerun")
     with tabs[0]:
         render_format_picker(ctx, report, key)
     with tabs[1]:
@@ -419,8 +503,9 @@ def render_video_report(ctx: AppContext, report: LinkReport, key: str) -> None:
             st.caption("標籤：" + "、".join(escape_markdown(tag) for tag in report["tags"][:40]))
         if report.get("license"):
             st.caption(f"授權：{escape_markdown(report['license'])}")
-    with tabs[4]:
-        render_comment_export(ctx, report, key)
+    if with_comments:
+        with tabs[4]:
+            render_comment_export(ctx, report, key)
 
 
 def playlist_file_stem(report: LinkReport) -> str:
@@ -429,12 +514,22 @@ def playlist_file_stem(report: LinkReport) -> str:
     return stem or "playlist"
 
 
+def picks_by_position(report: LinkReport) -> bool:
+    """Whether ticked entries go to yt-dlp by their place in the list rather than by ID. Picking by ID works only for
+    YouTube, whose IDs the engine can match while it reads the list, and only for entries that came with one."""
+    entries = report.get("entries") or []
+    has_ids = report.get("entries_have_ids", True) and all(entry["id"] for entry in entries)
+    return not (is_youtube_report(report) and has_ids)
+
+
 def render_playlist_report(ctx: AppContext, report: LinkReport, key: str) -> None:
     entries = report.get("entries") or []
     entry_count = report.get("entry_count")
-    st.write(f"播放清單／頻道：{f'共 {entry_count} 部，' if entry_count else ''}列出 {len(entries)} 部")
+    kind = "播放清單／頻道" if is_youtube_report(report) else "清單"
+    st.write(f"{kind}：{f'共 {entry_count} 部，' if entry_count else ''}列出 {len(entries)} 部")
     if not entries:
         return
+    by_position = not report.get("is_nested") and picks_by_position(report)
     # Only as many as the download limit start ticked: a channel can list hundreds, and one click should not fetch them all.
     preselected = int(collect_settings().playlist_limit)
     rows = [
@@ -455,6 +550,8 @@ def render_playlist_report(ctx: AppContext, report: LinkReport, key: str) -> Non
         },
     )
     chosen = [row["編號"] for row in edited if row["下載"]]
+    if by_position:
+        st.caption("勾選的影片會依清單中的編號下載；如果清單在下載前有變動，可能會下載到其他影片。")
     columns = st.columns(2)
     limit = ctx.limits.max_playlist
     if columns[0].button(f"下載勾選的 {len(chosen)} 部", key=f"{key}_pick_download", type="primary", width="stretch", disabled=not chosen):
@@ -464,6 +561,10 @@ def render_playlist_report(ctx: AppContext, report: LinkReport, key: str) -> Non
             # Rows here are tabs or whole playlists, so playlist item numbers would select those, not these entries.
             urls = [entry["url"] for entry in entries if entry["index"] in chosen and entry["url"]]
             if submit_downloads(ctx, urls):
+                st.rerun()
+        elif by_position:
+            positions = sorted(chosen)
+            if submit_downloads(ctx, [report["url"]], playlist_items=",".join(map(str, positions)), playlist_limit=len(positions)):
                 st.rerun()
         else:
             # By ID rather than by position: a channel may publish a video before the job runs, shifting every number.
@@ -511,14 +612,19 @@ def render_link_report(ctx: AppContext, report: LinkReport, index: int) -> None:
                 f"<div class='video-title'>{html.escape(report.get('title', ''))}</div>",
                 unsafe_allow_html=True,
             )
-            meta = [report.get("channel", ""), *(report.get("details") or [])]
+            # Reports from before sites were named have none, and are YouTube's.
+            site = report.get("site") or site_of_url(report.get("url", ""))
+            meta = [f"網站：{site}", report.get("channel", ""), *(report.get("details") or [])]
             st.markdown(
                 f"<div class='meta-line'>{html.escape(' · '.join(part for part in meta if part))}</div>",
                 unsafe_allow_html=True,
             )
 
             if not report.get("is_playlist"):
-                if report.get("is_live") and ctx.trusted:
+                if report.get("is_live") and not is_youtube_report(report):
+                    # The engine records only YouTube's streams, and skips the others with a note.
+                    st.warning("這部影片正在直播。目前只支援錄製 YouTube 的直播，請等直播結束後再下載。")
+                elif report.get("is_live") and ctx.trusted:
                     st.warning("這部影片正在直播。可在左側「播放清單與頻道」選擇錄製，否則結束後才能下載。")
                 elif report.get("is_live"):
                     # Recording runs for hours, so a public host does not offer it.
@@ -589,7 +695,8 @@ def render_download_page(ctx: AppContext) -> None:
     render_hero(ctx)
     render_restart_notice(ctx)
 
-    urls, rejected = render_link_input(ctx)
+    found = render_link_input(ctx)
+    urls = found.urls
     render_one_off_settings_notice()
 
     columns = st.columns([2, 2, 2, 2, 1])
@@ -599,7 +706,7 @@ def render_download_page(ctx: AppContext) -> None:
         scheduled_at = schedule_controls(ctx)
     with columns[3].popover("匯入清單檔", width="stretch"):
         st.file_uploader(
-            "文字檔裡的 YouTube 連結都會加入上方清單",
+            "文字檔裡的連結都會加入上方清單" if ctx.trusted else "文字檔裡的 YouTube 連結都會加入上方清單",
             type=LINK_FILE_TYPES,
             key="link_file_upload",
             on_change=append_links_from_file,
@@ -609,10 +716,12 @@ def render_download_page(ctx: AppContext) -> None:
     render_free_space(ctx)
 
     if start_download or inspect_only or scheduled_at:
-        if rejected:
-            st.error(rejected_links_message(rejected))
+        # The links named above as left out are just not taken; an entry that may be a typo stops everything, so it
+        # can be fixed first.
+        if found.rejected:
+            st.error(rejected_links_message(ctx, found.rejected))
         elif not urls:
-            st.error("請輸入至少一個 YouTube 網址。")
+            st.error("請輸入至少一個影片網址。" if ctx.trusted else "請輸入至少一個 YouTube 網址。")
         elif inspect_only:
             with public_request_slot(ctx) as allowed:
                 if allowed:

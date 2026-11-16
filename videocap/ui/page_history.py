@@ -9,6 +9,7 @@ from typing import Any, Optional
 import streamlit as st
 
 from videocap.inspector import rows_to_csv
+from videocap.sites import site_label
 from videocap.storage import AppStorage, HistoryEntry
 from videocap.tooling import format_bytes, format_duration
 from videocap.ui.common import format_local_time, page_header, render_active_jobs, render_low_disk_notice, submit_downloads, viewer_timezone
@@ -24,6 +25,7 @@ def history_rows(entries: list[HistoryEntry]) -> list[dict[str, Any]]:
         {
             "標題": entry.title,
             "頻道": entry.channel,
+            "網站": site_label(entry.site, entry.url),
             "規格": entry.quality,
             "大小": format_bytes(entry.size_bytes) if entry.size_bytes else "",
             "長度": format_duration(entry.duration),
@@ -40,6 +42,7 @@ def export_rows(entries: list[HistoryEntry], zone: Optional[tzinfo] = None) -> l
         {
             "標題": entry.title,
             "頻道": entry.channel,
+            "網站": site_label(entry.site, entry.url),
             "影片ID": entry.video_id,
             "網址": entry.url,
             "規格": entry.quality,

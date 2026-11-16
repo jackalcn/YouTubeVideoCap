@@ -25,6 +25,7 @@ from videocap.library import (
     recycle_bin_available,
     scan_folder,
 )
+from videocap.sites import site_label
 from videocap.subtitles import READABLE_SUBTITLE_EXTENSIONS, Cue, cues_to_text, cues_to_vtt, read_subtitle_file, search_cues
 from videocap.tooling import format_bytes, get_free_disk_bytes
 from videocap.ui.common import (
@@ -62,11 +63,22 @@ def filter_entries(entries: list[LibraryEntry], search: str, kind: str, sort: st
     return chosen
 
 
-def entry_rows(entries: list[LibraryEntry], root: Path) -> list[dict[str, Any]]:
+def file_sites(ctx: AppContext, entries: list[LibraryEntry]) -> dict[str, str]:
+    """The site each file was downloaded from, for the files the download history knows."""
+    storage = ctx.services.storage
+    if storage is None:
+        return {}
+    found = storage.find_by_paths(str(entry.path) for entry in entries)
+    return {path: site_label(record.site, record.url) for path, record in found.items()}
+
+
+def entry_rows(entries: list[LibraryEntry], root: Path, sites: dict[str, str]) -> list[dict[str, Any]]:
     return [
         {
             "檔名": entry.path.name,
             "類型": "影片" if entry.kind == "video" else "音訊",
+            # Empty for a file put there by hand, or downloaded before the history was kept.
+            "網站": sites.get(str(entry.path), ""),
             "大小": format_bytes(entry.size),
             "字幕": len(entry.subtitles),
             "修改時間": format_local_time(entry.modified_at, "%Y-%m-%d %H:%M"),
@@ -330,7 +342,7 @@ def render_library_page(ctx: AppContext) -> None:
     # instead of the same row now pointing at another file that 刪除 would then remove.
     listing = hashlib.sha1("\n".join(str(entry.path) for entry in shown).encode("utf-8")).hexdigest()[:12]
     selection = st.dataframe(
-        entry_rows(shown, root),
+        entry_rows(shown, root, file_sites(ctx, shown)),
         hide_index=True,
         width="stretch",
         height=min(36 * (len(shown) + 1), 420),

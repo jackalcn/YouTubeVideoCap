@@ -687,18 +687,26 @@ def test_the_link_box_is_parsed_once_per_change(monkeypatch: pytest.MonkeyPatch)
     import videocap.ui.page_download as page_download
 
     calls: list[str] = []
-    original = page_download.parse_youtube_urls
+    original = page_download.parse_links
 
-    def counting(text: str, **kwargs: Any) -> Any:
+    def counting(text: str, *args: Any, **kwargs: Any) -> Any:
         calls.append(text)
-        return original(text, **kwargs)
+        return original(text, *args, **kwargs)
 
-    monkeypatch.setattr(page_download, "parse_youtube_urls", counting)
+    monkeypatch.setattr(page_download, "parse_links", counting)
     app = run_page("download")
     app.text_area(key="keep_url_input").set_value(URL).run()
     before = len(calls)
     app.run()
     app.run()
+    assert len(calls) == before
+    # Ticking the pages set aside reads the text once more, and only once.
+    app.text_area(key="keep_url_input").set_value(f"{URL}\nhttps://example.com/article").run()
+    app.checkbox(key="keep_include_pages").check().run()
+    before = len(calls)
+    app.run()
+    app.checkbox(key="keep_include_pages").uncheck().run()
+    app.checkbox(key="keep_include_pages").check().run()
     assert len(calls) == before
 
 
@@ -724,9 +732,24 @@ def test_imported_list_files_keep_every_link_whatever_the_encoding(monkeypatch: 
     assert "找到 2 個" in state["link_file_notice"]
 
 
-def test_imported_links_that_are_not_youtube_are_counted(monkeypatch: pytest.MonkeyPatch) -> None:
-    state = import_file(monkeypatch, b"index,title,url\n1,a,https://youtu.be/jNQXAC9IVRw\n2,b,https://vimeo.com/1\n")
-    assert "另有 1 個" in state["link_file_notice"]
+def test_imported_links_to_other_sites_are_added_only_for_this_machines_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = b"index,title,url\n1,a,https://youtu.be/jNQXAC9IVRw\n2,b,https://vimeo.com/1\n"
+    state = import_file(monkeypatch, data)
+    assert state["keep_url_input"].splitlines() == ["https://youtu.be/jNQXAC9IVRw", "https://vimeo.com/1"]
+    assert "找到 2 個連結" in state["link_file_notice"] and "另有" not in state["link_file_notice"]
+
+    state = import_file(monkeypatch, data, trusted=False)
+    assert state["keep_url_input"].splitlines() == ["https://youtu.be/jNQXAC9IVRw"]
+    assert "找到 1 個 YouTube 連結" in state["link_file_notice"]
+    assert "另有 1 個其他網站的連結沒有加入" in state["link_file_notice"]
+
+
+def test_imported_links_that_cannot_be_used_are_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = b"https://youtu.be/jNQXAC9IVRw\nhttps://www.youtube.com/\nhttps://www.netflix.com/watch/80100172\n"
+    notice = import_file(monkeypatch, data)["link_file_notice"]
+    assert "另有 1 個連結無法使用（其他網站的連結請以 http:// 或 https:// 開頭）" in notice
+    assert "另有 1 個串流平台的連結沒有加入" in notice
+    assert "另有 1 個連結不是可下載的 YouTube 連結" in import_file(monkeypatch, data, trusted=False)["link_file_notice"]
 
 
 # links-errors:13 - comment errors in plain words

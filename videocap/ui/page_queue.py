@@ -153,7 +153,9 @@ def render_queue_page(ctx: AppContext) -> None:
         render_visitor_privacy(ctx)
 
     if not jobs:
-        st.info("佇列是空的。到「下載」頁貼上 YouTube 連結並按「開始下載」，任務就會出現在這裡。", icon=":material/inbox:")
+        # Only this machine's owner can download from other sites.
+        links = "影片連結" if ctx.trusted else " YouTube 連結"
+        st.info(f"佇列是空的。到「下載」頁貼上{links}並按「開始下載」，任務就會出現在這裡。", icon=":material/inbox:")
         if "download" in ctx.pages:
             st.page_link(ctx.pages["download"], label="前往下載頁", icon=":material/download:")
     else:

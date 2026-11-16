@@ -156,10 +156,23 @@ def test_finished_download_appears_in_history_and_library(tmp_path: Path) -> Non
 
 def test_rejected_links_are_named_and_nothing_starts() -> None:
     app = run_main()
-    app.text_area(key="keep_url_input").set_value("https://evil.example/video").run()
+    # A name before "@" would let the link pose as YouTube's.
+    app.text_area(key="keep_url_input").set_value(f"{URL}\nhttps://www.youtube.com@evil.example/video").run()
     button(app, "開始下載").click().run()
     assert "不是可下載的 YouTube" in texts(app.error)
     assert services_of(app).manager.list_jobs() == []
+
+
+def test_a_visitors_link_to_another_site_starts_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    public_mode(monkeypatch)
+    app = run_main()
+    app.text_area(key="keep_url_input").set_value("https://evil.example/video").run()
+    button(app, "開始下載").click().run()
+    assert "只開放下載 YouTube" in texts(app.warning)
+    assert "請輸入至少一個 YouTube 網址" in texts(app.error)
+    from videocap.ui.context import get_services
+
+    assert get_services(True).manager.list_jobs() == []
 
 
 def test_empty_input_asks_for_a_link() -> None:
