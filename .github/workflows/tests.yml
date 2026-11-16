@@ -47,6 +47,18 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      # curl-cffi is optional, and everything above ran without it. With the real package, on each system: yt-dlp
+      # takes the version its own extra asks for, the app keeps it away from YouTube and checks that it did, and a
+      # link that a site refuses is fetched the way a browser would. Only sites on the runner itself are asked.
+      - name: Install curl-cffi
+        run: python -m pip install "yt-dlp[curl-cffi]"
+
+      - name: Run the impersonation tests with curl-cffi
+        env:
+          # Makes the tests for the real package fail where they would otherwise be skipped for want of it.
+          VIDEOCAP_EXPECT_CURL_CFFI: '1'
+        run: python -m pytest -q tests/test_impersonation.py
+
   # The image's start command, user handling, fonts and time zone. The job above skips these, having no image.
   docker:
     runs-on: ubuntu-latest
