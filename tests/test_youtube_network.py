@@ -1,13 +1,14 @@
-"""Real downloads against YouTube. Skipped by default; run with: pytest -m network"""
+"""Real downloads against YouTube and, at the end, two other sites. Skipped by default; run with: pytest -m network"""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 from conftest import needs_ffmpeg
-from videocap.downloader import run_download
+from videocap.downloader import OTHER_SITE_SPONSORBLOCK_NOTE, run_download
 from videocap.inspector import inspect_link, search_youtube
 from videocap.library import describe_probe, get_media_duration, probe_media
 from videocap.options import AccessLimits, LoginSource, job_url, options_from_spec
@@ -19,6 +20,10 @@ pytestmark = pytest.mark.network
 # YouTube's first video: 19 seconds, with chapters and subtitles.
 VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 CHANNEL = "https://www.youtube.com/@jawed"
+# A one-minute campaign film from 1960 in the Internet Archive, which yt-dlp has an extractor for.
+ARCHIVE_VIDEO = "https://archive.org/details/Election_Ads/Commercial-JFK1960ElectionAdCampaignJingle.mpg"
+# A five-second CC0 clip that MDN's examples use: a plain file, for yt-dlp's generic extractor.
+DIRECT_LINK = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"
 
 
 class Progress:
@@ -197,3 +202,51 @@ def test_sponsorblock_cuts_a_video_with_real_segments(tmp_path: Path) -> None:
     )
     duration = get_media_duration(Path(outcome["items"][0]["path"]))
     assert duration is not None and duration < 215
+
+
+# Other sites. Only the machine's owner reaches them, which AccessLimits() is.
+
+
+def test_inspect_names_the_site_of_a_video_from_elsewhere(tmp_path: Path) -> None:
+    spec = JobSpec(url=ARCHIVE_VIDEO, settings=DownloadSettings(), output_dir=str(tmp_path))
+    report = inspect_link(ARCHIVE_VIDEO, options_from_spec(spec, AccessLimits()))
+    assert report["error"] == ""
+    assert report["extractor"] == "archiveorg" and report["site"] == "Internet Archive"
+    # The archive says nothing about codecs; its files are still listed, and the one that will be fetched is named.
+    assert report["selected_format"] and report["format_rows"]
+    assert report["selected_size"] > 1_000_000
+
+
+@needs_ffmpeg
+def test_a_video_from_another_site_downloads_without_the_youtube_only_steps(tmp_path: Path) -> None:
+    spec = JobSpec(url=ARCHIVE_VIDEO, settings=DownloadSettings(download_subtitles=False), output_dir=str(tmp_path))
+    preview = inspect_link(ARCHIVE_VIDEO, options_from_spec(spec, AccessLimits()))
+
+    outcome = download(tmp_path, url=ARCHIVE_VIDEO, sponsorblock_mode="remove", download_subtitles=False)
+    item = outcome["items"][0]
+    assert item["extractor"] == "archiveorg"
+    # The site's own file is kept as it is (here its sharpest copy is an Ogg video), under the name the preview gave.
+    assert Path(item["path"]).name == preview["output_name"]
+    assert get_media_duration(Path(item["path"])) == pytest.approx(60, abs=3)
+    # SponsorBlock only knows YouTube's videos: it is left out, and the person is told.
+    assert OTHER_SITE_SPONSORBLOCK_NOTE in outcome["notes"]
+
+
+def test_a_direct_link_downloads_under_an_id_of_its_own(tmp_path: Path) -> None:
+    spec = JobSpec(url=DIRECT_LINK, settings=DownloadSettings(), output_dir=str(tmp_path))
+    report = inspect_link(DIRECT_LINK, options_from_spec(spec, AccessLimits()))
+    assert report["error"] == ""
+    assert report["site"] == "interactive-examples.mdn.mozilla.net（直接連結）"
+
+    outcome = download(tmp_path, url=DIRECT_LINK, download_subtitles=False)
+    item = outcome["items"][0]
+    assert item["extractor"] == "generic"
+    # The file's name plus a mark of the link, so another site's flower.mp4 is another video.
+    assert re.fullmatch(r"flower-[0-9a-f]{8}", item["video_id"]) and item["video_id"] == report["video_id"]
+    assert Path(item["path"]).name == "flower.mp4" and Path(item["path"]).stat().st_size > 100_000
+
+
+def test_a_visitor_is_refused_another_site_before_anything_is_fetched(tmp_path: Path) -> None:
+    spec = JobSpec(url=DIRECT_LINK, settings=DownloadSettings(), output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="只開放下載 YouTube"):
+        options_from_spec(spec, AccessLimits(trusted=False))
