@@ -1542,7 +1542,8 @@ def download_once(
     for item in items:
         finish_item_sidecars(item, options, notes)
 
-    humanized = [humanize_ytdlp_error(message, url) for message in errors]
+    browser_advice = impersonation.advice(options.other_sites) if errors else ""
+    humanized = [humanize_ytdlp_error(message, url, browser_advice) for message in errors]
     if wanted_wait and not wait_live and any(marker in message.lower() for message in errors for marker in UPCOMING_MARKERS):
         notes.append(LIVE_WAIT_NEEDS_FFMPEG_NOTE)
     if any(WHOLE_VIDEO_CUT_MARKER in warning for warning in logger.warnings):
@@ -1747,7 +1748,7 @@ def run_download(
         outcome = download_with_ytdlp(url, options, progress_ui, status_ui, should_stop, on_log)
     except Exception as exc:
         outcome = empty_outcome()
-        outcome["errors"].append(humanize_ytdlp_error(str(exc), url))
+        outcome["errors"].append(humanize_ytdlp_error(str(exc), url, impersonation.advice(options.other_sites)))
         return outcome
 
     if any("account cookies are no longer valid" in message for message in outcome["warnings"]):

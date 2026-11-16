@@ -30,6 +30,7 @@ from videocap.config import (
     RECORDING_STATUS_PREFIX,
 )
 from videocap.downloader import DownloadedItem, DownloadOutcome
+from videocap.errors import cut_at_a_sentence
 from videocap.inspector import find_login_problem
 from videocap.jobs import CANCELED, DONE, FAILED, FINISHED_STATES, PAUSED, QUEUED, RUNNING, STATE_LABELS, Job
 from videocap.library import open_in_file_manager
@@ -545,7 +546,7 @@ def job_status_line(job: Job) -> str:
         return summary
     if job.state == FAILED and outcome:
         errors = outcome_errors(job)
-        return errors[0][:200] if errors else job.status_text
+        return cut_at_a_sentence(errors[0]) if errors else job.status_text
     return job.status_text
 
 

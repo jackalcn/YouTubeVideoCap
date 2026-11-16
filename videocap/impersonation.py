@@ -69,6 +69,11 @@ YOUTUBE_REQUEST_DOMAINS = (
 )
 
 INSTALL_BUTTON_LABEL = "安裝模擬瀏覽器（下載約 10 MB）"
+# What this machine's owner is told to do when a site wants a browser and the app cannot pass for one.
+INSTALL_ADVICE = "請到「系統」頁安裝模擬瀏覽器後再試。"
+SWITCHED_OFF_ADVICE = "模擬瀏覽器目前是停用的，請到「系統」頁啟用後再試。"
+UNSUPPORTED_ADVICE = "已安裝的模擬瀏覽器和目前的 yt-dlp 不相容，請到「系統」頁重新安裝後再試。"
+RESTART_ADVICE = "模擬瀏覽器已經安裝，重新啟動 App 後才能使用。"
 NOT_SEPARATE_MESSAGE = "模擬瀏覽器沒有和 YouTube 的連線隔開（可能是 yt-dlp 更新後內部結構變了），YouTube 的字幕下載可能受影響。App 已自動把它停用，請重新啟動 App。"
 
 
@@ -117,6 +122,18 @@ def ready() -> bool:
 
 def problem() -> str:
     return _problem
+
+
+def advice(other_sites: bool) -> str:
+    """What to do about a site that lets only a browser in, for errors.humanize_ytdlp_error. "" for a visitor, who
+    gets no other site and has no 系統 page to install from, and "" once the app can pass for a browser."""
+    if not other_sites or _kept:
+        return ""
+    if not installed_version():
+        return INSTALL_ADVICE
+    if switched_off()[0]:
+        return SWITCHED_OFF_ADVICE
+    return UNSUPPORTED_ADVICE if _unsupported else RESTART_ADVICE
 
 
 def unsupported() -> str:

@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from videocap.errors import failure_hint, failure_kind, humanize_ytdlp_error, is_network_loss, is_rate_limited, is_unreachable
+from videocap.errors import (
+    IMPERSONATION,
+    cut_at_a_sentence,
+    failure_hint,
+    failure_kind,
+    humanize_ytdlp_error,
+    is_network_loss,
+    is_rate_limited,
+    is_unreachable,
+)
+from videocap.impersonation import INSTALL_ADVICE
 
 
 # Messages as yt-dlp words them (or as Windows words them in Traditional Chinese), with the hint each should get.
@@ -251,8 +261,53 @@ def test_other_sites_errors_get_a_hint_of_their_own(message: str, expected: str)
 def test_another_sites_refusal_suggests_a_login_rather_than_an_update(message: str) -> None:
     hint = hint_of(message)
     assert "檢查新版本" not in hint and "更新" not in hint
-    # Nothing to install either: the app leaves out what impersonation needs on purpose.
+    # Nothing to install either, unless the caller says this person can: a visitor has no 系統 page.
     assert "安裝" not in hint and "pip" not in hint
+
+
+def test_only_the_owner_is_told_how_to_get_past_a_site_that_wants_a_browser() -> None:
+    for_owner = humanize_ytdlp_error(CLOUDFLARE, browser_advice=INSTALL_ADVICE)
+    assert for_owner.startswith("這個網站需要模擬瀏覽器（impersonation）才能下載：一般的程式連線會被它擋下。請到「系統」頁安裝模擬瀏覽器後再試。（原始訊息：")
+    for_visitor = humanize_ytdlp_error(CLOUDFLARE)
+    assert "系統" not in for_visitor and "安裝" not in for_visitor
+    # Still the same kind of failure, with or without the advice.
+    assert failure_kind(for_owner) == failure_kind(for_visitor) == failure_kind(CLOUDFLARE) == IMPERSONATION
+    # No other failure is about a browser, whoever asks.
+    refusal = "ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)"
+    assert humanize_ytdlp_error(refusal, browser_advice=INSTALL_ADVICE) == humanize_ytdlp_error(refusal)
+    # YouTube's subtitles ask for impersonation without needing it, which is no failure and gets no hint.
+    warning = "[youtube] jNQXAC9IVRw: The extractor specified to use impersonation for this download, but no impersonate target is available"
+    assert humanize_ytdlp_error(warning, browser_advice=INSTALL_ADVICE) == warning
+
+
+# How much of yt-dlp's message is quoted
+
+
+def test_a_long_message_is_quoted_up_to_the_end_of_a_sentence() -> None:
+    # Cut by length alone, this one stopped at "and try again with", as if the rest had been lost.
+    assert humanize_ytdlp_error(CLOUDFLARE).endswith("（原始訊息：[generic] page: Got HTTP Error 403 caused by Cloudflare anti-bot challenge…）")
+    short = "ERROR: [generic] clip: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)"
+    assert humanize_ytdlp_error(short).endswith(f"（原始訊息：{short.removeprefix('ERROR: ')}）")
+
+
+@pytest.mark.parametrize(
+    ("text", "limit", "expected"),
+    [
+        ("Short enough.", 40, "Short enough."),
+        ("The first sentence is whole. The second one would be cut somewhere in its middle.", 50, "The first sentence is whole…"),
+        # A dot inside an address ends nothing.
+        ("See https://github.com/yt-dlp/yt-dlp for more; then try again with other options", 60, "See https://github.com/yt-dlp/yt-dlp for more…"),
+        ("這個網站拒絕了下載請求。可能是需要登入，或連結已過期，也可能是這個網站不允許下載。", 30, "這個網站拒絕了下載請求…"),
+        # No sentence ends in reach: at a word.
+        ("one long line of a log without any stop in it at all that goes on", 40, "one long line of a log without any stop…"),
+        # A sentence that ends in the first few words would leave almost nothing.
+        ("No. " + "word " * 30, 40, "No. word word word word word word word…"),
+        # Nothing to cut at: at the limit.
+        ("x" * 100, 40, "x" * 40 + "…"),
+    ],
+)
+def test_text_is_cut_at_a_sentence_then_at_a_word(text: str, limit: int, expected: str) -> None:
+    assert cut_at_a_sentence(text, limit) == expected
 
 
 def test_protected_and_refused_sites_are_not_worked_around() -> None:

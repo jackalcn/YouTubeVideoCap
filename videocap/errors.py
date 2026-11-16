@@ -27,6 +27,14 @@ BOT_CHECK = "bot_check"
 RATE_LIMIT = "rate_limit"
 # A site that wants a person to pass its check, which the app can say only after it has tried as a browser.
 HUMAN_CHECK = "human_check"
+# A site that lets only a browser in. What the person can do about it depends on who they are and on what is
+# installed, so the caller of humanize_ytdlp_error says it.
+IMPERSONATION = "impersonation"
+# How much of yt-dlp's own message is quoted after the app's words for it.
+QUOTE_LENGTH = 200
+# Where a sentence, or a part of one, ends: in yt-dlp's English and in the app's own Chinese. A dot inside an address
+# has no space after it.
+SENTENCE_END_RE = re.compile(r"[.;!?](?=\s)|[。；！？]")
 CONNECTION_LOST = "connection_lost"
 UNREACHABLE = "unreachable"
 
@@ -111,13 +119,13 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
     # yt-dlp's own lists of sites it refuses. Their words also say "will NOT be supported" and "DRM protected".
     Hint("drm_site", ("known to use drm protection",), "這個網站的影片都受 DRM 版權保護，無法下載。"),
     Hint("refused_site", ("primarily used for piracy", "this website is not supported"), "yt-dlp 不支援這個網站，所以無法下載。"),
-    # Before the 403 below: Cloudflare's check is an HTTP 403 too. The app leaves out what impersonation needs, which
-    # once broke subtitle downloads on Windows, and YouTube's subtitles ask for it without needing it.
+    # Before the 403 below: Cloudflare's check is an HTTP 403 too. YouTube's subtitles ask for impersonation without
+    # needing it, and their warning is no failure, so this is for other sites only.
     Hint(
-        "impersonation",
+        IMPERSONATION,
         ("impersonat",),
         None,
-        "{site}需要模擬瀏覽器（impersonation）才能下載，目前這個 App 沒有這項功能，所以無法下載這個網站的影片。",
+        "{site}需要模擬瀏覽器（impersonation）才能下載：一般的程式連線會被它擋下。",
     ),
     # Found in no message: yt-dlp words this refusal as any other HTTP 403. The try that passed for a browser saw
     # the site answer with its check all the same, and humanize_human_check says so.
@@ -378,12 +386,31 @@ def matching_hint(cleaned: str, url: str = "") -> Optional[tuple[Hint, str]]:
     return None
 
 
-def humanize_ytdlp_error(message: str, url: str = "") -> str:
+def cut_at_a_sentence(text: str, limit: int = QUOTE_LENGTH) -> str:
+    """The text, or as many whole sentences of it as fit. Cut by length alone, yt-dlp's advice stopped in the middle
+    of an instruction, which reads as if the rest had been lost."""
+    if len(text) <= limit:
+        return text
+    start = text[:limit]
+    ends = [match.end() for match in SENTENCE_END_RE.finditer(start)]
+    if ends and ends[-1] >= limit // 3:
+        return start[: ends[-1]].rstrip(".;。；") + "…"
+    # No sentence ends in reach, as in one long line of a log: then at a word, and failing that at the limit.
+    ends_with_a_word = start[-1].isspace() or text[limit].isspace()
+    words = start.rstrip() if ends_with_a_word else start.rsplit(None, 1)[0]
+    return (words if len(words) >= limit // 3 else start).rstrip(",;:，；：") + "…"
+
+
+def humanize_ytdlp_error(message: str, url: str = "", browser_advice: str = "") -> str:
     """yt-dlp's message with what to do about it in front. The link the message came from says which site it is
-    about when the message itself does not."""
+    about when the message itself does not. `browser_advice` is added for a site that lets only a browser in: what
+    this person can do about that, from videocap.impersonation.advice, and nothing for a visitor."""
     cleaned = message.removeprefix("ERROR: ").strip()
     matched = matching_hint(cleaned, url)
-    return f"{matched[1]}（原始訊息：{cleaned[:200]}）" if matched else cleaned
+    if not matched:
+        return cleaned
+    hint, text = matched
+    return f"{text}{browser_advice if hint.kind == IMPERSONATION else ''}（原始訊息：{cut_at_a_sentence(cleaned)}）"
 
 
 def humanize_human_check(message: str, url: str = "") -> str:
@@ -391,7 +418,7 @@ def humanize_human_check(message: str, url: str = "") -> str:
     for a browser was answered with it."""
     cleaned = message.removeprefix("ERROR: ").strip()
     hint = next(hint for hint in YTDLP_ERROR_HINTS if hint.kind == HUMAN_CHECK)
-    return f"{hint.text_for(site_in_message(cleaned, url) or UNNAMED_SITE)}（原始訊息：{cleaned[:200]}）"
+    return f"{hint.text_for(site_in_message(cleaned, url) or UNNAMED_SITE)}（原始訊息：{cut_at_a_sentence(cleaned)}）"
 
 
 def classify_failure(message: str) -> Optional[tuple[Hint, str]]:

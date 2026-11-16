@@ -397,9 +397,30 @@ def test_without_the_package_a_refused_link_is_tried_once(new_site: NewSite, tmp
     url = site.add_clip("cf/clip.mp4")
     report, outcome = inspect(url, tmp_path), download(url, tmp_path)
 
-    assert "模擬瀏覽器" in report["error"] and "模擬瀏覽器" in outcome["errors"][0]
+    for error in (report["error"], outcome["errors"][0]):
+        # The owner is told where to get what the site wants.
+        assert error.startswith("這個網站需要模擬瀏覽器") and impersonation.INSTALL_ADVICE in error
     assert not any("模擬瀏覽器" in note for note in outcome["notes"])
     assert site.asked_for("cf/clip.mp4") == 2 and site.browser_requests == []
+
+
+def test_what_the_owner_is_told_to_do_follows_what_is_installed(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(impersonation, "installed_version", lambda: "")
+    assert impersonation.advice(True) == impersonation.INSTALL_ADVICE
+    # A visitor gets no other site, and has no 系統 page to install from.
+    assert impersonation.advice(False) == ""
+
+    monkeypatch.setattr(impersonation, "installed_version", lambda: "0.17.0")
+    monkeypatch.setattr(impersonation, "_unsupported", "Only curl_cffi versions 0.5.10 and 0.10.x through 0.17.x are supported")
+    assert impersonation.advice(True) == impersonation.UNSUPPORTED_ADVICE
+    monkeypatch.setattr(impersonation, "_unsupported", "")
+    assert impersonation.advice(True) == impersonation.RESTART_ADVICE
+    impersonation.write_switch(impersonation.BY_OWNER)
+    assert impersonation.advice(True) == impersonation.SWITCHED_OFF_ADVICE
+
+    # Ready: nothing is left to do, and nothing is said.
+    monkeypatch.setattr(impersonation, "_kept", (impersonation.leaving_youtube_alone(recording(stand_in_handler())),))
+    assert impersonation.advice(True) == ""
 
 
 def test_a_visitors_link_to_another_site_is_refused_before_any_request(browser: Any, plain_site: LocalSite, tmp_path: Path) -> None:

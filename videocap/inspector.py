@@ -452,12 +452,14 @@ def inspect_once(url: str, options: DownloadOptions, refusals: impersonation.Ref
                 except Exception:
                     output_name = ""
     except Exception as exc:
-        return {"url": url, "error": humanize_ytdlp_error(str(exc), url)}, refusal_in([str(exc)], log.warnings)
+        advice = impersonation.advice(options.other_sites)
+        return {"url": url, "error": humanize_ytdlp_error(str(exc), url, advice)}, refusal_in([str(exc)], log.warnings)
     formats = listed_formats(info)
     if "entries" not in info and not formats:
         # Removed, private, members-only, age-gated or blocked: yt-dlp was told not to fail, so it only warned.
         reason = find_unplayable_reason(log.warnings)
-        return {"url": url, "error": humanize_ytdlp_error(reason, url)}, refusal_in([reason], log.warnings)
+        advice = impersonation.advice(options.other_sites)
+        return {"url": url, "error": humanize_ytdlp_error(reason, url, advice)}, refusal_in([reason], log.warnings)
 
     report: LinkReport = {
         "url": url,
