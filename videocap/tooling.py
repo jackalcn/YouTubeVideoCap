@@ -255,9 +255,11 @@ def install_impersonation(timeout: float = 600, proxy: str = "") -> UpdateResult
     if code != 0:
         return UpdateResult(False, output)
     refresh_import_paths()
-    impersonation.load()
+    # Installing is asking to use it. A switch may be left from before: of an app closed in the middle of a removal,
+    # or of a check that failed, which is made again here and switches it off again if it still fails.
+    impersonation.switch_on()
     # Installed, yet yt-dlp has no handler for it in this process: another version of the package is still in memory.
-    return UpdateResult(True, output, restart_required=not impersonation.ready() and not impersonation.switched_off()[0])
+    return UpdateResult(True, output, restart_required=not impersonation.ready())
 
 
 def remove_impersonation(timeout: float = 300) -> UpdateResult:

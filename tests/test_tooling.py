@@ -229,8 +229,12 @@ def test_impersonation_installs_the_curl_cffi_that_the_installed_yt_dlp_asks_for
 
     # yt-dlp's handler for the package loads once pip is done.
     monkeypatch.setattr(impersonation, "load", lambda: monkeypatch.setattr(impersonation, "_kept", (object(),)))
+    # A switch left behind, as by an app that was closed in the middle of a removal.
+    impersonation.write_switch(impersonation.BY_OWNER)
     result = tooling.install_impersonation(proxy="http://proxy.example:8080")
     assert result.succeeded and not result.restart_required
+    # Installing is asking to use it, so it starts switched on.
+    assert impersonation.switched_off() == ("", "")
     command = browser_pip.pip_command
     # yt-dlp's own extra, so that pip picks a version this yt-dlp takes, whichever yt-dlp it is.
     assert command[:4] == [sys.executable, "-m", "pip", "install"] and command[-1] == "yt-dlp[curl-cffi]"
