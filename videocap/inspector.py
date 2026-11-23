@@ -21,6 +21,7 @@ from videocap.downloader import (
     AUDIO_EXTENSIONS,
     VIDEO_EXTENSIONS,
     DirectLinkTypePP,
+    PageStreamPP,
     UrlKeyedIdPP,
     YtDlpLogCollector,
     estimate_size,
@@ -34,8 +35,10 @@ from videocap.options import (
     add_extractor_args,
     build_base_options,
     build_format_options,
+    build_read_options,
     expected_final_extension,
 )
+from videocap.page_streams import find_streams, holds_no_video
 from videocap.sidecars import comment_rows, write_csv
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status
 from videocap.sites import is_youtube_url, site_label
@@ -49,6 +52,9 @@ DRM_MARKER = "drm protected"
 UNKNOWN = "未知"
 # The extension yt-dlp gives audio it takes out of its container without converting it.
 ORIGINAL_AUDIO_EXTENSIONS = {"opus": "opus", "mp4a": "m4a", "vorbis": "ogg", "mp3": "mp3", "flac": "flac"}
+# What the report of a page says when its video was found in the page's own player script, and when that failed.
+PAGE_STREAM_DETAIL = "串流取自網頁的播放器腳本"
+PAGE_STREAM_FOUND_BUT_FAILED = "這個網頁沒有直接列出影片，它的播放器腳本裡有串流網址，但無法讀取："
 
 SubtitleRow = dict[str, str]
 FormatRow = dict[str, str]
@@ -401,25 +407,44 @@ def preview_extension(info: Mapping[str, Any], options: DownloadOptions, ffmpeg_
 def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
     refusals = impersonation.Refusals()
     report, _ = inspect_once(url, options, refusals)
-    if not report.get("error") or not refusals.forbidden or options.impersonate or not impersonation.offered_to(url, options.other_sites):
-        return report
-    # The site answered HTTP 403, so once more with every request made the way a browser makes it: the download does
-    # the same, in downloader.download_with_ytdlp.
-    refusals = impersonation.Refusals()
-    report, failure = inspect_once(url, replace(options, impersonate=True), refusals)
-    if failure and refusals.challenged:
-        # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
-        report["error"] = humanize_human_check(failure, url)
+    if report.get("error") and refusals.forbidden and not options.impersonate and impersonation.offered_to(url, options.other_sites):
+        # The site answered HTTP 403, so once more with every request made the way a browser makes it: the download does
+        # the same, in downloader.download_with_ytdlp.
+        options = replace(options, impersonate=True)
+        refusals = impersonation.Refusals()
+        report, failure = inspect_once(url, options, refusals)
+        if failure and refusals.challenged:
+            # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
+            report["error"] = humanize_human_check(failure, url)
+            return report
+    if report.get("error") and not options.page_stream and options.other_sites and holds_no_video(url, [report["error"]]):
+        return inspect_stream_in_page(url, options, report)
     return report
+
+
+def inspect_stream_in_page(url: str, options: DownloadOptions, report: LinkReport) -> LinkReport:
+    """A page that holds no video yt-dlp can see, but whose player script keeps a stream's address packed (see
+    videocap.page_streams): the report of that stream, in the page's name. The page's own report stands when the page
+    gives no stream away. When it gives one away that cannot be read, that is what the report says."""
+    streams = find_streams(build_read_options(options, impersonation.Silent()), url, options.other_sites)
+    failed: LinkReport = report
+    for stream in streams:
+        found = inspect_link(stream.address, replace(options, page_stream=stream))
+        if not found.get("error"):
+            found["url"] = url
+            found["site"] = site_label(found.get("extractor", ""), url)
+            found["details"] = [PAGE_STREAM_DETAIL, *found.get("details", [])]
+            return found
+        failed = {"url": url, "error": f"{PAGE_STREAM_FOUND_BUT_FAILED}{found['error']}"}
+    return failed
 
 
 def inspect_once(url: str, options: DownloadOptions, refusals: impersonation.Refusals) -> tuple[LinkReport, str]:
     """One look at the link. Also returns yt-dlp's own words for what it failed with, or ""."""
     ffmpeg_available, _ = get_ffmpeg_status()
     log = YtDlpLogCollector()
-    opts = build_base_options(
-        log, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites, options.impersonate
-    )
+    # The owner's own say on how requests are made, as in the download: a link that the download reads must be read here.
+    opts = build_read_options(options, log)
     opts.update(build_format_options(options, ffmpeg_available))
     opts.update(
         {
@@ -439,6 +464,8 @@ def inspect_once(url: str, options: DownloadOptions, refusals: impersonation.Ref
     try:
         with impersonation.youtube_dl(yt_dlp.YoutubeDL, opts, url, options.other_sites, refusals) as ydl:
             if options.other_sites:
+                if options.page_stream:
+                    ydl.add_post_processor(PageStreamPP(options.page_stream), when="pre_process")
                 # The same ID the download will give a direct link's or a page's video, and so the same file name.
                 ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")
                 ydl.add_post_processor(DirectLinkTypePP(), when="pre_process")

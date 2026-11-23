@@ -23,11 +23,14 @@ from videocap.options import (
     build_format_options,
     build_late_postprocessors,
     build_output_template,
+    build_read_options,
     build_ydl_options,
     entry_filter_reason,
+    merge_http_headers,
     network_options,
     options_from_spec,
 )
+from videocap.page_streams import PageStream
 from videocap.settings import BUILTIN_PRESETS, DownloadSettings, JobSpec, job_spec_from_dict, settings_from_dict
 
 
@@ -965,6 +968,47 @@ def test_extra_ytdlp_steps_are_left_for_the_downloader_to_add_last() -> None:
 
         add_owner_postprocessors(ydl, options)
         assert [type(step).__name__ for step in ydl._pps["after_move"]] == ["ExecPP"]
+
+
+def test_headers_are_merged_by_name_without_regard_to_case_and_without_spaces_around_them() -> None:
+    merged = merge_http_headers({"referer": "https://a.example/", "X-One": "1"}, {"Referer": " https://b.example/ ", "x-two": " 2"})
+    assert merged == {"Referer": "https://b.example/", "X-One": "1", "X-Two": "2"}
+
+
+def test_a_reading_of_a_link_takes_only_the_owners_options_about_how_requests_are_made() -> None:
+    raw = (
+        '--referer https://site.example/ --add-headers "X-Extra: 1" --proxy http://127.0.0.1:9 --extractor-args generic:impersonate '
+        "--no-check-certificates --write-info-json --write-thumbnail --retries 7 --limit-rate 50K --embed-metadata"
+    )
+    options = spec_options(ytdlp_extra_args=raw)
+    read = build_read_options(options, YtDlpLogCollector())
+    # How requests are made, with the owner's say on it.
+    assert read["http_headers"] == {"Referer": "https://site.example/", "X-Extra": "1"}
+    assert read["extractor_args"]["generic"] == {"impersonate": [""]}
+    assert read["proxy"] == "http://127.0.0.1:9" and read["nocheckcertificate"] is True
+    # Nothing that saves a file or names it, and nothing that the app chose for itself stays chosen.
+    assert not {"writeinfojson", "writethumbnail", "ratelimit", "postprocessors"} & read.keys()
+    assert read["retries"] == options.retry_count
+    # The download takes all of them.
+    download = build_ydl_options(options, True, YtDlpLogCollector())
+    assert download["writeinfojson"] is True and download["retries"] == 7 and download["ratelimit"] == 50 * 1024
+    assert download["http_headers"] == read["http_headers"]
+
+
+def test_a_visitor_has_no_options_of_the_owners_to_take() -> None:
+    options = spec_options(AccessLimits.for_public_host(), ytdlp_extra_args="--referer https://site.example/")
+    assert "http_headers" not in build_read_options(options, YtDlpLogCollector())
+
+
+def test_the_owners_headers_are_added_to_a_streams_pages_not_put_in_their_place() -> None:
+    stream = PageStream("https://site.example/watch/1", "https://cdn.example/a.m3u8")
+    options = replace(spec_options(ytdlp_extra_args='--referer http://elsewhere.example/ --add-headers "X-Extra: 1"'), page_stream=stream)
+    expected = {"Referer": "http://elsewhere.example/", "Origin": "https://site.example", "X-Extra": "1"}
+    assert build_read_options(options, YtDlpLogCollector())["http_headers"] == expected
+    assert build_ydl_options(options, True, YtDlpLogCollector())["http_headers"] == expected
+    # Without the owner's, the page's alone.
+    plain = replace(spec_options(), page_stream=stream)
+    assert build_read_options(plain, YtDlpLogCollector())["http_headers"] == stream.headers()
 
 
 def test_extra_ytdlp_options_change_a_real_download(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:

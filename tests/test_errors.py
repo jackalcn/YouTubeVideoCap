@@ -438,6 +438,27 @@ def test_another_sites_long_message_keeps_its_kind_after_it_is_cut_short() -> No
     assert is_rate_limited(humanized) and not is_network_loss(humanized)
 
 
+def test_a_refusal_from_another_site_says_it_may_want_the_page_it_came_from() -> None:
+    message = "ERROR: [generic] index: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)"
+    other = humanize_ytdlp_error(message, "https://cdn.example.com/hls/index.m3u8")
+    # How the owner gets past it: the one place a stream's site is told which page it is asked for from.
+    assert "Referer" in other and "--referer" in other and "進階 yt-dlp 參數" in other
+    # Still the same failure when it is read again in the app's own words.
+    assert failure_kind(other) == "http_403"
+    # YouTube's refusal has nothing to do with the page it came from.
+    youtube = humanize_ytdlp_error("ERROR: [download] Got error: HTTP Error 403: Forbidden", "https://youtu.be/jNQXAC9IVRw")
+    assert "Referer" not in youtube and "referer" not in youtube
+
+
+def test_yt_dlps_word_for_no_video_is_a_kind_of_its_own() -> None:
+    from videocap.errors import UNREADABLE_LINK
+
+    for message in ("ERROR: Unsupported URL: https://example.com/about", "ERROR: No suitable extractor found for URL https://example.com/about"):
+        assert failure_kind(message) == UNREADABLE_LINK
+        # And after the app has put it in its own words.
+        assert failure_kind(humanize_ytdlp_error(message, "https://example.com/about")) == UNREADABLE_LINK
+
+
 # A message that names no site
 
 UNNAMED_REFUSAL = "ERROR: unable to download video data: HTTP Error 403: Forbidden"

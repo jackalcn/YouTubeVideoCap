@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import functools
 import http.server
+import re
 import shutil
 import subprocess
 import threading
 from pathlib import Path
 from typing import Callable, Iterator
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -32,7 +34,30 @@ CHECKED_PREFIX = "/cf/"
 BROWSERS_ONLY_PREFIX = "/browsers-only/"
 # Under this no one gets in, browser or not: the check wants a person.
 PERSON_ONLY_PREFIX = "/captcha/"
+# Under this the check for bots turns away the first request for each address and lets the next one through, as one
+# that passes only some of what it is sent does.
+FLAKY_PREFIX = "/flaky/"
+# Anything in a folder of this name opens only to a request that names a page of one chosen site as its Referer, as
+# the stream of a page whose player checks that does, and anything else gets a bare HTTP 403. See refer_only_from.
+REFERRED_FOLDER = "/referred/"
 CHECK_PAGE = b"<!doctype html><html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>"
+# The letters and digits a packer writes its codes with, which a test writes them with by its own hand.
+PACKER_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def packer_code(position: int, base: int) -> str:
+    return PACKER_DIGITS[position] if position < base else packer_code(position // base, base) + PACKER_DIGITS[position % base]
+
+
+def pack(code: str, base: int = 36) -> str:
+    """The code as Dean Edwards' packer writes it, which the players of pages that hide a stream's address often are:
+    its words swapped for short codes and listed apart, in a script that puts them back and runs the result."""
+    words = list(dict.fromkeys(re.findall(r"\w+", code)))
+    codes = {word: packer_code(position, base) for position, word in enumerate(words)}
+    swapped = re.sub(r"\b(\w+)\b", lambda match: codes[match.group(1)], code, flags=re.ASCII)
+    payload = swapped.replace("\\", "\\\\").replace("'", "\\'")
+    unpacker = "function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\\\\b'+c.toString(a)+'\\\\b','g'),k[c]);return p}"
+    return f"eval({unpacker}('{payload}',{base},{len(words)},'{'|'.join(words)}'.split('|'),0,{{}}))"
 
 
 class SiteHandler(http.server.SimpleHTTPRequestHandler):
@@ -47,12 +72,16 @@ class SiteHandler(http.server.SimpleHTTPRequestHandler):
 
     def answer(self, serve: Callable[[], None]) -> None:
         self.site.requests.append(self.path)
+        self.site.referers.append((self.path, self.headers.get("Referer", ""), self.headers.get("Origin", "")))
         as_browser = self.headers.get(BROWSER_HEADER) is not None
         if as_browser:
             self.site.browser_requests.append(self.path)
-        if self.path.startswith(REFUSED_PREFIX) or (self.path.startswith(BROWSERS_ONLY_PREFIX) and not as_browser):
+        unreferred = REFERRED_FOLDER in self.path and not self.site.accepts_referer(self.headers.get("Referer", ""))
+        if self.path.startswith(REFUSED_PREFIX) or (self.path.startswith(BROWSERS_ONLY_PREFIX) and not as_browser) or unreferred:
             self.send_error(403, "Forbidden")
-        elif self.path.startswith(PERSON_ONLY_PREFIX) or (self.path.startswith(CHECKED_PREFIX) and not as_browser):
+        elif self.path.startswith(PERSON_ONLY_PREFIX) or (self.path.startswith(CHECKED_PREFIX) and not as_browser) or (
+            self.path.startswith(FLAKY_PREFIX) and self.site.turns_away_first(self.path)
+        ):
             self.send_check()
         else:
             serve()
@@ -83,6 +112,11 @@ class LocalSite:
         self.requests: list[str] = []
         # Those of them that came as from a browser.
         self.browser_requests: list[str] = []
+        # Each request's path with the Referer and the Origin it came with, "" for one it came without.
+        self.referers: list[tuple[str, str, str]] = []
+        self.referer_origin = ""
+        # The addresses under FLAKY_PREFIX that have been asked for once.
+        self.asked_once: set[str] = set()
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(SiteHandler, site=self))
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -113,12 +147,45 @@ class LocalSite:
         offered = "".join(f'<source src="{source}" type="{kind}" width="{width}" height="{height}">' for source, kind, width, height in sources)
         return self.write_page(name, title, f"<video controls>{offered}</video>")
 
-    def write_page(self, name: str, title: str, players: str) -> str:
-        html = f"<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1>{players}</body></html>"
+    def write_page(self, name: str, title: str, players: str, head: str = "") -> str:
+        html = f"<!doctype html><html><head><title>{title}</title>{head}</head><body><h1>{title}</h1>{players}</body></html>"
         target = self.root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(html, encoding="utf-8")
         return self.url(name)
+
+    def add_packed_page(self, name: str, code: str, title: str = "Local page", image: str = "", base: int = 36) -> str:
+        """A page whose only player is a packed script: nothing in the page's text says where its stream is."""
+        head = f'<meta property="og:image" content="{image}">' if image else ""
+        return self.write_page(name, title, f"<script>{pack(code, base)}</script>", head)
+
+    def add_playlist(self, name: str = "hls/index.m3u8", segments: int = 3) -> str:
+        """A stream's playlist, written out: enough to be read and listed, with no segment behind it."""
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD"]
+        for number in range(segments):
+            lines += ["#EXTINF:2.0,", f"segment{number}.ts"]
+        target = self.root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join([*lines, "#EXT-X-ENDLIST"]) + "\n", encoding="utf-8")
+        return self.url(name)
+
+    def refer_only_from(self, page_site: LocalSite) -> None:
+        """Makes what is in a folder named `referred` open only to requests that name a page of that site as their Referer."""
+        self.referer_origin = page_site.base
+
+    def turns_away_first(self, path: str) -> bool:
+        """Whether this is the first request for the address, which the flaky check turns away."""
+        first = path not in self.asked_once
+        self.asked_once.add(path)
+        return first
+
+    def accepts_referer(self, referer: str) -> bool:
+        parts = urlsplit(referer)
+        return bool(self.referer_origin) and f"{parts.scheme}://{parts.netloc}" == self.referer_origin
+
+    def referers_for(self, path: str) -> list[tuple[str, str]]:
+        """The Referer and the Origin of each request that named this path."""
+        return [(referer, origin) for requested, referer, origin in self.referers if requested.split("?")[0] == f"/{path.lstrip('/')}"]
 
     def add_stream(self, folder: str = "hls", variant: str = "a", segments_in: str = "") -> str:
         """An HLS stream: a playlist and its segments. `segments_in` puts the segments in a folder of their own, so

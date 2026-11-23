@@ -60,15 +60,17 @@ from videocap.media_tools import reserve_output_path
 from videocap.options import (
     DownloadOptions,
     build_late_postprocessors,
+    build_read_options,
     build_ydl_options,
     entry_filter_reason,
     expected_final_extension,
     waits_for_live,
     writes_thumbnail,
 )
+from videocap.page_streams import PageStream, find_streams, holds_no_video
 from videocap.processes import end_process_tree, remove_when_released, tie_to_app, tied_popen_options
 from videocap.sidecars import release_time, set_file_times, write_comments_csv, write_live_chat_csv, write_music_tags, write_nfo
-from videocap.sites import MEDIA_SNIFF_BYTES, URL_NAMED_EXTRACTORS, is_youtube_url, media_extension_from_bytes, url_keyed_id
+from videocap.sites import MEDIA_SNIFF_BYTES, URL_NAMED_EXTRACTORS, host_of, is_youtube_url, media_extension_from_bytes, url_keyed_id
 from videocap.subtitles import READABLE_SUBTITLE_EXTENSIONS, cues_to_srt, cues_to_vtt, cut_cues, read_subtitle_file, write_transcript
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status, get_free_disk_bytes
 
@@ -107,6 +109,7 @@ POSTPROCESSOR_LABELS = {
     "FixupTimestamp": "正在修正檔案...",
     "ScrubText": "正在整理文字...",
     "UrlKeyedId": "正在整理文字...",
+    "PageStream": "正在採用網頁的標題與縮圖...",
     "DirectLinkType": "正在確認檔案類型...",
     "CutClipSubtitles": "正在對齊片段字幕...",
     "MetadataParser": "正在整理影片資訊...",
@@ -610,6 +613,28 @@ class UrlKeyedIdPP(PostProcessor):
         return [], information
 
 
+class PageStreamPP(PostProcessor):
+    """Gives a stream that a page's packed player script gave away what the page says of it: its address, its title and
+    its picture. yt-dlp saw a playlist called "playlist" and nothing more.
+
+    Runs at pre_process before UrlKeyedIdPP, which then keys the ID on the page, and before yt-dlp names a file."""
+
+    def __init__(self, page: PageStream) -> None:
+        super().__init__()
+        self.page = page
+
+    def run(self, information: Any) -> tuple[list[str], Any]:
+        # A list's flat entries pass through here too, before they are videos.
+        if not information.get("id"):
+            return [], information
+        information["webpage_url"] = information["original_url"] = self.page.page_url
+        if self.page.title:
+            information["title"] = self.page.title
+        if self.page.thumbnail and not information.get("thumbnail"):
+            information["thumbnail"] = self.page.thumbnail
+        return [], information
+
+
 class DirectLinkTypePP(PostProcessor):
     """Finds out what kind of file a direct link leads to when neither the link nor its server says: no extension in
     the address, and the file sent as plain data. yt-dlp then saves it as ".unknown_video", which no player opens and
@@ -1104,12 +1129,14 @@ def download_with_ytdlp(
     refusals = impersonation.Refusals()
     outcome, failures = download_once(url, options, progress_ui, status_ui, should_stop, on_log, refusals)
     if refused_as_a_program(url, options, outcome, failures, refusals):
-        return download_as_a_browser(url, options, outcome, progress_ui, status_ui, should_stop, on_log)
+        outcome = download_as_a_browser(url, options, outcome, progress_ui, status_ui, should_stop, on_log)
+        # The page was read as a browser reads it, and so is its player script, whatever it gives away.
+        return download_stream_in_page(url, replace(options, impersonate=True), outcome, progress_ui, status_ui, should_stop, on_log)
     forbidden = list(dict.fromkeys(video_id for message, video_id in failures if video_id and FORBIDDEN_MARKER in message.lower()))
     # A client the person picked is a choice to respect, and a stopped job is meant to stop. Only YouTube has other
     # clients to ask, and the retry asks YouTube for the video by its ID.
     if not forbidden or options.network.player_client or outcome["stopped"] or not is_youtube_url(url):
-        return outcome
+        return download_stream_in_page(url, options, outcome, progress_ui, status_ui, should_stop, on_log)
     if options_for_forbidden_retry(options, outcome) is None:
         return outcome
 
@@ -1197,6 +1224,49 @@ def download_as_a_browser(
     elif outcome["errors"] and not outcome["stopped"]:
         outcome["notes"].append(BROWSER_RETRY_FAILED_NOTE)
     return outcome
+
+
+PAGE_STREAM_MESSAGE = "這個網頁沒有直接列出影片，改讀它的播放器腳本，找到串流網址再下載。"
+PAGE_STREAM_NOTE = "這個網頁沒有直接列出影片：串流網址取自它的播放器腳本（{host}），下載時以這個網頁當來源網頁（Referer）。"
+
+
+def page_without_a_video(url: str, options: DownloadOptions, outcome: DownloadOutcome) -> bool:
+    """Whether the owner's link to an ordinary page came back with nothing, and with yt-dlp's word that it saw no video
+    in it as the only failure: the one that a look at the page's own scripts can mend. A stream that was found this way
+    is not searched for again."""
+    if not options.other_sites or options.page_stream or outcome["items"] or outcome["stopped"]:
+        return False
+    return holds_no_video(url, outcome["errors"])
+
+
+def download_stream_in_page(
+    url: str,
+    options: DownloadOptions,
+    outcome: DownloadOutcome,
+    progress_ui: ProgressUI,
+    status_ui: Optional[StatusUI] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> DownloadOutcome:
+    """A page that holds no video yt-dlp can see, but whose player script keeps a stream's address packed (see
+    videocap.page_streams): that stream is downloaded in the page's name, asked for as the page's player would ask for
+    it. The outcome stands as it is when the page gives no stream away. Once the stream is found, its outcome replaces
+    the page's, which only said that the page held no video."""
+    if not page_without_a_video(url, options, outcome) or (should_stop and should_stop()):
+        return outcome
+    streams = find_streams(build_read_options(options, impersonation.Silent()), url, options.other_sites)
+    if not streams:
+        return outcome
+    if on_log:
+        on_log(PAGE_STREAM_MESSAGE)
+    progress_ui.progress(0.0, text=PAGE_STREAM_MESSAGE)
+    result = outcome
+    for stream in streams:
+        result = download_with_ytdlp(stream.address, replace(options, page_stream=stream), progress_ui, status_ui, should_stop, on_log)
+        if result["items"] or result["stopped"]:
+            break
+    result["notes"].insert(0, PAGE_STREAM_NOTE.format(host=host_of(stream.address)))
+    return result
 
 
 def options_for_forbidden_retry(options: DownloadOptions, outcome: DownloadOutcome) -> Optional[DownloadOptions]:
@@ -1478,6 +1548,8 @@ def download_once(
         collect_when = "post_process" if has_media else "before_dl"
         ydl.add_post_processor(ScrubTextPP(), when="pre_process")
         if options.other_sites:
+            if options.page_stream:
+                ydl.add_post_processor(PageStreamPP(options.page_stream), when="pre_process")
             # Only these options can reach the extractors whose IDs need it.
             ydl.add_post_processor(UrlKeyedIdPP(), when="pre_process")
             ydl.add_post_processor(DirectLinkTypePP(), when="pre_process")

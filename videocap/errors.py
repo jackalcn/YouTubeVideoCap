@@ -27,6 +27,9 @@ BOT_CHECK = "bot_check"
 RATE_LIMIT = "rate_limit"
 # A site that wants a person to pass its check, which the app can say only after it has tried as a browser.
 HUMAN_CHECK = "human_check"
+# yt-dlp's word that it saw no video in a page, or could not read the link at all. The player of a page may still keep
+# its stream's address in a script yt-dlp does not read: see videocap.page_streams.
+UNREADABLE_LINK = "unreadable_link"
 # A site that lets only a browser in. What the person can do about it depends on who they are and on what is
 # installed, so the caller of humanize_ytdlp_error says it.
 IMPERSONATION = "impersonation"
@@ -186,7 +189,8 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
         "YouTube 拒絕了下載請求。常見原因是這台機器的網路位址被限制（雲端主機、VPN 常見），或 yt-dlp 版本太舊。"
         "可以在「會員登入」登入帳號後再試；在自己的電腦上執行時，也可以到「系統」頁按「檢查新版本」更新 yt-dlp。",
         "{site}拒絕了下載請求（HTTP 403）。可能是需要登入（" + OTHER_SITE_LOGIN + "），"
-        "連結已過期（請回到影片網頁重新複製連結），或這個網站不允許下載。",
+        "連結已過期（請回到影片網頁重新複製連結），要求看到來源網頁（Referer，影片串流常見：請在「進階 yt-dlp 參數」"
+        "填 --referer 加上影片所在網頁的網址），或這個網站不允許下載。",
     ),
     # YouTube's own 404s are the channel's, below; one while downloading a stream says nothing useful.
     Hint(
@@ -272,7 +276,7 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
     ),
     Hint("truncated_link", ("looks truncated",), "網址不完整，請重新複製完整網址。"),
     Hint(
-        "unreadable_link",
+        UNREADABLE_LINK,
         ("no suitable extractor", "unsupported url"),
         "無法辨識這個網址，請從瀏覽器網址列或 YouTube 的「分享」重新複製完整連結。",
         "這個網址裡找不到可以下載的影片：yt-dlp 不支援這個網站，或這個網頁裡沒有影片。請確認貼的是影片所在網頁的完整網址。",

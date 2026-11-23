@@ -45,6 +45,7 @@ from videocap.config import (
 )
 # Imported by everything that builds a YoutubeDL: importing it is what keeps impersonation away from YouTube.
 from videocap import impersonation
+from videocap.page_streams import PageStream
 from videocap.settings import DownloadSettings, JobSpec
 from videocap.sites import is_youtube_url
 from videocap.urls import apply_channel_tab, parse_date_filter, parse_time_ranges, url_identity, validate_playlist_items
@@ -293,6 +294,9 @@ class DownloadOptions:
     # Sends every request of the run the way a browser would, which a site's check for bots may insist on. Set only
     # for the one retry of the owner's link to another site, after the site refused the first try.
     impersonate: bool = False
+    # Set only for a stream that the packed player script of a page gave away (see videocap.page_streams). The run is
+    # the stream's, but its requests carry what the page's own player would send, and its result takes the page's name.
+    page_stream: Optional[PageStream] = None
 
 
 class YtDlpLogger(Protocol):
@@ -359,6 +363,7 @@ def build_base_options(
     noplaylist: bool = True,
     other_sites: bool = False,
     impersonate: bool = False,
+    page_stream: Optional[PageStream] = None,
 ) -> dict[str, Any]:
     network = network or NetworkOptions()
     base_opts: dict[str, Any] = {
@@ -391,7 +396,65 @@ def build_base_options(
         # yt-dlp's option for the whole run, because its generic extractor's own switch covers only the first request
         # and leaves out a stream's playlist and segments. impersonation.youtube_dl drops it again for a YouTube link.
         base_opts["impersonate"] = impersonation.any_browser()
+    if page_stream and other_sites:
+        # Under the owner's own headers, which build_ydl_options and build_read_options put over these.
+        base_opts["http_headers"] = page_stream.headers()
     return base_opts
+
+
+# What the owner's extra yt-dlp options may still say when nothing is saved: how requests are made, and nothing about
+# what is kept or how it is named. Reading a link and reading a page take these, so they meet the same site as the download.
+REQUEST_YTDLP_KEYS = frozenset(
+    {
+        "http_headers",
+        "extractor_args",
+        "proxy",
+        "source_address",
+        "socket_timeout",
+        "nocheckcertificate",
+        "legacyserverconnect",
+        "geo_verification_proxy",
+        "geo_bypass",
+        "geo_bypass_country",
+        "geo_bypass_ip_block",
+        "sleep_interval_requests",
+    }
+)
+
+
+def merge_http_headers(*parts: Mapping[str, str]) -> dict[str, str]:
+    """Headers from several sources, the later ones winning. Names are matched without regard to case, as HTTP does and
+    as yt-dlp does when it adds its own. A value has no spaces around it: --add-headers "Referer: https://..." leaves
+    the one after the colon in the value."""
+    merged: dict[str, str] = {}
+    for part in parts:
+        for name, value in part.items():
+            merged[name.title()] = str(value).strip()
+    return merged
+
+
+def apply_extra_ytdlp_options(ydl_opts: dict[str, Any], extra: ExtraYtDlpOptions, only: Optional[frozenset[str]] = None) -> None:
+    """Puts the owner's options over the app's own, so the owner has the last word. With `only`, just those of them."""
+    for key, value in extra.params.items():
+        if only is not None and key not in only:
+            continue
+        if key == "extractor_args":
+            add_extractor_args(ydl_opts, value)
+        elif key == "http_headers":
+            # Added to the headers a stream's page asks for, not in place of them.
+            ydl_opts[key] = merge_http_headers(ydl_opts.get(key) or {}, value)
+        else:
+            ydl_opts[key] = value
+
+
+def build_read_options(options: DownloadOptions, logger: YtDlpLogger) -> dict[str, Any]:
+    """What yt-dlp is told when a request only reads, as the link inspection and the reading of a page do: how the
+    run's requests are made, with the owner's say on that, and nothing about what is saved."""
+    ydl_opts = build_base_options(
+        logger, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites, options.impersonate, options.page_stream
+    )
+    apply_extra_ytdlp_options(ydl_opts, options.extra_ytdlp, only=REQUEST_YTDLP_KEYS)
+    return ydl_opts
 
 
 def youtube_extractor_args(network: NetworkOptions, login: LoginSource) -> dict[str, list[str]]:
@@ -553,7 +616,7 @@ def build_late_postprocessors(options: DownloadOptions, ffmpeg_available: bool) 
 
 def build_ydl_options(options: DownloadOptions, ffmpeg_available: bool, logger: YtDlpLogger) -> dict[str, Any]:
     ydl_opts = build_base_options(
-        logger, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites, options.impersonate
+        logger, options.retry_count, options.login, options.network, options.noplaylist, options.other_sites, options.impersonate, options.page_stream
     )
     ydl_opts.update(
         {
@@ -635,11 +698,7 @@ def build_ydl_options(options: DownloadOptions, ffmpeg_available: bool, logger: 
         add_extractor_args(ydl_opts, {"youtube": {"comment_sort": [options.comments_mode], "max_comments": [limit, "all", "all", "0"]}})
 
     # Last, so the owner's options win over the app's choices. APP_MANAGED_YTDLP_KEYS never get here.
-    for key, value in options.extra_ytdlp.params.items():
-        if key == "extractor_args":
-            add_extractor_args(ydl_opts, value)
-        else:
-            ydl_opts[key] = value
+    apply_extra_ytdlp_options(ydl_opts, options.extra_ytdlp)
     return ydl_opts
 
 

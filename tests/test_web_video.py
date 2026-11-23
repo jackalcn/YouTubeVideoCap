@@ -441,3 +441,28 @@ def test_history_and_the_already_downloaded_check_know_the_site(new_site: NewSit
     assert storage.find_downloads([other["video_id"]], other["extractor"]) == {}
     # Not to be taken for a YouTube video with that ID.
     assert storage.find_downloads([seen["video_id"]]) == {}
+
+
+# What the owner's own yt-dlp options say of how a site is asked
+
+
+def test_the_inspection_asks_a_site_as_the_download_does(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    site.refer_only_from(site)
+    url = site.add_clip("referred/clip.mp4")
+    # Without a Referer both are refused, and the owner is told that a site may want one.
+    for error in (inspect(url, tmp_path)["error"], *download(url, tmp_path)["errors"]):
+        assert error.startswith("這個網站拒絕了下載請求（HTTP 403）") and "--referer" in error
+    typed = f"--referer {site.url('watch.html')}"
+    # With the owner's own Referer both get in. The inspection used to leave the owner's options out, and said HTTP 403
+    # whatever was typed, though the download would have gone through.
+    assert inspect(url, tmp_path, ytdlp_extra_args=typed)["error"] == ""
+    outcome = download(url, tmp_path, ytdlp_extra_args=typed)
+    assert outcome["errors"] == [] and duration_of(Path(outcome["items"][0]["path"])) == pytest.approx(2, abs=0.3)
+
+
+def test_the_inspection_saves_nothing_that_the_owners_options_ask_for(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    url = site.add_clip("clip.mp4")
+    assert inspect(url, tmp_path, ytdlp_extra_args="--write-info-json --write-thumbnail --write-description")["error"] == ""
+    assert list(tmp_path.iterdir()) == []
