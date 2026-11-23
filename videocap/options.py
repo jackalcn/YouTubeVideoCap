@@ -433,6 +433,12 @@ def merge_http_headers(*parts: Mapping[str, str]) -> dict[str, str]:
     return merged
 
 
+def owner_referer(extra: ExtraYtDlpOptions) -> str:
+    """The Referer the owner typed into 進階 yt-dlp 參數, as --referer or as a header, or "" when there is none."""
+    headers = extra.params.get("http_headers") or {}
+    return next((str(value).strip() for name, value in headers.items() if str(name).lower() == "referer"), "")
+
+
 def apply_extra_ytdlp_options(ydl_opts: dict[str, Any], extra: ExtraYtDlpOptions, only: Optional[frozenset[str]] = None) -> None:
     """Puts the owner's options over the app's own, so the owner has the last word. With `only`, just those of them."""
     for key, value in extra.params.items():

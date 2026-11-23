@@ -17,7 +17,7 @@ from offline_web import LocalSite, new_site_fixture, pack, web_media_fixture  # 
 from offline_youtube import duration_of
 from videocap import impersonation
 from videocap.downloader import BROWSER_RETRY_FAILED_NOTE, BROWSER_RETRY_WORKED_NOTE, PAGE_STREAM_MESSAGE, PAGE_STREAM_NOTE, run_download
-from videocap.errors import UNREADABLE_LINK, failure_kind
+from videocap.errors import UNREADABLE_LINK, failure_kind, referer_advice
 from videocap.inspector import PAGE_STREAM_DETAIL, PAGE_STREAM_FOUND_BUT_FAILED, inspect_link
 from videocap.options import AccessLimits, DownloadOptions, LoginSource, build_base_options, options_from_spec
 from videocap.page_streams import (
@@ -410,6 +410,21 @@ def test_the_owners_own_referer_has_the_last_word(new_site: NewSite, tmp_path: P
     assert report["error"].startswith(PAGE_STREAM_FOUND_BUT_FAILED)
     # Over the page's, but not in place of the Origin that it also sends.
     assert ("http://elsewhere.example/", page_site.base) in stream_site.referers_for("referred/hls/index.m3u8")
+
+
+def test_a_refusal_names_the_owners_referer_when_it_is_the_address_of_a_stream(new_site: NewSite, tmp_path: Path) -> None:
+    page_site, stream_site = pair(new_site)
+    stream = stream_site.add_playlist("referred/hls/index.m3u8")
+    url = page_site.add_packed_page("watch.html", player_script(stream))
+    # The owner's own Referer wins over the page's, and a stream is not a page that a player is in.
+    extra = f'--add-headers "Referer: {stream}"'
+    report, outcome = inspect(url, tmp_path, ytdlp_extra_args=extra), download(url, tmp_path, ytdlp_extra_args=extra)
+    advice = referer_advice(stream)
+    assert report["error"].startswith(PAGE_STREAM_FOUND_BUT_FAILED) and report["error"].endswith(advice)
+    assert outcome["items"] == [] and outcome["errors"][0].endswith(advice)
+    # Without it, or with a page there, the same site lets the stream through and has nothing to be told.
+    assert inspect(url, tmp_path)["error"] == ""
+    assert inspect(url, tmp_path, ytdlp_extra_args=f'--referer {page_site.url("watch.html")}')["error"] == ""
 
 
 def test_a_visitor_never_has_a_page_read_for_a_stream(new_site: NewSite, tmp_path: Path) -> None:

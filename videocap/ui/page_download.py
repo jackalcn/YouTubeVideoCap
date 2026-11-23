@@ -55,7 +55,7 @@ from videocap.ui.common import (
 )
 from videocap.ui.context import AppContext, collect_settings, current_browser, current_cookie_bytes, current_output_dir
 from videocap.ui.sidebar import render_settings_sidebar
-from videocap.ui.verify import asks_for_a_person, render_site_verification
+from videocap.ui.verify import REPORT_NEXT_STEP, asks_for_a_person, render_site_verification
 from videocap.urls import DOMAIN_LIKE_RE, ParsedLinks, describe_url_counts, extract_video_id, format_timestamp, parse_links
 
 
@@ -602,7 +602,7 @@ def render_link_report(ctx: AppContext, report: LinkReport, index: int) -> None:
         if report.get("error"):
             st.error(f"{escape_markdown(report.get('url', ''))}\n\n{escape_markdown(report.get('error', ''))}")
             if asks_for_a_person(report["error"]):
-                render_site_verification(ctx, report.get("url", ""), key=f"report_{index}")
+                render_site_verification(ctx, report.get("url", ""), key=f"report_{index}", next_step=REPORT_NEXT_STEP)
             return
 
         thumbnail_col, info_col = st.columns([1, 2])

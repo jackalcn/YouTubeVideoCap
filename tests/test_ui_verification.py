@@ -13,6 +13,7 @@ from streamlit.testing.v1 import AppTest
 
 import videocap.impersonation as impersonation
 import videocap.services as services_module
+import videocap.ui.common as common
 import videocap.verification as verification
 from videocap.downloader import empty_outcome
 from videocap.errors import humanize_human_check
@@ -29,6 +30,9 @@ from videocap.ui.verify import (
     NEEDS_IMPERSONATION,
     NOTICE_KEY,
     OPEN_LABEL,
+    REPORT_NEXT_STEP,
+    RETRY_LABEL,
+    SYSTEM_NEXT_STEP,
     asks_for_a_person,
 )
 
@@ -180,6 +184,14 @@ def test_a_window_that_ended_says_how_and_the_button_is_there_to_open_another(mo
     assert message in texts(getattr(app, shown)) and OPEN_LABEL in labels(app)
 
 
+def test_a_passed_check_tells_a_link_report_what_to_do_next(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verification, "_current", StandInWindow(state=verification.PASSED, message="已通過驗證：site.example。"))
+    app = download_page(report())
+    assert "已通過驗證：site.example。" + REPORT_NEXT_STEP in texts(app.success)
+    # A report has no job to try again: the page's own buttons do it.
+    assert RETRY_LABEL not in labels(app) and OPEN_LABEL in labels(app)
+
+
 def test_the_result_of_another_sites_window_is_not_said_here(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verification, "_current", StandInWindow("https://other.example/", state=verification.PASSED, message="已通過驗證：other.example。"))
     app = download_page(report())
@@ -267,6 +279,26 @@ def test_a_job_that_failed_on_a_check_has_the_button_for_its_own_link(monkeypatc
     assert verification.current_window() is opened and FINISH_LABEL in labels(app)
 
 
+def test_a_job_whose_check_was_passed_can_be_tried_again_from_its_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verification, "_current", StandInWindow(state=verification.PASSED, message="已通過驗證：site.example。"))
+    job = failed_job(WANTS_A_PERSON)
+    retried: list[str] = []
+    monkeypatch.setattr(common, "retry_job", lambda job, ctx: retried.append(job.id))
+    app = run_results()
+    assert "已通過驗證：site.example。" in texts(app.success) and RETRY_LABEL in labels(app)
+    button(app, RETRY_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert retried == [job.id]
+
+
+def test_a_job_whose_check_was_not_passed_has_no_button_to_try_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    failed_job(WANTS_A_PERSON)
+    assert RETRY_LABEL not in labels(run_results())
+    # Nor does one whose window was for another site.
+    monkeypatch.setattr(verification, "_current", StandInWindow("https://other.example/", state=verification.PASSED, message="已通過驗證：other.example。"))
+    assert RETRY_LABEL not in labels(run_results())
+
+
 def test_a_job_that_failed_for_another_reason_has_no_button() -> None:
     failed_job("這個網站拒絕了下載請求（HTTP 403）。")
     assert OPEN_LABEL not in labels(run_results())
@@ -289,6 +321,33 @@ def test_the_system_page_lists_the_sites_whose_check_was_passed_and_forgets_one(
     button(app, CLEAR_LABEL).click().run()
     assert not app.exception, app.exception
     assert len(verification.verified_sites.all()) == 1
+
+
+def test_a_site_passed_from_the_system_page_is_said_to_be_used_from_now_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verification, "_current", StandInWindow("https://typed.example/", state=verification.PASSED, message="已通過驗證：typed.example。"))
+    app = run_page("system")
+    app.text_input(key="verification_system_url").set_value("https://typed.example/").run()
+    assert "已通過驗證：typed.example。" + SYSTEM_NEXT_STEP in texts(app.success)
+
+
+# The sidebar, where the owner's Referer is typed
+
+
+def sidebar_warnings(extra: str) -> str:
+    app = run_page("download", settings_loaded=True, **{f"{SETTING_KEY_PREFIX}ytdlp_extra_args": extra})
+    return texts(app.sidebar.warning)
+
+
+def test_a_referer_that_is_the_address_of_a_stream_is_said_to_be_wrong() -> None:
+    shown = sidebar_warnings('--add-headers "Referer: https://cdn.example/abc/playlist.m3u8"')
+    # The site is named, written as markdown (its dots escaped).
+    assert "串流或影片檔的網址" in shown and "cdn" in shown
+    assert "串流或影片檔的網址" in sidebar_warnings("--referer https://cdn.example/clip.mp4")
+
+
+def test_a_referer_that_is_a_page_is_left_alone() -> None:
+    assert "串流或影片檔的網址" not in sidebar_warnings("--referer https://site.example/watch/1")
+    assert "串流或影片檔的網址" not in sidebar_warnings("")
 
 
 def test_the_system_page_says_when_no_site_has_been_passed() -> None:

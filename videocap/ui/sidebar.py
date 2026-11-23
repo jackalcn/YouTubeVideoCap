@@ -32,7 +32,7 @@ from videocap.config import (
     VIDEO_CODEC_OPTIONS,
     VIDEO_QUALITY_OPTIONS,
 )
-from videocap.errors import JS_RUNTIME_HINT
+from videocap.errors import JS_RUNTIME_HINT, REFERER_IS_A_STREAM
 from videocap.inspector import check_youtube_login
 from videocap.library import folder_creation_problem
 from videocap.options import (
@@ -42,11 +42,13 @@ from videocap.options import (
     LoginSource,
     embeds_thumbnail,
     network_options,
+    owner_referer,
     parse_extra_ytdlp_args,
     parse_subtitle_languages,
 )
 from videocap.services import temporary_cookie_file
 from videocap.settings import BUILTIN_PRESETS, SETTING_KEY_PREFIX, SETTING_RANGES, DownloadSettings, settings_from_dict
+from videocap.sites import host_of, is_media_link
 from videocap.storage import PRESETS_KEY
 from videocap.ui.common import escape_markdown, public_request_slot
 from videocap.ui.context import (
@@ -584,6 +586,9 @@ def render_extra_ytdlp_args() -> None:
         return
     if extra.ignored:
         st.caption(f"這些選項由 App 管理，已忽略：{'、'.join(extra.ignored)}")
+    referer = owner_referer(extra)
+    if referer and is_media_link(referer):
+        st.warning(REFERER_IS_A_STREAM.format(site=escape_markdown(host_of(referer) or referer)))
 
 
 def render_login_settings(ctx: AppContext) -> None:

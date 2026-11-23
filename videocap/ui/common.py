@@ -963,7 +963,9 @@ def render_job_result(job: Job, ctx: AppContext) -> None:
         render_download_outcome(cast(DownloadOutcome, job.outcome), f"job_{job.id}", ctx, job.state)
         payload = job.payload
         if isinstance(payload, DownloadPayload) and any(asks_for_a_person(message) for message in outcome_errors(job)):
-            render_site_verification(ctx, payload.spec.url, key=f"job_{job.id}")
+            # The same try again as the card's, for a job that stopped; one that finished has its own for the videos left.
+            retry = partial(retry_job, job, ctx) if job.state in (FAILED, CANCELED) else None
+            render_site_verification(ctx, payload.spec.url, key=f"job_{job.id}", retry=retry)
     elif job.error:
         st.error(escape_markdown(job.error))
 

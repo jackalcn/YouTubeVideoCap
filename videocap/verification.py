@@ -528,7 +528,7 @@ class VerificationWindow:
                     self.sites.add(session)
                     with self._lock:
                         self._session = session
-                    self._set(PASSED, f"已通過驗證：{self.host}。現在可以回到下載頁，再試一次。")
+                    self._set(PASSED, f"已通過驗證：{self.host}。")
                 else:
                     self._set(FAILED, f"沒有收到 {self.host} 的 cookies，驗證可能還沒通過。請再開一次視窗。")
                 return

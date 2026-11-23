@@ -4,7 +4,7 @@ import functools
 import re
 from typing import Iterable, NamedTuple, Optional
 
-from videocap.sites import SITE_NAMES, extractor_for, host_of, is_youtube_url, site_label
+from videocap.sites import SITE_NAMES, extractor_for, host_of, is_media_link, is_youtube_url, site_label
 
 
 JS_RUNTIME_HINT = (
@@ -27,6 +27,8 @@ BOT_CHECK = "bot_check"
 RATE_LIMIT = "rate_limit"
 # A site that wants a person to pass its check, which the app can say only after it has tried as a browser.
 HUMAN_CHECK = "human_check"
+# What yt-dlp says when a site refuses a request, in any of the ways below that are not a check for a person.
+HTTP_403 = "http_403"
 # yt-dlp's word that it saw no video in a page, or could not read the link at all. The player of a page may still keep
 # its stream's address in a script yt-dlp does not read: see videocap.page_streams.
 UNREADABLE_LINK = "unreadable_link"
@@ -185,7 +187,7 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
         "{site}暫時限制了請求頻率，請稍後再試。",
     ),
     Hint(
-        "http_403",
+        HTTP_403,
         ("http error 403",),
         "YouTube 拒絕了下載請求。常見原因是這台機器的網路位址被限制（雲端主機、VPN 常見），或 yt-dlp 版本太舊。"
         "可以在「會員登入」登入帳號後再試；在自己的電腦上執行時，也可以到「系統」頁按「檢查新版本」更新 yt-dlp。",
@@ -424,6 +426,29 @@ def humanize_human_check(message: str, url: str = "") -> str:
     cleaned = message.removeprefix("ERROR: ").strip()
     hint = next(hint for hint in YTDLP_ERROR_HINTS if hint.kind == HUMAN_CHECK)
     return f"{hint.text_for(site_in_message(cleaned, url) or UNNAMED_SITE)}（原始訊息：{cut_at_a_sentence(cleaned)}）"
+
+
+# What a person is told whose Referer is the address of a stream or a file: no page's player sends that, and a site that
+# checks where a request came from refuses it. The Referer is the owner's own, saved with the settings and sent with every
+# request of every link, so it may be a leftover from another link.
+REFERER_IS_A_STREAM = (
+    "「進階 yt-dlp 參數」的來源網頁（Referer）填的是串流或影片檔的網址（{site}）。"
+    "來源網頁要填「影片所在網頁」的網址；網站看到串流自己的網址，多半會拒絕。"
+    "這個值會送給每個連結的每個請求，而 App 找得到網頁裡的串流時，會自己帶正確的來源網頁，所以這一行可以拿掉。"
+)
+
+
+def referer_advice(referer: str) -> str:
+    return REFERER_IS_A_STREAM.format(site=host_of(referer) or referer)
+
+
+def add_referer_advice(message: str, referer: str) -> str:
+    """A site's refusal (HTTP 403, or its check for a person) with a word on the owner's Referer when that is the address
+    of a stream or a file, which may be why the site refused. Any other failure, and any other Referer, leaves it as it is."""
+    if not referer or not is_media_link(referer) or failure_kind(message) not in (HTTP_403, HUMAN_CHECK):
+        return message
+    advice = referer_advice(referer)
+    return message if advice in message else f"{message}\n\n{advice}"
 
 
 def classify_failure(message: str) -> Optional[tuple[Hint, str]]:

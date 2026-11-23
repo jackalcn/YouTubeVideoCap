@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import streamlit as st
 
@@ -22,6 +22,7 @@ OPEN_LABEL = "開啟瀏覽器視窗，自己通過驗證"
 FINISH_LABEL = "我已通過驗證"
 CANCEL_LABEL = "取消"
 CLEAR_LABEL = "清除"
+RETRY_LABEL = "用通過的驗證重試"
 AWAY_FROM_THE_MACHINE = "要在執行 App 的這台電腦前操作，才能開啟瀏覽器視窗。"
 INTRODUCTION = (
     "有些網站要求真人驗證（例如勾選「我不是機器人」）。App 不會代為通過驗證：按下按鈕會開一個瀏覽器視窗，"
@@ -29,6 +30,8 @@ INTRODUCTION = (
     "視窗用全新的設定檔，不會讀你平常瀏覽器的任何資料；留下的資料只存在記憶體，關閉 App 就清掉。"
     "網站會在自己設定的時間後讓通過的驗證失效（常見是 30 分鐘左右），失效時再通過一次即可。"
 )
+REPORT_NEXT_STEP = "再按一次「解析連結（不下載）」或「開始下載」。"
+SYSTEM_NEXT_STEP = "之後貼上這個網站的連結，就會沿用。"
 NEEDS_IMPERSONATION = (
     "通過驗證後，要靠上面的「模擬瀏覽器」才能沿用：網站認得的不只是 cookies，還有連線的方式。"
     "它現在還不能用，請先安裝或啟用（已經安裝的話，重新啟動 App）。"
@@ -79,9 +82,10 @@ def _window_fragment(key: str) -> None:
         st.button(CANCEL_LABEL, key=f"verify_cancel_{key}", on_click=window.cancel, width="stretch")
 
 
-def render_site_verification(ctx: AppContext, url: str, key: str) -> None:
+def render_site_verification(ctx: AppContext, url: str, key: str, next_step: str = "", retry: Optional[Callable[[], None]] = None) -> None:
     """Under a failure that says a site wants a person: opens a browser window for the owner to pass the check in, and
-    shows how it goes. `key` tells this place from the others on the page."""
+    shows how it goes. `key` tells this place from the others on the page. Once the check is passed, `next_step` says what
+    to do now, and `retry`, when the place can do it, is what a button of its own does."""
     if not url or not ctx.trusted:
         return
     if not can_pass_checks(ctx):
@@ -104,7 +108,12 @@ def render_site_verification(ctx: AppContext, url: str, key: str) -> None:
         st.caption(reason)
         return
     if status is not None and status.host == host:
-        (st.success if status.state == verification.PASSED else st.warning)(status.message)
+        if status.state == verification.PASSED:
+            st.success(f"{status.message}{next_step}")
+            if retry is not None:
+                st.button(RETRY_LABEL, key=f"verify_retry_{key}", on_click=retry, icon=":material/replay:")
+        else:
+            st.warning(status.message)
     # The check is passed from the address the site sees, so the window goes the way the app's own requests do.
     proxy = network_options(collect_settings(), ctx.limits).proxy
     st.button(OPEN_LABEL, key=f"verify_open_{key}", on_click=open_window, args=(url, proxy), icon=":material/open_in_new:")
@@ -144,4 +153,4 @@ def render_site_checks(ctx: AppContext) -> None:
     typed: Optional[str] = st.text_input("網站網址", key=SYSTEM_URL_KEY, placeholder="https://example.com/", help="要先通過驗證的網站或影片網頁。")
     address = (typed or "").strip()
     if address.startswith(("http://", "https://")) and host_of(address):
-        render_site_verification(ctx, address, key="system")
+        render_site_verification(ctx, address, key="system", next_step=SYSTEM_NEXT_STEP)

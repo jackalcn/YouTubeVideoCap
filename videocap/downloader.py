@@ -48,6 +48,7 @@ from videocap.config import (
 )
 from videocap.errors import (
     JS_RUNTIME_HINT,
+    add_referer_advice,
     explain_missing_js_runtime,
     extract_failed_video_id,
     humanize_human_check,
@@ -64,6 +65,7 @@ from videocap.options import (
     build_ydl_options,
     entry_filter_reason,
     expected_final_extension,
+    owner_referer,
     waits_for_live,
     writes_thumbnail,
 )
@@ -1825,6 +1827,8 @@ def run_download(
 
     if any("account cookies are no longer valid" in message for message in outcome["warnings"]):
         outcome["errors"].insert(0, EXPIRED_LOGIN_MESSAGE)
+    referer = owner_referer(options.extra_ytdlp)
+    outcome["errors"] = [add_referer_advice(message, referer) for message in outcome["errors"]]
 
     # The same video can arrive through a playlist's two entries, and both then point at one file.
     with_media = {item["path"]: item for item in outcome["items"] if item["path"]}

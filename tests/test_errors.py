@@ -3,10 +3,14 @@ from __future__ import annotations
 import pytest
 
 from videocap.errors import (
+    HUMAN_CHECK,
     IMPERSONATION,
+    REFERER_IS_A_STREAM,
+    add_referer_advice,
     cut_at_a_sentence,
     failure_hint,
     failure_kind,
+    humanize_human_check,
     humanize_ytdlp_error,
     is_network_loss,
     is_rate_limited,
@@ -448,6 +452,31 @@ def test_a_refusal_from_another_site_says_it_may_want_the_page_it_came_from() ->
     # YouTube's refusal has nothing to do with the page it came from.
     youtube = humanize_ytdlp_error("ERROR: [download] Got error: HTTP Error 403: Forbidden", "https://youtu.be/jNQXAC9IVRw")
     assert "Referer" not in youtube and "referer" not in youtube
+
+
+STREAM_AS_REFERER = "https://cdn.example/abc/playlist.m3u8"
+
+
+def test_a_refusal_says_so_when_the_owners_referer_is_the_address_of_a_stream() -> None:
+    advice = REFERER_IS_A_STREAM.format(site="cdn.example")
+    plain = humanize_ytdlp_error("ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden", "https://site.example/watch/1")
+    check = humanize_human_check("ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden", "https://site.example/watch/1")
+    for refusal in (plain, check):
+        told = add_referer_advice(refusal, STREAM_AS_REFERER)
+        # What was said stays first, and is still the same kind of failure.
+        assert told.startswith(refusal) and told.endswith(advice) and failure_kind(told) == failure_kind(refusal)
+        # Said once, however many times it is asked.
+        assert add_referer_advice(told, STREAM_AS_REFERER) == told
+    assert failure_kind(add_referer_advice(check, STREAM_AS_REFERER)) == HUMAN_CHECK
+
+
+def test_a_refusal_is_left_as_it_is_for_any_other_referer_or_failure() -> None:
+    refusal = humanize_ytdlp_error("ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden", "https://site.example/watch/1")
+    for referer in ("", "https://site.example/watch/1", "https://other.example/", "not a link"):
+        assert add_referer_advice(refusal, referer) == refusal
+    # A failure that is no refusal has nothing to do with it.
+    missing = humanize_ytdlp_error("ERROR: [generic] 1: Unable to download webpage: HTTP Error 404: Not Found", "https://site.example/watch/1")
+    assert add_referer_advice(missing, STREAM_AS_REFERER) == missing
 
 
 def test_yt_dlps_word_for_no_video_is_a_kind_of_its_own() -> None:

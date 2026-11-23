@@ -27,7 +27,7 @@ from videocap.downloader import (
     estimate_size,
     refusal_in,
 )
-from videocap.errors import humanize_human_check, humanize_ytdlp_error
+from videocap.errors import add_referer_advice, humanize_human_check, humanize_ytdlp_error
 from videocap.options import (
     DownloadOptions,
     LoginSource,
@@ -37,6 +37,7 @@ from videocap.options import (
     build_format_options,
     build_read_options,
     expected_final_extension,
+    owner_referer,
 )
 from videocap.page_streams import find_streams, holds_no_video
 from videocap.sidecars import comment_rows, write_csv
@@ -405,6 +406,13 @@ def preview_extension(info: Mapping[str, Any], options: DownloadOptions, ffmpeg_
 
 
 def inspect_link(url: str, options: DownloadOptions) -> LinkReport:
+    report = read_link(url, options)
+    if report.get("error"):
+        report["error"] = add_referer_advice(report["error"], owner_referer(options.extra_ytdlp))
+    return report
+
+
+def read_link(url: str, options: DownloadOptions) -> LinkReport:
     refusals = impersonation.Refusals()
     report, _ = inspect_once(url, options, refusals)
     if report.get("error") and refusals.forbidden and not options.impersonate and impersonation.offered_to(url, options.other_sites):

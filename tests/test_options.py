@@ -29,6 +29,7 @@ from videocap.options import (
     merge_http_headers,
     network_options,
     options_from_spec,
+    owner_referer,
 )
 from videocap.page_streams import PageStream
 from videocap.settings import BUILTIN_PRESETS, DownloadSettings, JobSpec, job_spec_from_dict, settings_from_dict
@@ -998,6 +999,15 @@ def test_a_reading_of_a_link_takes_only_the_owners_options_about_how_requests_ar
 def test_a_visitor_has_no_options_of_the_owners_to_take() -> None:
     options = spec_options(AccessLimits.for_public_host(), ytdlp_extra_args="--referer https://site.example/")
     assert "http_headers" not in build_read_options(options, YtDlpLogCollector())
+
+
+def test_the_referer_the_owner_typed_is_found_however_it_was_given() -> None:
+    assert owner_referer(spec_options(ytdlp_extra_args="--referer https://site.example/watch/1").extra_ytdlp) == "https://site.example/watch/1"
+    assert owner_referer(spec_options(ytdlp_extra_args='--add-headers "referer:   https://site.example/ "').extra_ytdlp) == "https://site.example/"
+    assert owner_referer(spec_options(ytdlp_extra_args='--add-headers "X-Extra: 1"').extra_ytdlp) == ""
+    assert owner_referer(spec_options().extra_ytdlp) == ""
+    # A visitor has none of the owner's options to take.
+    assert owner_referer(spec_options(AccessLimits.for_public_host(), ytdlp_extra_args="--referer https://site.example/").extra_ytdlp) == ""
 
 
 def test_the_owners_headers_are_added_to_a_streams_pages_not_put_in_their_place() -> None:
