@@ -7,10 +7,10 @@ from typing import Optional
 
 
 APP_NAME = "YouTube影片下載平台"
-APP_VERSION = "v2026.11.18.1"
-APP_UPDATED_AT = "2026-11-18"
+APP_VERSION = "v2026.11.24.1"
+APP_UPDATED_AT = "2026-11-24"
 DEPLOY_VERIFY_MIN_COMMIT = "7f71b98"
-DEPLOY_MARKER = "build-2026-11-18-01-youtube"
+DEPLOY_MARKER = "build-2026-11-24-01-youtube"
 LOCAL_RUN_GUIDE_URL = "https://github.com/jackalcn/YouTubeVideoCap#在本機執行"
 
 YOUTUBE_HOSTS = frozenset(
