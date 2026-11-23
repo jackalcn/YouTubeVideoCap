@@ -37,6 +37,10 @@ PERSON_ONLY_PREFIX = "/captcha/"
 # Under this the check for bots turns away the first request for each address and lets the next one through, as one
 # that passes only some of what it is sent does.
 FLAKY_PREFIX = "/flaky/"
+# Anything in a folder of this name opens only to a request that carries the cookie a passed check leaves and the User-Agent
+# of the browser that passed it, as a site's check does; any other gets the check itself. See require_clearance.
+VERIFIED_FOLDER = "/verified/"
+CLEARANCE_COOKIE = "cf_clearance"
 # Anything in a folder of this name opens only to a request that names a page of one chosen site as its Referer, as
 # the stream of a page whose player checks that does, and anything else gets a bare HTTP 403. See refer_only_from.
 REFERRED_FOLDER = "/referred/"
@@ -76,10 +80,12 @@ class SiteHandler(http.server.SimpleHTTPRequestHandler):
         as_browser = self.headers.get(BROWSER_HEADER) is not None
         if as_browser:
             self.site.browser_requests.append(self.path)
+        self.site.seen.append((self.path, {name.lower(): value for name, value in self.headers.items()}))
         unreferred = REFERRED_FOLDER in self.path and not self.site.accepts_referer(self.headers.get("Referer", ""))
+        unverified = VERIFIED_FOLDER in self.path and not self.site.accepts_clearance(self.headers.get("Cookie", ""), self.headers.get("User-Agent", ""))
         if self.path.startswith(REFUSED_PREFIX) or (self.path.startswith(BROWSERS_ONLY_PREFIX) and not as_browser) or unreferred:
             self.send_error(403, "Forbidden")
-        elif self.path.startswith(PERSON_ONLY_PREFIX) or (self.path.startswith(CHECKED_PREFIX) and not as_browser) or (
+        elif self.path.startswith(PERSON_ONLY_PREFIX) or unverified or (self.path.startswith(CHECKED_PREFIX) and not as_browser) or (
             self.path.startswith(FLAKY_PREFIX) and self.site.turns_away_first(self.path)
         ):
             self.send_check()
@@ -115,6 +121,10 @@ class LocalSite:
         # Each request's path with the Referer and the Origin it came with, "" for one it came without.
         self.referers: list[tuple[str, str, str]] = []
         self.referer_origin = ""
+        # Every request's path with all its headers, names in lower case.
+        self.seen: list[tuple[str, dict[str, str]]] = []
+        self.clearance_value = ""
+        self.clearance_agent = ""
         # The addresses under FLAKY_PREFIX that have been asked for once.
         self.asked_once: set[str] = set()
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(SiteHandler, site=self))
@@ -172,6 +182,19 @@ class LocalSite:
     def refer_only_from(self, page_site: LocalSite) -> None:
         """Makes what is in a folder named `referred` open only to requests that name a page of that site as their Referer."""
         self.referer_origin = page_site.base
+
+    def require_clearance(self, value: str = "passed", agent: str = "") -> None:
+        """Makes what is in a folder named `verified` open only to a request with this clearance cookie, and with this
+        User-Agent when one is given."""
+        self.clearance_value, self.clearance_agent = value, agent
+
+    def accepts_clearance(self, cookie_header: str, agent: str) -> bool:
+        cookies = [part.strip() for part in cookie_header.split(";")]
+        return bool(self.clearance_value) and f"{CLEARANCE_COOKIE}={self.clearance_value}" in cookies and (not self.clearance_agent or agent == self.clearance_agent)
+
+    def headers_for(self, path: str) -> list[dict[str, str]]:
+        """All the headers of each request that named this path."""
+        return [headers for requested, headers in self.seen if requested.split("?")[0] == f"/{path.lstrip('/')}"]
 
     def turns_away_first(self, path: str) -> bool:
         """Whether this is the first request for the address, which the flaky check turns away."""

@@ -43,6 +43,18 @@ def no_impersonation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def no_passed_checks(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A site whose check was passed in a browser stays passed until the app ends, and the window of the last check is
+    remembered: no test may leave either for the next."""
+    import videocap.verification as verification
+
+    verification.verified_sites.clear()
+    monkeypatch.setattr(verification, "_current", None)
+    yield
+    verification.verified_sites.clear()
+
+
+@pytest.fixture(autouse=True)
 def no_real_recycle_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests delete only their own temp files, which the library already removes for good; this keeps the real
     recycle bin out of it even when pytest's temp folder is moved somewhere else."""

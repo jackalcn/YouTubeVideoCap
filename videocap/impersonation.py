@@ -31,6 +31,7 @@ from yt_dlp.YoutubeDL import YoutubeDL as PlainYoutubeDL
 
 from videocap import impersonation_switch
 from videocap.sites import host_of, is_youtube_host, is_youtube_url
+from videocap.verification import VerifiedSession, verified_sites
 
 try:
     from yt_dlp.networking.common import _REQUEST_HANDLERS, _RH_PREFERENCES
@@ -250,17 +251,52 @@ def offered_to(url: str, other_sites: bool) -> bool:
     return bool(other_sites and _kept and host_of(url) and not is_youtube_url(url))
 
 
+def browser_like(browser_major: Optional[int]) -> Any:
+    """The browser yt-dlp passes for when asked for one like a Chrome-based browser of this version: the newest Chrome it
+    can pass for that is not newer than that, or any browser when it knows none."""
+    handler = next(iter(_taken.values()), None)
+    if handler is not None and browser_major:
+        known = [
+            target
+            for target in handler.supported_targets
+            if target.client == "chrome" and str(target.version).isdigit() and int(target.version) <= browser_major and target.os not in ("android", "ios")
+        ]
+        if known:
+            return max(known, key=lambda target: (int(target.version), target.os == "windows"))
+    return any_browser()
+
+
+def with_verified_session(opts: dict[str, Any], session: VerifiedSession) -> dict[str, Any]:
+    """The options of a run for a site whose check the owner passed in a browser: asked as that browser asks. The
+    owner's own headers stay over it, and a run that passes for a browser passes for one like that browser."""
+    merged = dict(opts)
+    headers = {name.title(): value for name, value in session.headers().items()}
+    headers.update({name.title(): str(value).strip() for name, value in (opts.get("http_headers") or {}).items()})
+    merged["http_headers"] = headers
+    if merged.get("impersonate") is not None:
+        merged["impersonate"] = browser_like(session.browser_major)
+    return merged
+
+
 def youtube_dl(base: Any, opts: dict[str, Any], url: str, other_sites: bool, refusals: Optional[Refusals] = None) -> Any:
     """The YoutubeDL for a link. `base` is yt_dlp.YoutubeDL as the caller's module knows it. A link that may be
     fetched as a browser would gets one that can do it, and that notes in `refusals` what the site refused it with.
-    Every other one is yt-dlp's own, and is never told to impersonate."""
+    Every other one is yt-dlp's own, and is never told to impersonate. A link to a site whose check for a person the
+    owner passed in a browser (see videocap.verification) gets that browser's cookies and way of introducing itself."""
+    verified = verified_sites.session_for(url) if other_sites and host_of(url) and not is_youtube_url(url) else None
+    if verified:
+        opts = with_verified_session(opts, verified)
     if offered_to(url, other_sites):
-        session = session_class(base)(opts)
-        session.refusals = refusals
-        return session
-    if "impersonate" in opts:
-        opts = {key: value for key, value in opts.items() if key != "impersonate"}
-    return base(opts)
+        ydl = session_class(base)(opts)
+        ydl.refusals = refusals
+    else:
+        if "impersonate" in opts:
+            opts = {key: value for key, value in opts.items() if key != "impersonate"}
+        ydl = base(opts)
+    if verified:
+        for cookie in verified.live_cookies():
+            ydl.cookiejar.set_cookie(cookie.as_cookie())
+    return ydl
 
 
 def load() -> None:

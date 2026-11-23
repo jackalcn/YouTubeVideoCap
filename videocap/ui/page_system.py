@@ -54,6 +54,7 @@ from videocap.tooling import (
 from videocap.ui.common import escape_markdown, format_local_time, page_header
 from videocap.ui.context import AppContext, apply_settings_to_state, collect_settings, current_output_dir
 from videocap.ui.sidebar import save_preset
+from videocap.ui.verify import render_site_checks
 
 
 # An exported settings file is a few kilobytes.
@@ -720,6 +721,7 @@ def render_system_page(ctx: AppContext) -> None:
         render_speech_recognition(ctx)
         # For other sites, which a visitor does not get.
         render_impersonation(ctx)
+        render_site_checks(ctx)
     render_connection_test(ctx)
     if ctx.trusted:
         render_storage_status(ctx)

@@ -58,6 +58,7 @@ from videocap.ui.context import (
     current_output_dir,
     start_as_new_visitor,
 )
+from videocap.ui.verify import asks_for_a_person, render_site_verification
 
 
 # Streamlit serves a download from memory, so a file is read whole when someone asks for it.
@@ -960,6 +961,9 @@ def render_job_result(job: Job, ctx: AppContext) -> None:
         render_tool_result(job, ctx)
     elif job.outcome:
         render_download_outcome(cast(DownloadOutcome, job.outcome), f"job_{job.id}", ctx, job.state)
+        payload = job.payload
+        if isinstance(payload, DownloadPayload) and any(asks_for_a_person(message) for message in outcome_errors(job)):
+            render_site_verification(ctx, payload.spec.url, key=f"job_{job.id}")
     elif job.error:
         st.error(escape_markdown(job.error))
 
