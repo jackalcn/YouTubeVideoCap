@@ -342,8 +342,10 @@ def test_a_window_the_owner_cancels_closes_the_browser(tmp_path: Path, monkeypat
     assert ended(window).state == verification.CANCELED and profiles_left() == [] and verification.verified_sites.all() == []
 
 
-def test_a_window_the_owner_closes_ends_as_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_browser(tmp_path, monkeypatch, exit_after=0.6)
+@pytest.mark.parametrize("linger", [0, 1.0], ids=["at once", "a moment after its connection"])
+def test_a_window_the_owner_closes_ends_as_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linger: float) -> None:
+    # A real browser's process ends a moment after its connection drops, and on Windows the stand-in's launcher too.
+    fake_browser(tmp_path, monkeypatch, exit_after=0.6, linger=linger)
     window = verification.start_window(PAGE)
     final = ended(window)
     assert final.state == verification.CLOSED and "關閉" in final.message and profiles_left() == []

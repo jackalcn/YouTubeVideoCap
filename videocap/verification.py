@@ -43,6 +43,9 @@ START_SECONDS = 20.0
 POLL_SECONDS = 1.0
 # Once the site's cookie for a passed check shows, the page it leads to is let load, which may set more cookies.
 SETTLE_SECONDS = 3.0
+# How long a browser whose connection dropped is given to end, before the window takes it for one that is still
+# running. A browser's connection goes as its window closes, and its process a moment later, once it has shut down.
+END_SECONDS = 5.0
 # What Cloudflare's check leaves in the browser that passed it. Other sites' checks leave other cookies, which the
 # owner tells the window about by saying it is passed.
 CLEARANCE_COOKIE = "cf_clearance"
@@ -346,6 +349,15 @@ def launch(browser: Browser, address: str, profile: Path, proxy: str = "") -> su
     return start_tied_process(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def ended_soon(process: subprocess.Popen[Any], timeout: float = END_SECONDS) -> bool:
+    """Whether the process has ended, or ends within this time."""
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def read_endpoint(profile: Path, process: subprocess.Popen[Any], timeout: float = START_SECONDS) -> str:
     """The address of the browser's debugging connection, which it writes in its profile once it listens."""
     deadline = time.monotonic() + timeout
@@ -491,8 +503,9 @@ class VerificationWindow:
             self._set(WAITING, f"請在剛開啟的{self.browser.name}視窗裡通過驗證（例如勾選「我不是機器人」）。通過後這裡會自動偵測，視窗也會自動關閉。")
             self._watch(process, devtools)
         except Exception as error:
-            # Ended while the owner was at it, the window was closed; ended before, the browser did not start.
-            if self._state == WAITING and process is not None and process.poll() is not None:
+            # Ended while the owner was at it, the window was closed; ended before, the browser did not start. The
+            # connection that failed may have dropped just before the browser's process ended.
+            if self._state == WAITING and process is not None and ended_soon(process):
                 self._set(CLOSED, "瀏覽器視窗被關閉了，沒有收到驗證。")
             else:
                 self._set(FAILED, f"瀏覽器視窗沒有順利開啟：{error}")
