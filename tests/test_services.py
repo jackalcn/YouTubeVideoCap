@@ -330,6 +330,35 @@ def test_temporary_cookie_file_is_removed_even_after_an_error() -> None:
         assert path is None
 
 
+@pytest.mark.parametrize("ending", ["an error", "a failure", "a cancel"])
+def test_an_uploaded_login_is_removed_however_its_job_ends(services: AppServices, tmp_path: Path, fake_run: FakeRun, ending: str) -> None:
+    # yt-dlp saves the cookies it was given along the way into the copy, those of a check passed in a browser window too.
+    seen: list[Path] = []
+
+    def run(url: str, options: Any, should_stop: Any) -> DownloadOutcome:
+        seen.append(options.login.cookie_file)
+        assert options.login.cookie_file.read_bytes() == b"cookies"
+        if ending == "an error":
+            raise RuntimeError("yt-dlp broke")
+        outcome = empty_outcome()
+        if ending == "a cancel":
+            while not should_stop():
+                time.sleep(0.005)
+            outcome["stopped"] = True
+        else:
+            outcome["errors"] = ["ERROR: [youtube] abc123def45: Video unavailable"]
+        return outcome
+
+    fake_run.result = run
+    job = services.submit_download(make_spec(tmp_path, needs_cookie_file=True), LOCAL_OWNER, AccessLimits(), cookie_bytes=b"cookies")
+    if ending == "a cancel":
+        wait_until(lambda: bool(seen))
+        services.manager.cancel(job.id)
+    wait_until(lambda: job.state in (FAILED, CANCELED))
+    assert job.state == (CANCELED if ending == "a cancel" else FAILED)
+    assert seen and not seen[0].exists() and not seen[0].parent.exists()
+
+
 def test_retry_of_a_whole_job_resumes_in_place(services: AppServices, tmp_path: Path, fake_run: FakeRun) -> None:
     def fail(url: str, options: Any, should_stop: Any) -> DownloadOutcome:
         outcome = empty_outcome()
