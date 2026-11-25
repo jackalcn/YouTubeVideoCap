@@ -24,7 +24,7 @@ import importlib
 import importlib.metadata
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from yt_dlp.YoutubeDL import YoutubeDL as PlainYoutubeDL
@@ -87,6 +87,15 @@ class Refusals:
     forbidden: int = 0
     # One of them with Cloudflare's challenge header: the site wants a person to pass its check.
     challenged: bool = False
+    # The addresses that were answered so, which tell a refused page from a refused stream.
+    addresses: list[str] = field(default_factory=list)
+
+    def note(self, error: Any) -> None:
+        if error.status != HTTP_FORBIDDEN:
+            return
+        self.forbidden += 1
+        self.challenged = self.challenged or is_challenge(error)
+        self.addresses.append(str(error.response.url))
 
 
 class Silent:
@@ -217,12 +226,28 @@ def leaving_youtube_alone(handler: Any) -> Any:
 
 
 @functools.cache
-def session_class(base: Any) -> Any:
-    class OtherSiteYoutubeDL(base):  # type: ignore[misc, valid-type]
-        """A YoutubeDL for the owner's link to another site: it can pass for a browser, and it keeps what the site
-        refused it with."""
+def noting_class(base: Any) -> Any:
+    class NotingYoutubeDL(base):  # type: ignore[misc, valid-type]
+        """A YoutubeDL that keeps what a site refused it with, and is otherwise the one it is made from."""
 
         refusals: Optional[Refusals] = None
+
+        def urlopen(self, req: Any) -> Any:
+            try:
+                return super().urlopen(req)
+            except HTTPError as error:
+                if self.refusals is not None:
+                    self.refusals.note(error)
+                raise
+
+    return NotingYoutubeDL
+
+
+@functools.cache
+def session_class(base: Any) -> Any:
+    class OtherSiteYoutubeDL(noting_class(base)):  # type: ignore[misc]
+        """A YoutubeDL for the owner's link to another site: it can pass for a browser, and it keeps what the site
+        refused it with."""
 
         @functools.cached_property
         def _request_director(self) -> Any:
@@ -232,15 +257,6 @@ def session_class(base: Any) -> Any:
                 if isinstance(handler, ImpersonateRequestHandler):
                     handler.director = director  # type: ignore[attr-defined]
             return director
-
-        def urlopen(self, req: Any) -> Any:
-            try:
-                return super().urlopen(req)
-            except HTTPError as error:
-                if self.refusals is not None and error.status == HTTP_FORBIDDEN:
-                    self.refusals.forbidden += 1
-                    self.refusals.challenged = self.refusals.challenged or is_challenge(error)
-                raise
 
     return OtherSiteYoutubeDL
 
@@ -280,10 +296,12 @@ def with_verified_session(opts: dict[str, Any], session: VerifiedSession) -> dic
 
 def youtube_dl(base: Any, opts: dict[str, Any], url: str, other_sites: bool, refusals: Optional[Refusals] = None) -> Any:
     """The YoutubeDL for a link. `base` is yt_dlp.YoutubeDL as the caller's module knows it. A link that may be
-    fetched as a browser would gets one that can do it, and that notes in `refusals` what the site refused it with.
-    Every other one is yt-dlp's own, and is never told to impersonate. A link to a site whose check for a person the
-    owner passed in a browser (see videocap.verification) gets that browser's cookies and way of introducing itself."""
-    verified = verified_sites.session_for(url) if other_sites and host_of(url) and not is_youtube_url(url) else None
+    fetched as a browser would gets one that can do it. Every other one is never told to impersonate. For the owner's
+    link to another site, either kind notes in `refusals`, when given, what the site refused it with. A link to a site
+    whose check for a person the owner passed in a browser (see videocap.verification) gets that browser's cookies and
+    way of introducing itself."""
+    another_site = bool(other_sites and host_of(url) and not is_youtube_url(url))
+    verified = verified_sites.session_for(url) if another_site else None
     if verified:
         opts = with_verified_session(opts, verified)
     if offered_to(url, other_sites):
@@ -292,7 +310,11 @@ def youtube_dl(base: Any, opts: dict[str, Any], url: str, other_sites: bool, ref
     else:
         if "impersonate" in opts:
             opts = {key: value for key, value in opts.items() if key != "impersonate"}
-        ydl = base(opts)
+        if another_site and refusals is not None and not MISSING_FROM_YTDLP:
+            ydl = noting_class(base)(opts)
+            ydl.refusals = refusals
+        else:
+            ydl = base(opts)
     if verified:
         for cookie in verified.live_cookies():
             ydl.cookiejar.set_cookie(cookie.as_cookie())

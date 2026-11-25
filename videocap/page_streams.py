@@ -8,7 +8,13 @@ stream is, and it says the page holds no video.
 
 Packing only swaps words for codes. Undoing it is reading a table: no script of the page is run. The address found
 that way is asked for as the page's own player would ask for it, with the page named as the Referer, which the sites
-that hide their streams usually check."""
+that hide their streams usually check.
+
+Other pages keep their player in an <iframe> of its own instead, often on the site's own other host, rather than in
+the page itself. yt-dlp follows an iframe only to a host it already has an extractor for, so one to any other site is
+left exactly where the page is: holding no video. That smaller, dedicated document is usually not written for a
+search engine to read the way the outer page may be, so once opened it is read as plain text too, not only for a
+packed script."""
 
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ import re
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 import yt_dlp
@@ -38,6 +44,8 @@ PACKED_SCRIPTS_LIMIT = 20
 UNPACKED_LIMIT = 4 * 1024 * 1024
 # How many of a page's addresses are tried, the likeliest first.
 STREAM_TRIES = 3
+# How many of a page's own <iframe>s are opened, when neither the page nor a packed script of its own gives a stream away.
+IFRAME_TRIES = 2
 # How often a page that answers with a check for bots is asked for, and how long to wait before asking again.
 PAGE_ATTEMPTS = 2
 CHECK_PAUSE_SECONDS = 3.0
@@ -55,6 +63,8 @@ PLAYLIST_RE = re.compile(
     r"""|(?P<bare>https?://[^\s"'`<>\\]+?\.m3u8(?:\?[^\s"'`<>\\]*)?)(?![\w./%-]))""",
     re.I,
 )
+# An <iframe>'s own address, however the page quotes it.
+IFRAME_RE = re.compile(r"""<iframe\b[^>]*\bsrc=(["'])(?P<src>[^"'<>]+)\1""", re.I)
 JS_ESCAPE_RE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|(.))", re.S)
 JS_PLAIN_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
 META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.I)
@@ -69,21 +79,26 @@ class UnpackedTooLarge(Exception):
 
 @dataclass(frozen=True)
 class PageStream:
-    """A stream that a page's player script gave away, with what the page says of it."""
+    """A stream that a page's player script gave away, with what the page says of it. `page_url` is what the owner
+    gave: the address the stream is downloaded and remembered under, whatever document its player script was really
+    read from. `referer` is that document, when it was not `page_url` itself but an iframe of the page's own: what a
+    browser would name as the Referer of a request the iframe's own player makes. Left "" for `page_url` itself."""
 
     page_url: str
     address: str
     title: str = ""
     thumbnail: str = ""
+    referer: str = ""
 
     def headers(self) -> dict[str, str]:
-        """What the page's own player sends with every request for the stream: the page as the Referer, written as a
-        browser writes it (the whole address to the page's own site, only the site to any other), and, to another
-        site, the Origin the request comes from."""
-        page, target = urlsplit(self.page_url), urlsplit(self.address)
+        """What the page's own player sends with every request for the stream: the document that asked for it (the
+        page itself, or the iframe of its own that really did) as the Referer, written as a browser writes it (the
+        whole address to that document's own site, only the site to any other), and, to another site, the Origin the
+        request comes from."""
+        page, target = urlsplit(self.referer or self.page_url), urlsplit(self.address)
         origin = f"{page.scheme}://{page.netloc}"
         if (page.scheme, page.netloc.lower()) == (target.scheme, target.netloc.lower()):
-            return {"Referer": urldefrag(self.page_url).url}
+            return {"Referer": urldefrag(self.referer or self.page_url).url}
         return {"Referer": f"{origin}/", "Origin": origin}
 
 
@@ -166,6 +181,31 @@ def find_stream_addresses(page: str, page_url: str) -> list[str]:
     return sorted(found, key=lambda address: urlsplit(address).path.count("/"))
 
 
+def iframe_addresses(page: str, page_url: str) -> list[str]:
+    """The addresses of this page's own <iframe>s, resolved against it, at most IFRAME_TRIES of them. yt-dlp's generic
+    extractor follows an iframe only to a host it already has an extractor of its own for; a site that keeps its
+    player in one instead of the page itself, to a host yt-dlp does not know, is left for find_streams to open."""
+    found: list[str] = []
+    for match in IFRAME_RE.finditer(page):
+        address = urljoin(page_url, html.unescape(match.group("src")))
+        if urlsplit(address).scheme in ("http", "https") and address not in found:
+            found.append(address)
+    return found[:IFRAME_TRIES]
+
+
+def find_addresses_in_iframe(page: str, page_url: str) -> list[str]:
+    """The addresses an iframe's own document gives away, whole: in a packed script, as find_stream_addresses reads
+    one, or written out in the open. Unlike the outer page, which a site may fill with addresses meant for a search
+    engine rather than a player (see videocap.errors.refused_past_the_link), a dedicated player document of its own is
+    safe to read as plain text too."""
+    found = list(find_stream_addresses(page, page_url))
+    for match in PLAYLIST_RE.finditer(html.unescape(page)):
+        address = urljoin(page_url, match.group("quoted") or match.group("bare"))
+        if urlsplit(address).scheme in ("http", "https") and address != page_url and address not in found:
+            found.append(address)
+    return sorted(found, key=lambda address: urlsplit(address).path.count("/"))
+
+
 def tidy(text: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(text)).strip()[:TITLE_LIMIT]
 
@@ -194,11 +234,12 @@ def page_thumbnail(page: str, page_url: str) -> str:
     return address if urlsplit(address).scheme in ("http", "https") else ""
 
 
-def read_page_once(ydl_opts: Mapping[str, Any], url: str, other_sites: bool) -> tuple[str, bool]:
-    """One reading of the page: its text, and whether it was turned away by a site's check for bots."""
+def read_page_once(ydl_opts: Mapping[str, Any], url: str, other_sites: bool, headers: Optional[Mapping[str, str]] = None) -> tuple[str, bool]:
+    """One reading of the page: its text, and whether it was turned away by a site's check for bots. `headers` is what a
+    browser would add to this one request, such as the Referer of the page that pointed here (see iframe_addresses)."""
     try:
         with impersonation.youtube_dl(yt_dlp.YoutubeDL, dict(ydl_opts), url, other_sites) as ydl:
-            response = ydl.urlopen(Request(url))
+            response = ydl.urlopen(Request(url, headers=dict(headers or {})))
             try:
                 kind = str(response.headers.get("Content-Type") or "").lower()
                 if kind and not ("html" in kind or "xml" in kind or kind.startswith("text/")):
@@ -217,7 +258,7 @@ def read_page_once(ydl_opts: Mapping[str, Any], url: str, other_sites: bool) -> 
         return data.decode("utf-8", "replace"), False
 
 
-def read_page(ydl_opts: Mapping[str, Any], url: str, other_sites: bool) -> str:
+def read_page(ydl_opts: Mapping[str, Any], url: str, other_sites: bool, headers: Optional[Mapping[str, str]] = None) -> str:
     """The page's text, read through yt-dlp so that the proxy, the cookies, the headers and the way of connecting are
     those of the run that found nothing in it. "" when it cannot be read, or is not a page.
 
@@ -225,7 +266,7 @@ def read_page(ydl_opts: Mapping[str, Any], url: str, other_sites: bool) -> str:
     browser a second ago. So a page that answers with the check is asked for once more, after a pause; a second
     answer of the same kind is the site's own, and the page is left unread."""
     for attempt in range(PAGE_ATTEMPTS):
-        page, challenged = read_page_once(ydl_opts, url, other_sites)
+        page, challenged = read_page_once(ydl_opts, url, other_sites, headers)
         if page or not challenged:
             return page
         if attempt + 1 < PAGE_ATTEMPTS:
@@ -234,9 +275,20 @@ def read_page(ydl_opts: Mapping[str, Any], url: str, other_sites: bool) -> str:
 
 
 def find_streams(ydl_opts: Mapping[str, Any], url: str, other_sites: bool) -> list[PageStream]:
-    """The streams that the page at this address gives away, the likeliest first: at most STREAM_TRIES of them."""
+    """The streams that the page at this address gives away, the likeliest first: at most STREAM_TRIES of them. A page
+    that gives none away itself, but keeps its player in an iframe of its own, is asked for only to open that: the
+    stream still downloads and is remembered in the outer page's name, but is asked for as the iframe's own player
+    would ask for it."""
     page = read_page(ydl_opts, url, other_sites)
     if not page:
         return []
     title, thumbnail = page_title(page), page_thumbnail(page, url)
-    return [PageStream(url, address, title, thumbnail) for address in find_stream_addresses(page, url)[:STREAM_TRIES]]
+    addresses, referer = find_stream_addresses(page, url), ""
+    if not addresses:
+        for frame_url in iframe_addresses(page, url):
+            framed = read_page(ydl_opts, frame_url, other_sites, PageStream(url, frame_url).headers())
+            nested = find_addresses_in_iframe(framed, frame_url) if framed else []
+            if nested:
+                addresses, referer = nested, frame_url
+                break
+    return [PageStream(url, address, title, thumbnail, referer) for address in addresses[:STREAM_TRIES]]

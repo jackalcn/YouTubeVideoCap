@@ -48,9 +48,11 @@ from videocap.config import (
 )
 from videocap.errors import (
     JS_RUNTIME_HINT,
+    STREAM_REFUSED,
     add_referer_advice,
     explain_missing_js_runtime,
     extract_failed_video_id,
+    failure_kind,
     humanize_human_check,
     humanize_ytdlp_error,
     warns_of_missing_js_runtime,
@@ -1246,12 +1248,13 @@ PAGE_STREAM_NOTE = "這個網頁沒有直接列出影片：串流網址取自它
 
 
 def page_without_a_video(url: str, options: DownloadOptions, outcome: DownloadOutcome) -> bool:
-    """Whether the owner's link to an ordinary page came back with nothing, and with yt-dlp's word that it saw no video
-    in it as the only failure: the one that a look at the page's own scripts can mend. A stream that was found this way
-    is not searched for again."""
+    """Whether the owner's link to an ordinary page came back with nothing, as yt-dlp's word that it saw no video in
+    it, or with its own pick among what it saw refused (see videocap.errors.STREAM_REFUSED): either way, a look at the
+    page's own scripts and iframes may know a better one. A stream that was found this way is not searched for again."""
     if not options.other_sites or options.page_stream or outcome["items"] or outcome["stopped"]:
         return False
-    return holds_no_video(url, outcome["errors"])
+    errors = outcome["errors"]
+    return holds_no_video(url, errors) or any(failure_kind(error) == STREAM_REFUSED for error in errors)
 
 
 def download_stream_in_page(
@@ -1263,10 +1266,10 @@ def download_stream_in_page(
     should_stop: Optional[Callable[[], bool]] = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> DownloadOutcome:
-    """A page that holds no video yt-dlp can see, but whose player script keeps a stream's address packed (see
-    videocap.page_streams): that stream is downloaded in the page's name, asked for as the page's player would ask for
-    it. The outcome stands as it is when the page gives no stream away. Once the stream is found, its outcome replaces
-    the page's, which only said that the page held no video."""
+    """A page that holds no video yt-dlp can see, or whose own pick among what it saw was refused: a stream that its
+    player script, or an iframe of its own, gives away instead (see videocap.page_streams) is downloaded in the page's
+    name, asked for as whichever of them really held the player would ask for it. The outcome stands as it is when
+    nothing better is found. Once a stream is found, its outcome replaces the page's own."""
     if not page_without_a_video(url, options, outcome) or (should_stop and should_stop()):
         return outcome
     streams = find_streams(build_read_options(options, impersonation.Silent()), url, options.other_sites)
@@ -1371,7 +1374,7 @@ def download_once(
     refusals: Optional[impersonation.Refusals] = None,
 ) -> tuple[DownloadOutcome, list[tuple[str, str]]]:
     """One yt-dlp run. Also returns yt-dlp's own error messages with their videos, in the order of the outcome's
-    translated ones. `refusals` is where a run that can pass for a browser notes what the site refused it with."""
+    translated ones. `refusals` is where a run for another site's link notes what the site refused it with."""
     options, notes = without_youtube_only_options(options, url)
     options.output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_available, _ = get_ffmpeg_status()
@@ -1634,7 +1637,8 @@ def download_once(
         finish_item_sidecars(item, options, notes)
 
     browser_advice = impersonation.advice(options.other_sites) if errors else ""
-    humanized = [humanize_ytdlp_error(message, url, browser_advice) for message in errors]
+    refused = refusals.addresses if refusals else []
+    humanized = [humanize_ytdlp_error(message, url, browser_advice, refused) for message in errors]
     if wanted_wait and not wait_live and any(marker in message.lower() for message in errors for marker in UPCOMING_MARKERS):
         notes.append(LIVE_WAIT_NEEDS_FFMPEG_NOTE)
     if any(WHOLE_VIDEO_CUT_MARKER in warning for warning in logger.warnings):

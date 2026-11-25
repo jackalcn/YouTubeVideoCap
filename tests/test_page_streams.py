@@ -21,11 +21,14 @@ from videocap.errors import UNREADABLE_LINK, failure_kind, referer_advice
 from videocap.inspector import PAGE_STREAM_DETAIL, PAGE_STREAM_FOUND_BUT_FAILED, inspect_link
 from videocap.options import AccessLimits, DownloadOptions, LoginSource, build_base_options, options_from_spec
 from videocap.page_streams import (
+    IFRAME_TRIES,
     PACKED_SCRIPT_LIMIT,
     PageStream,
+    find_addresses_in_iframe,
     find_stream_addresses,
     find_streams,
     holds_no_video,
+    iframe_addresses,
     page_thumbnail,
     page_title,
     read_page,
@@ -172,6 +175,65 @@ def test_a_page_is_not_trusted_with_more_than_a_few_tries(monkeypatch: pytest.Mo
     addresses = [f"https://cdn.example/{number}/index.m3u8" for number in range(10)]
     monkeypatch.setattr(page_streams, "read_page", lambda *args: f"<script>{pack(player_script(*addresses))}</script>")
     assert [stream.address for stream in find_streams({}, PAGE, True)] == addresses[:3]
+
+
+# Finding the stream in an iframe of the page's own
+
+
+def test_an_iframes_address_is_found_resolved_and_not_trusted_with_too_many_tries() -> None:
+    page = (
+        '<iframe id="player" src="/player?x=1"></iframe>'
+        "<iframe src='https://cdn.example/embed'></iframe>"
+        '<iframe src="javascript:void(0)"></iframe>'
+        '<iframe src="https://cdn.example/embed"></iframe>'
+        '<iframe src="/third"></iframe>'
+    )
+    # Resolved against the page, a duplicate and a non-http address dropped, and no more than IFRAME_TRIES kept.
+    assert iframe_addresses(page, PAGE) == ["https://site.example/player?x=1", "https://cdn.example/embed"]
+    assert len(iframe_addresses(page, PAGE)) == IFRAME_TRIES
+
+
+def test_an_iframes_own_plain_address_is_found_without_unpacking() -> None:
+    page = "<p>player</p><script>var source='https://cdn.example/id/playlist.m3u8?t=1';</script>"
+    assert find_addresses_in_iframe(page, PAGE) == ["https://cdn.example/id/playlist.m3u8?t=1"]
+
+
+def test_an_iframes_html_escaped_address_is_read_as_the_one_it_escapes() -> None:
+    page = '<a href="https://cdn.example/id/playlist.m3u8?a=1&amp;b=2">play</a>'
+    assert find_addresses_in_iframe(page, PAGE) == ["https://cdn.example/id/playlist.m3u8?a=1&b=2"]
+
+
+def test_an_iframes_packed_address_is_still_found() -> None:
+    code = "var a='https://cdn.example/id/playlist.m3u8';"
+    page = f"<script>{pack(code)}</script>"
+    assert find_addresses_in_iframe(page, PAGE) == ["https://cdn.example/id/playlist.m3u8"]
+
+
+def test_a_page_with_no_stream_of_its_own_is_asked_for_a_stream_through_its_iframe(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages = {
+        PAGE: '<iframe src="https://frame.example/embed"></iframe>',
+        "https://frame.example/embed": "<script>var source='https://cdn.example/id/real.m3u8';</script>",
+    }
+    monkeypatch.setattr(page_streams, "read_page", lambda opts, url, other, headers=None: pages.get(url, ""))
+    (stream,) = find_streams({}, PAGE, True)
+    # Remembered under the outer page, the owner's own, but asked for as the iframe's own player would ask for it.
+    assert stream.page_url == PAGE and stream.address == "https://cdn.example/id/real.m3u8"
+    assert stream.headers() == {"Referer": "https://frame.example/", "Origin": "https://frame.example"}
+
+
+def test_an_iframe_is_opened_only_when_the_page_gives_no_stream_away_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+
+    def fake_read_page(opts: object, url: str, other: bool, headers: object = None) -> str:
+        opened.append(url)
+        if url == PAGE:
+            return f"<script>{pack(player_script('https://cdn.example/id/own.m3u8'))}</script><iframe src='https://frame.example/embed'></iframe>"
+        return "<script>var source='https://cdn.example/id/real.m3u8';</script>"
+
+    monkeypatch.setattr(page_streams, "read_page", fake_read_page)
+    assert [stream.address for stream in find_streams({}, PAGE, True)] == ["https://cdn.example/id/own.m3u8"]
+    # Its own packed script already gave a stream away, so the iframe is never opened.
+    assert opened == [PAGE]
 
 
 # What the page says of its video
@@ -325,6 +387,25 @@ def test_a_stream_found_in_a_pages_script_downloads_in_the_pages_name(new_site: 
     assert set(stream_site.referers_for("referred/hls/index.m3u8")) == {(page_site.base + "/", page_site.base)}
     # Without the page as the Referer, the same stream is refused.
     assert inspect(stream, tmp_path)["error"].startswith("這個網站拒絕了下載請求（HTTP 403）")
+
+
+@needs_ffmpeg
+def test_a_stream_found_through_an_iframe_downloads_in_the_pages_name(new_site: NewSite, tmp_path: Path) -> None:
+    page_site, stream_site = pair(new_site)
+    stream = stream_site.add_stream("referred/hls")
+    page_site.add_embedded_player("player.html", stream)
+    url = page_site.add_iframe_page("watch.html", "player.html", title="Seen through an iframe")
+
+    outcome = download(url, tmp_path)
+    assert outcome["errors"] == []
+    item = outcome["items"][0]
+    saved = Path(item["path"])
+    # Named for the outer page, the owner's own link, not the iframe that really held the player.
+    assert saved.stem.startswith("Seen through an iframe") and duration_of(saved) == pytest.approx(2, abs=0.5)
+    assert item["webpage_url"] == url and PAGE_STREAM_NOTE.format(host="127.0.0.1") in outcome["notes"]
+    # Asked for as the iframe's own player would ask: another site, so only where the iframe is (the same one here).
+    segments = stream_site.segments("referred/hls")
+    assert segments and all(stream_site.referers_for(segment) == [(page_site.base + "/", page_site.base)] for segment in segments)
 
 
 @needs_ffmpeg

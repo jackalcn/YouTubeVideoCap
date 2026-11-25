@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import http.server
+import json
 import re
 import shutil
 import subprocess
@@ -166,10 +167,26 @@ class LocalSite:
         target.write_text(html, encoding="utf-8")
         return self.url(name)
 
+    def add_listing_page(self, name: str, stream: str, title: str = "Local page") -> str:
+        """A page that names its video's stream only in what it tells search engines (a schema.org VideoObject), which
+        yt-dlp's generic extractor reads."""
+        data = {"@context": "https://schema.org", "@type": "VideoObject", "name": title, "contentUrl": stream}
+        return self.write_page(name, title, "<p>player</p>", f'<script type="application/ld+json">{json.dumps(data)}</script>')
+
     def add_packed_page(self, name: str, code: str, title: str = "Local page", image: str = "", base: int = 36) -> str:
         """A page whose only player is a packed script: nothing in the page's text says where its stream is."""
         head = f'<meta property="og:image" content="{image}">' if image else ""
         return self.write_page(name, title, f"<script>{pack(code, base)}</script>", head)
+
+    def add_iframe_page(self, name: str, frame_src: str, title: str = "Local page") -> str:
+        """A page whose only player is in an <iframe> of its own: nothing in the outer page's text says where its
+        stream is either."""
+        return self.write_page(name, title, f'<iframe src="{frame_src}"></iframe>')
+
+    def add_embedded_player(self, name: str, stream: str, title: str = "Embedded player") -> str:
+        """A small, dedicated player document, as an <iframe> often holds one of its own: writes its stream's address
+        out in the open, not packed, and not meant for a search engine to read."""
+        return self.write_page(name, title, f"<p>player</p><script>var source='{stream}';</script>")
 
     def add_playlist(self, name: str = "hls/index.m3u8", segments: int = 3) -> str:
         """A stream's playlist, written out: enough to be read and listed, with no segment behind it."""

@@ -27,7 +27,7 @@ from videocap.downloader import (
     estimate_size,
     refusal_in,
 )
-from videocap.errors import add_referer_advice, humanize_human_check, humanize_ytdlp_error
+from videocap.errors import STREAM_REFUSED, add_referer_advice, failure_kind, humanize_human_check, humanize_ytdlp_error
 from videocap.options import (
     DownloadOptions,
     LoginSource,
@@ -425,15 +425,20 @@ def read_link(url: str, options: DownloadOptions) -> LinkReport:
             # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
             report["error"] = humanize_human_check(failure, url)
             return report
-    if report.get("error") and not options.page_stream and options.other_sites and holds_no_video(url, [report["error"]]):
+    # A page that gave nothing away, or whose own page was let through while yt-dlp's pick among what it found was
+    # refused (see videocap.errors.STREAM_REFUSED): either way, the page's own scripts and iframes may know a better one.
+    if report.get("error") and not options.page_stream and options.other_sites and (
+        holds_no_video(url, [report["error"]]) or failure_kind(report["error"]) == STREAM_REFUSED
+    ):
         return inspect_stream_in_page(url, options, report)
     return report
 
 
 def inspect_stream_in_page(url: str, options: DownloadOptions, report: LinkReport) -> LinkReport:
-    """A page that holds no video yt-dlp can see, but whose player script keeps a stream's address packed (see
-    videocap.page_streams): the report of that stream, in the page's name. The page's own report stands when the page
-    gives no stream away. When it gives one away that cannot be read, that is what the report says."""
+    """A page that holds no video yt-dlp can see, or whose own pick among what it saw was refused: the report of a
+    stream that the page's player script, or an iframe of its own, gives away instead (see videocap.page_streams), in
+    the page's name. The page's own report (or the refusal already given) stands when nothing better is found. When
+    it gives one away that cannot be read either, that is what the report says."""
     streams = find_streams(build_read_options(options, impersonation.Silent()), url, options.other_sites)
     failed: LinkReport = report
     for stream in streams:
@@ -488,13 +493,13 @@ def inspect_once(url: str, options: DownloadOptions, refusals: impersonation.Ref
                     output_name = ""
     except Exception as exc:
         advice = impersonation.advice(options.other_sites)
-        return {"url": url, "error": humanize_ytdlp_error(str(exc), url, advice)}, refusal_in([str(exc)], log.warnings)
+        return {"url": url, "error": humanize_ytdlp_error(str(exc), url, advice, refusals.addresses)}, refusal_in([str(exc)], log.warnings)
     formats = listed_formats(info)
     if "entries" not in info and not formats:
         # Removed, private, members-only, age-gated or blocked: yt-dlp was told not to fail, so it only warned.
         reason = find_unplayable_reason(log.warnings)
         advice = impersonation.advice(options.other_sites)
-        return {"url": url, "error": humanize_ytdlp_error(reason, url, advice)}, refusal_in([reason], log.warnings)
+        return {"url": url, "error": humanize_ytdlp_error(reason, url, advice, refusals.addresses)}, refusal_in([reason], log.warnings)
 
     report: LinkReport = {
         "url": url,

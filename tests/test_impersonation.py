@@ -14,6 +14,7 @@ import pytest
 import yt_dlp
 from yt_dlp.networking import Request
 from yt_dlp.networking.common import _REQUEST_HANDLERS
+from yt_dlp.networking.exceptions import HTTPError
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 import videocap
@@ -23,7 +24,7 @@ from fake_browser import browser_fixture, real_handler, recording, stand_in_hand
 from offline_web import LocalSite, new_site_fixture, web_media_fixture  # noqa: F401
 from offline_youtube import OfflineYouTube, duration_of, offline_media_fixture, offline_youtube_fixture  # noqa: F401
 from videocap.downloader import BROWSER_RETRY_FAILED_NOTE, BROWSER_RETRY_WORKED_NOTE, refused_as_a_program, run_download
-from videocap.errors import HUMAN_CHECK, failure_kind
+from videocap.errors import HUMAN_CHECK, STREAM_REFUSED, failure_kind
 from videocap.inspector import inspect_link
 from videocap.options import OTHER_SITES_OWNER_ONLY_MESSAGE, AccessLimits, DownloadOptions, options_from_spec, parse_extra_ytdlp_args
 from videocap.settings import DownloadSettings, JobSpec
@@ -115,6 +116,22 @@ def test_only_the_owners_link_to_another_site_can_pass_for_a_browser(browser: An
 def test_without_the_package_every_youtubedl_is_ytdlps_own() -> None:
     with impersonation.youtube_dl(yt_dlp.YoutubeDL, dict(QUIET), "https://example.com/watch/1", True) as ydl:
         assert type(ydl) is yt_dlp.YoutubeDL and not can_impersonate(ydl)
+
+
+def test_without_the_package_a_refusal_is_noted_all_the_same(plain_site: LocalSite) -> None:
+    refusals = impersonation.Refusals()
+    refused = plain_site.url("forbidden/index.m3u8")
+    with impersonation.youtube_dl(yt_dlp.YoutubeDL, dict(QUIET), plain_site.url("watch.html"), True, refusals) as ydl:
+        assert not can_impersonate(ydl)
+        for address in (refused, plain_site.url("missing.html")):
+            with pytest.raises(HTTPError):
+                ydl.urlopen(Request(address))
+    # The refusal only: a missing page is another matter.
+    assert refusals.forbidden == 1 and refusals.addresses == [refused] and not refusals.challenged
+    # A YouTube link's run, and a visitor's, are left as they always were.
+    for url, other_sites in ((YOUTUBE_VIDEO, True), (plain_site.url("watch.html"), False)):
+        with impersonation.youtube_dl(yt_dlp.YoutubeDL, dict(QUIET), url, other_sites, refusals) as ydl:
+            assert type(ydl) is yt_dlp.YoutubeDL
 
 
 def test_a_youtube_link_is_never_told_to_impersonate_the_whole_run(browser: Any) -> None:
@@ -389,6 +406,21 @@ def test_a_plain_refusal_stays_a_plain_refusal_after_one_more_try(browser: Any, 
         assert error.startswith("這個網站拒絕了下載請求（HTTP 403）") and "真人驗證" not in error
     assert len(outcome["errors"]) == 1 and BROWSER_RETRY_FAILED_NOTE in outcome["notes"]
     assert site.asked_for("forbidden/clip.mp4") == 4 and site.asked_as_a_browser("forbidden/clip.mp4") == 2
+
+
+@needs_ffmpeg
+def test_a_stream_refused_after_its_page_let_a_browser_in_is_told_as_the_streams(browser: Any, new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    url = site.add_listing_page("cf/watch.html", site.add_playlist("forbidden/index.m3u8"))
+    report, outcome = inspect(url, tmp_path), download(url, tmp_path)
+
+    for error in (report["error"], *outcome["errors"]):
+        # The first try was refused the page. What the last one was refused is what the person is told of.
+        assert failure_kind(error) == STREAM_REFUSED and "真人驗證" not in error
+    assert len(outcome["errors"]) == 1 and BROWSER_RETRY_FAILED_NOTE in outcome["notes"]
+    # The page: once as a program and once as a browser, for each of the two; each also opens the page once more
+    # afterwards, as the browser it already passed for, looking for a better stream in an iframe of its own.
+    assert site.asked_for("cf/watch.html") == 6 and site.asked_as_a_browser("cf/watch.html") == 4
 
 
 @needs_ffmpeg
