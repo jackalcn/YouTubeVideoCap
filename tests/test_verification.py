@@ -197,8 +197,10 @@ def test_a_machine_with_no_desktop_opens_no_window(monkeypatch: pytest.MonkeyPat
 def test_the_owners_choice_of_browser_comes_first_and_chrome_before_edge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "programs"
     for relative in (r"Google\Chrome\Application\chrome.exe", r"Microsoft\Edge\Application\msedge.exe"):
-        target = root / relative.replace("\\", "/")
-        target.parent.mkdir(parents=True)
+        # Joined as the app joins it: folders on Windows, and one file with backslashes in its name anywhere else,
+        # where this test still runs with the platform said to be Windows.
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"")
     chosen = tmp_path / "my-browser.exe"
     chosen.write_bytes(b"")
