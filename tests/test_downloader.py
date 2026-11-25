@@ -1858,17 +1858,20 @@ def refused_playlist(site: OfflineYouTube, working_client: str) -> str:
 
 
 def test_videos_refused_with_403_are_tried_once_more_with_other_clients(offline_youtube: OfflineYouTube, tmp_path: Path) -> None:
-    url = refused_playlist(offline_youtube, "tv")
+    from videocap.options import fallback_player_clients
+
+    url = refused_playlist(offline_youtube, "web_embedded")
     spec = JobSpec(url=url, settings=DownloadSettings(download_subtitles=False, expand_playlist=True), output_dir=str(tmp_path))
     log: list[str] = []
     outcome = run_download(url, options_from_spec(spec, AccessLimits()), Progress(), on_log=log.append)
     assert outcome["errors"] == [] and outcome["failed_ids"] == []
     assert sorted(item["title"] for item in outcome["items"]) == ["Part 1", "Part 2"]
     assert all(Path(item["path"]).is_file() for item in outcome["items"])
-    # Only the refused video was asked for again, with clients that need no PO token.
+    # Only the refused video was asked for again, with the clients that need no PO token, which the log names.
+    clients = list(fallback_player_clients())
     assert offline_youtube.extractions.count("https://www.youtube.com/watch?v=forbidVid01") == 1
-    assert offline_youtube.player_clients_asked[-1] == ["web_embedded", "tv", "tv_downgraded"]
-    assert any("HTTP 403" in line and "tv_downgraded" in line for line in log)
+    assert "web_embedded" in clients and offline_youtube.player_clients_asked[-1] == clients
+    assert any("HTTP 403" in line and "、".join(clients) in line for line in log)
     assert len(outcome["notes"]) == 1 and "已下載完成" in outcome["notes"][0]
 
 
@@ -1969,7 +1972,7 @@ def test_the_retries_share_what_is_left_of_a_public_jobs_budget(offline_youtube:
 
     urls = [offline_youtube.add_video(f"budgetVid0{number}", f"Budget {number}") for number in (1, 2)]
     for number in (1, 2):
-        offline_youtube.refused_unless_client[f"budgetVid0{number}"] = "tv"
+        offline_youtube.refused_unless_client[f"budgetVid0{number}"] = "web_embedded"
     playlist = offline_youtube.add_playlist("PLbudget", urls)
     one_video = sum((offline_youtube.media / name).stat().st_size for name in ("v.mp4", "a.m4a"))
     spec = JobSpec(url=playlist, settings=DownloadSettings(download_subtitles=False, expand_playlist=True), output_dir=str(tmp_path))
@@ -1986,7 +1989,7 @@ def test_videos_left_without_a_retry_keep_their_error(offline_youtube: OfflineYo
 
     urls = [offline_youtube.add_video(f"budgetVid0{number}", f"Budget {number}") for number in (3, 4)]
     for number in (3, 4):
-        offline_youtube.refused_unless_client[f"budgetVid0{number}"] = "tv"
+        offline_youtube.refused_unless_client[f"budgetVid0{number}"] = "web_embedded"
     playlist = offline_youtube.add_playlist("PLbudget2", urls)
     one_video = sum((offline_youtube.media / name).stat().st_size for name in ("v.mp4", "a.m4a"))
     spec = JobSpec(url=playlist, settings=DownloadSettings(download_subtitles=False, expand_playlist=True), output_dir=str(tmp_path))
@@ -2000,6 +2003,7 @@ def test_videos_left_without_a_retry_keep_their_error(offline_youtube: OfflineYo
 
 def test_a_public_job_without_room_left_is_not_retried(tmp_path: Path) -> None:
     from videocap.downloader import options_for_forbidden_retry
+    from videocap.options import fallback_player_clients
 
     finished = tmp_path / "finished.mp4"
     finished.write_bytes(b"x" * 1000)
@@ -2008,7 +2012,7 @@ def test_a_public_job_without_room_left_is_not_retried(tmp_path: Path) -> None:
     assert options_for_forbidden_retry(make_options(tmp_path, max_job_bytes=1000), outcome) is None
     room = options_for_forbidden_retry(make_options(tmp_path, max_job_bytes=1500), outcome)
     assert room is not None and room.max_job_bytes == 500
-    assert room.network.player_client == "web_embedded,tv,tv_downgraded"
+    assert room.network.player_client == ",".join(fallback_player_clients())
     # A resumed run counts the files in the job's folder itself, so taking them off here would count them twice.
     resumed = options_for_forbidden_retry(make_options(tmp_path, output_dir=tmp_path, max_job_bytes=1500, resuming=True), outcome)
     assert resumed is not None and resumed.max_job_bytes == 1500

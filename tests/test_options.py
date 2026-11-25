@@ -800,17 +800,50 @@ def test_community_chapters_are_marked_with_their_own_names(offline_youtube: Off
 # feat:7 - YouTube player client, and feat:15 - Traditional Chinese titles
 
 
-def test_offered_player_clients_need_no_po_token_from_youtube() -> None:
+def formats_without_po_token(client: str) -> set[str]:
+    """The kinds of format the installed yt-dlp downloads from this client without a PO token: https, dash, hls."""
+    from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS, StreamingProtocol
+
+    policies = INNERTUBE_CLIENTS[client].get("GVS_PO_TOKEN_POLICY", {})
+    return {protocol.value for protocol in StreamingProtocol if not (protocol in policies and policies[protocol].required)}
+
+
+def test_each_offered_player_client_gets_formats_without_a_po_token() -> None:
     from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
 
-    from videocap.config import PLAYER_CLIENT_OPTIONS, PLAYER_CLIENTS_WITHOUT_COOKIES
+    from videocap.config import PLAYER_CLIENTS_WITHOUT_COOKIES
+    from videocap.options import offered_player_clients
 
-    offered = [client for client in PLAYER_CLIENT_OPTIONS if client != "default"]
-    assert offered
-    for client in offered:
-        policies = INNERTUBE_CLIENTS[client]["GVS_PO_TOKEN_POLICY"].values()
-        assert not any(policy.required for policy in policies), client
-    assert PLAYER_CLIENTS_WITHOUT_COOKIES == {client for client in offered if not INNERTUBE_CLIENTS[client]["SUPPORTS_COOKIES"]}
+    offered = offered_player_clients()
+    clients = [client for client in offered if client != "default"]
+    assert "default" in offered and clients
+    for client in clients:
+        # One the installed yt-dlp knows, with formats it downloads without a PO token.
+        assert client in INNERTUBE_CLIENTS, client
+        kinds = formats_without_po_token(client)
+        assert kinds, client
+        # Where that is not every kind, the sidebar names the kinds left, as for web_embedded's HLS since yt-dlp 2026.11.23.
+        if kinds != {"https", "dash", "hls"}:
+            assert all(kind.upper() in offered[client] for kind in kinds), (client, kinds)
+        # Those that cannot log in are the ones a logged-in run leaves out.
+        assert (client in PLAYER_CLIENTS_WITHOUT_COOKIES) == (not INNERTUBE_CLIENTS[client]["SUPPORTS_COOKIES"]), client
+
+
+def test_a_player_client_the_installed_ytdlp_does_not_know_is_neither_offered_nor_tried(monkeypatch: pytest.MonkeyPatch) -> None:
+    import videocap.options as options_module
+    from videocap.config import PLAYER_CLIENT_OPTIONS
+    from videocap.downloader import empty_outcome, options_for_forbidden_retry
+
+    # As yt-dlp 2026.10.26 has them: no ios_producer yet.
+    monkeypatch.setattr(options_module, "known_player_clients", lambda: frozenset({"web", "web_embedded", "tv", "tv_samsung", "visionos"}))
+    assert list(options_module.offered_player_clients()) == [client for client in PLAYER_CLIENT_OPTIONS if client != "ios_producer"]
+    assert options_module.fallback_player_clients() == options_module.fallback_player_clients(LoginSource(browser="firefox")) == ("web_embedded",)
+    # When yt-dlp's list cannot be read, all of them: yt-dlp skips a client it does not know.
+    monkeypatch.setattr(options_module, "known_player_clients", lambda: None)
+    assert options_module.offered_player_clients() == PLAYER_CLIENT_OPTIONS
+    # And none at all leaves no retry to make.
+    monkeypatch.setattr(options_module, "known_player_clients", lambda: frozenset({"web"}))
+    assert options_for_forbidden_retry(make_options(), empty_outcome()) is None
 
 
 def test_the_chosen_player_client_reaches_ytdlps_youtube_extractor() -> None:
@@ -1139,13 +1172,15 @@ def test_part_b_settings_are_validated_and_kept_in_presets() -> None:
         mtime_upload_date=True,
         write_nfo=True,
         remove_ranges="0:01-0:02",
-        player_client="tv",
+        player_client="tv_samsung",
         prefer_traditional_metadata=True,
         embed_infojson=True,
         thumbnails_as_jpg=True,
         ytdlp_extra_args="--limit-rate 1M",
     )
     assert settings_from_dict(chosen.to_dict()) == chosen
+    # A client no longer offered is one more value that is not valid: YouTube turned tv away in November 2026.
+    assert settings_from_dict({"player_client": "tv"}).player_client == "default"
     broken = settings_from_dict({"comments_mode": "all", "comments_max": 0, "player_client": "android_hacked", "write_nfo": "yes"})
     defaults = DownloadSettings()
     assert (broken.comments_mode, broken.comments_max, broken.player_client, broken.write_nfo) == (
@@ -1255,16 +1290,27 @@ def test_a_list_of_player_clients_reaches_ytdlp_as_a_list() -> None:
     assert logged_in["extractor_args"] == {"youtube": {"player_client": ["tv", "web_embedded"]}}
 
 
-def test_fallback_player_clients_need_no_po_token_and_take_cookies() -> None:
+@pytest.mark.parametrize("login", [LoginSource(), LoginSource(browser="firefox")], ids=["no login", "logged in"])
+def test_a_video_refused_with_403_is_asked_for_again_with_clients_that_can_get_it(login: LoginSource) -> None:
     from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
 
-    from videocap.config import FALLBACK_PLAYER_CLIENTS
+    from videocap.downloader import empty_outcome, options_for_forbidden_retry
+    from videocap.options import youtube_extractor_args
 
-    for client in FALLBACK_PLAYER_CLIENTS:
-        assert not any(policy.required for policy in INNERTUBE_CLIENTS[client].get("GVS_PO_TOKEN_POLICY", {}).values()), client
-        assert INNERTUBE_CLIENTS[client]["SUPPORTS_COOKIES"], client
-    # Different from what yt-dlp already tried.
-    assert not set(FALLBACK_PLAYER_CLIENTS) & set(yt_dlp.extractor.youtube.YoutubeIE._DEFAULT_CLIENTS)
+    retry = options_for_forbidden_retry(make_options(login=login), empty_outcome())
+    assert retry is not None
+    # The clients yt-dlp is really asked for, once a logged-in run has left out those that cannot log in.
+    asked = youtube_extractor_args(retry.network, login).get("player_client", [])
+    assert asked
+    for client in asked:
+        assert client in INNERTUBE_CLIENTS and formats_without_po_token(client), client
+        assert INNERTUBE_CLIENTS[client]["SUPPORTS_COOKIES"] or not login.is_used, client
+    # Not what yt-dlp asked the first time: none of its own clients, or for a login fewer of them.
+    youtube = yt_dlp.extractor.youtube.YoutubeIE
+    if login.is_used:
+        assert set(asked) < set(youtube._DEFAULT_AUTHED_CLIENTS) or not set(asked) & set(youtube._DEFAULT_AUTHED_CLIENTS)
+    else:
+        assert not set(asked) & set(youtube._DEFAULT_CLIENTS)
 
 
 # Other sites are for this machine's owner

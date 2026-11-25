@@ -37,7 +37,6 @@ from videocap.config import (
     COLLISION_ID_FIELD,
     COLLISION_ID_TEMPLATE,
     EXPIRED_LOGIN_MESSAGE,
-    FALLBACK_PLAYER_CLIENTS,
     JOB_LOG_LINES,
     LIVE_CHAT_TRACK,
     LIVE_WAIT_MAX_SECONDS,
@@ -66,6 +65,7 @@ from videocap.options import (
     build_ydl_options,
     entry_filter_reason,
     expected_final_extension,
+    fallback_player_clients,
     owner_referer,
     waits_for_live,
     writes_thumbnail,
@@ -1155,7 +1155,7 @@ def download_with_ytdlp(
     if options_for_forbidden_retry(options, outcome) is None:
         return outcome
 
-    clients = "、".join(FALLBACK_PLAYER_CLIENTS)
+    clients = "、".join(fallback_player_clients(options.login))
     message = f"{len(forbidden)} 部影片被 YouTube 拒絕（HTTP 403），改用其他 YouTube 用戶端（{clients}）再試一次。"
     if on_log:
         on_log(message)
@@ -1285,7 +1285,11 @@ def download_stream_in_page(
 
 
 def options_for_forbidden_retry(options: DownloadOptions, outcome: DownloadOutcome) -> Optional[DownloadOptions]:
-    """One video at a time, with the fallback clients. None when a public visitor's job has no room left for it."""
+    """One video at a time, with the fallback clients. None when a public visitor's job has no room left for it, and
+    when the installed yt-dlp knows none of those clients that the run could use."""
+    clients = fallback_player_clients(options.login)
+    if not clients:
+        return None
     max_job_bytes = options.max_job_bytes
     if max_job_bytes:
         if options.resuming:
@@ -1301,7 +1305,7 @@ def options_for_forbidden_retry(options: DownloadOptions, outcome: DownloadOutco
                 return None
     return replace(
         options,
-        network=replace(options.network, player_client=",".join(FALLBACK_PLAYER_CLIENTS)),
+        network=replace(options.network, player_client=",".join(clients)),
         noplaylist=True,
         playlist_items="",
         filters=replace(options.filters, only_ids=frozenset()),

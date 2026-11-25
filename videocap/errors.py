@@ -176,7 +176,7 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
     Hint(
         "client_refused",
         ("page needs to be reloaded", "必須重新載入頁面"),
-        "這個 YouTube 用戶端目前無法使用（YouTube 改了它的驗證方式）。請在側邊欄把「YouTube 用戶端」改回「預設」，或換成 web_embedded。",
+        "這個 YouTube 用戶端目前無法使用（YouTube 改了它的驗證方式）。請在側邊欄把「YouTube 用戶端」改回「預設」，或換成清單裡的其他用戶端。",
         youtube_only=True,
     ),
     Hint("drm", ("drm protected",), "此影片受 DRM 保護，無法下載。"),

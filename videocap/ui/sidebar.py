@@ -26,7 +26,7 @@ from videocap.config import (
     MEDIA_TYPE_OPTIONS,
     NAMING_CUSTOM,
     NAMING_TEMPLATE,
-    PLAYER_CLIENT_OPTIONS,
+    PLAYER_CLIENTS_WITHOUT_COOKIES,
     SPONSORBLOCK_CATEGORIES,
     SPONSORBLOCK_MODES,
     VIDEO_CODEC_OPTIONS,
@@ -42,6 +42,7 @@ from videocap.options import (
     LoginSource,
     embeds_thumbnail,
     network_options,
+    offered_player_clients,
     owner_referer,
     parse_extra_ytdlp_args,
     parse_subtitle_languages,
@@ -550,13 +551,18 @@ def render_network_settings(ctx: AppContext) -> None:
             help=None if ctx.trusted else f"公開主機最多等待 {CLOUD_MAX_WAIT_SECONDS} 秒。",
         )
         st.checkbox("強制使用 IPv4", key=opt("force_ipv4"))
+        clients = offered_player_clients()
+        if setting("player_client") not in clients:
+            # A preset saved with a newer yt-dlp may name a client this one does not know, and Streamlit refuses it.
+            st.session_state[opt("player_client")] = "default"
+        without_login = "、".join(client for client in clients if client in PLAYER_CLIENTS_WITHOUT_COOKIES)
         st.selectbox(
             "YouTube 用戶端",
-            options=list(PLAYER_CLIENT_OPTIONS),
-            format_func=PLAYER_CLIENT_OPTIONS.get,
+            options=list(clients),
+            format_func=clients.get,
             key=opt("player_client"),
             help=youtube_only(
-                ctx, "遇到 HTTP 403 或可選的畫質變少時，可以換一個試試。不同用戶端取得的格式與字幕可能不同。登入時 visionos 無法使用，會改用預設。"
+                ctx, f"遇到 HTTP 403 或可選的畫質變少時，可以換一個試試。不同用戶端取得的格式與字幕可能不同。登入時 {without_login} 無法使用，會改用預設。"
             ),
         )
         if ctx.trusted:

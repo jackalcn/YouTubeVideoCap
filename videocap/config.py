@@ -115,22 +115,27 @@ DEFAULT_SPONSORBLOCK_CATEGORIES = ["sponsor", "selfpromo", "interaction"]
 # Marked segments become chapters named like 「[贊助片段] 贊助廣告」. A highlight is a spot, not a segment to skip.
 SPONSORBLOCK_CHAPTER_PREFIX = "[贊助片段]"
 SPONSORBLOCK_UNPREFIXED_CATEGORIES = frozenset({"poi_highlight"})
-# Clients yt-dlp's README lists that YouTube serves without a PO token. "default" leaves the choice to yt-dlp.
+# The YouTube clients to choose from: each got formats from YouTube without a PO token when they were tried on
+# 2026-11-26 with yt-dlp 2026.11.23. YouTube answered tv and tv_downgraded with "The page needs to be reloaded", so
+# they are gone, and a saved choice of either is read as "default". "default" leaves the choice to yt-dlp. A client
+# the installed yt-dlp does not know is not offered (options.offered_player_clients): ios_producer came in 2026.11.23.
 PLAYER_CLIENT_OPTIONS = {
     "default": "預設（自動選擇）",
     "tv_samsung": "電視版（tv_samsung）",
-    "tv": "電視版（tv）",
-    "tv_downgraded": "舊版電視（tv_downgraded）",
     "visionos": "Apple Vision 版（visionos，不需 Deno）",
-    "web_embedded": "內嵌播放器版（web_embedded，限可嵌入的影片）",
+    "ios_producer": "iOS 版（ios_producer，只有 H.264，不需 Deno）",
+    # Since yt-dlp 2026.11.23 only its HLS formats need no PO token, besides format 18 (360p at most), for which yt-dlp
+    # never asks one. On 2026-11-26 its other https formats came without an address at all.
+    "web_embedded": "內嵌播放器版（web_embedded，限可嵌入的影片，以 HLS 格式為主）",
 }
 # yt-dlp drops these when cookies are used, and with nothing else requested the download would fail.
-PLAYER_CLIENTS_WITHOUT_COOKIES = frozenset({"visionos"})
-# Tried once more for videos YouTube refused with HTTP 403 under yt-dlp's default clients (tv_samsung, visionos,
-# web). yt-dlp's README and client table list these as needing no PO token, and all of them take cookies. yt-dlp
-# skips a client YouTube turns away ("The page needs to be reloaded", which tv and tv_downgraded got in November
-# 2026), so the one that still works comes first.
-FALLBACK_PLAYER_CLIENTS = ("web_embedded", "tv", "tv_downgraded")
+PLAYER_CLIENTS_WITHOUT_COOKIES = frozenset({"visionos", "ios_producer"})
+# Tried once more for videos YouTube refused with HTTP 403 under yt-dlp's default clients (tv_samsung and visionos;
+# before yt-dlp 2026.11.23 also web). On 2026-11-26 both got formats without a PO token and a download through each
+# worked: ios_producer's https formats, which are H.264 and AAC only, and web_embedded's HLS. ios_producer comes first
+# for its wider choice. It cannot log in, so a logged-in retry asks web_embedded alone, as one with a yt-dlp older than
+# ios_producer does.
+FALLBACK_PLAYER_CLIENTS = ("ios_producer", "web_embedded")
 # One of the language codes YouTube's own interface offers.
 TRADITIONAL_METADATA_LANGUAGE = "zh-TW"
 COMMENTS_MODE_OPTIONS = {"off": "不另存", "top": "熱門留言優先", "new": "最新留言優先"}

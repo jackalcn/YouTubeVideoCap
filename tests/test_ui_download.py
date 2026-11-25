@@ -1285,24 +1285,42 @@ def test_the_chosen_player_client_and_titles_reach_search(monkeypatch: pytest.Mo
     if public:
         public_mode(monkeypatch)
     seen = record_network(monkeypatch, page_search, "search_youtube", [])
-    app = run_with_settings("search", player_client="tv", prefer_traditional_metadata=True)
+    app = run_with_settings("search", player_client="tv_samsung", prefer_traditional_metadata=True)
     app.text_input(key="keep_search_query").set_value("cats")
     app.button[0].click().run()
     assert not app.exception, app.exception
-    assert [(network.player_client, network.metadata_language) for network in seen] == [("tv", "zh-TW")]
+    assert [(network.player_client, network.metadata_language) for network in seen] == [("tv_samsung", "zh-TW")]
+
+
+def test_a_player_client_this_ytdlp_does_not_know_is_not_offered(monkeypatch: pytest.MonkeyPatch) -> None:
+    import videocap.options as options_module
+    from videocap.storage import LAST_SETTINGS_KEY
+
+    # yt-dlp 2026.10.26 has no ios_producer, which settings saved with a newer one may name.
+    monkeypatch.setattr(options_module, "known_player_clients", lambda: frozenset({"web", "web_embedded", "tv_samsung", "visionos"}))
+    storage = services().storage
+    assert storage is not None
+    storage.set_value(LAST_SETTINGS_KEY, {"player_client": "ios_producer"})
+    app = run_page("download")
+    assert app.session_state["opt_player_client"] == "default"
+    box = app.selectbox(key="opt_player_client")
+    assert not any("ios_producer" in str(option) for option in box.options) and "ios_producer" not in str(box.help)
+    # Where yt-dlp has it, the saved choice stays.
+    monkeypatch.setattr(options_module, "known_player_clients", lambda: frozenset({"web_embedded", "tv_samsung", "visionos", "ios_producer"}))
+    assert run_page("download").session_state["opt_player_client"] == "ios_producer"
 
 
 def test_the_music_preset_turns_on_music_tags() -> None:
     from videocap.ui.sidebar import PRESET_SELECT_KEY
 
-    app = run_with_settings("download", player_client="tv", ytdlp_extra_args="--limit-rate 1M")
+    app = run_with_settings("download", player_client="tv_samsung", ytdlp_extra_args="--limit-rate 1M")
     assert app.session_state["opt_music_tags"] is False
     app.selectbox(key=PRESET_SELECT_KEY).set_value("音樂（MP3 320k＋封面）").run()
     assert not app.exception, app.exception
     assert app.session_state["opt_music_tags"] is True
     assert app.checkbox(key="opt_music_tags").value is True
     # How this machine reaches YouTube is not part of a built-in preset.
-    assert app.session_state["opt_player_client"] == "tv"
+    assert app.session_state["opt_player_client"] == "tv_samsung"
     assert app.session_state["opt_ytdlp_extra_args"] == "--limit-rate 1M"
 
 
@@ -1359,7 +1377,7 @@ def test_a_saved_preset_brings_back_the_new_options() -> None:
     chosen = {
         "music_tags": True, "thumbnails_as_jpg": True, "comments_mode": "top", "comments_max": 300,
         "subtitles_to_traditional": True, "mtime_upload_date": True, "write_nfo": True, "wait_for_live": True,
-        "save_live_chat": True, "player_client": "tv", "prefer_traditional_metadata": True, "folder_rule": "media_server",
+        "save_live_chat": True, "player_client": "tv_samsung", "prefer_traditional_metadata": True, "folder_rule": "media_server",
         "ytdlp_extra_args": "--limit-rate 1M",
     }  # fmt: skip
     app = run_with_settings("download", **chosen)

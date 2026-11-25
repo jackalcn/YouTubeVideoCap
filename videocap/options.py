@@ -24,6 +24,7 @@ from videocap.config import (
     DEFAULT_COMMENTS_MAX,
     DEFAULT_CUSTOM_NAME,
     DEFAULT_SUBTITLE_LANGUAGES,
+    FALLBACK_PLAYER_CLIENTS,
     FOLDER_MEDIA_SERVER,
     FOLDER_TEMPLATES,
     LIVE_CHAT_TRACK,
@@ -35,6 +36,7 @@ from videocap.config import (
     NAMING_DATED,
     NAMING_TEMPLATE,
     PLAYLIST_INDEX_TEMPLATE,
+    PLAYER_CLIENT_OPTIONS,
     PLAYER_CLIENTS_WITHOUT_COOKIES,
     PLAYLIST_PICKER_MAX_ITEMS,
     SECTION_SUFFIX_TEMPLATE,
@@ -461,6 +463,34 @@ def build_read_options(options: DownloadOptions, logger: YtDlpLogger) -> dict[st
     )
     apply_extra_ytdlp_options(ydl_opts, options.extra_ytdlp, only=REQUEST_YTDLP_KEYS)
     return ydl_opts
+
+
+def known_player_clients() -> Optional[frozenset[str]]:
+    """The YouTube clients the installed yt-dlp can ask, or None when its list cannot be read. A release may add some
+    and drop others, and yt-dlp skips a client it does not know with no more than a warning."""
+    try:
+        from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
+    except ImportError:
+        return None
+    return frozenset(client for client in INNERTUBE_CLIENTS if not client.startswith("_"))
+
+
+def offered_player_clients() -> dict[str, str]:
+    """PLAYER_CLIENT_OPTIONS less the clients the installed yt-dlp does not know, as ios_producer before 2026.11.23."""
+    known = known_player_clients()
+    return {client: label for client, label in PLAYER_CLIENT_OPTIONS.items() if client == "default" or known is None or client in known}
+
+
+def fallback_player_clients(login: Optional[LoginSource] = None) -> tuple[str, ...]:
+    """The clients a video YouTube refused with HTTP 403 is asked for once more: FALLBACK_PLAYER_CLIENTS, less those
+    the installed yt-dlp does not know, and for a logged-in run less those that cannot log in."""
+    known = known_player_clients()
+    logged_in = bool(login and login.is_used)
+    return tuple(
+        client
+        for client in FALLBACK_PLAYER_CLIENTS
+        if (known is None or client in known) and not (logged_in and client in PLAYER_CLIENTS_WITHOUT_COOKIES)
+    )
 
 
 def youtube_extractor_args(network: NetworkOptions, login: LoginSource) -> dict[str, list[str]]:
