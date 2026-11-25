@@ -21,10 +21,10 @@ from videocap.downloader import (
     empty_outcome,
     remove_partial_files,
     run_download,
-    strip_cookies_from_info_json,
+    writing_no_cookies,
 )
 from videocap.errors import extract_failed_video_id, humanize_ytdlp_error
-from videocap.options import AccessLimits, DownloadOptions, EntryFilters, LoginSource, options_from_spec
+from videocap.options import AccessLimits, DownloadOptions, EntryFilters, options_from_spec
 from videocap.settings import DownloadSettings, JobSpec
 
 
@@ -403,27 +403,16 @@ def test_transcript_is_written_next_to_the_subtitle(fake_ydl: type[FakeYDL], tmp
     assert subtitle.with_suffix(".txt").read_text(encoding="utf-8") == "Hello\n"
 
 
-def test_login_cookies_never_stay_in_a_saved_info_file(fake_ydl: type[FakeYDL], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    info_file = tmp_path / "out" / "video.info.json"
+def test_what_a_download_writes_of_a_video_leaves_the_cookies_out_and_keeps_everything_else() -> None:
+    import yt_dlp
 
-    def script(ydl: FakeYDL) -> Any:
-        info_file.parent.mkdir(parents=True, exist_ok=True)
-        info_file.write_text(json.dumps({"id": "x", "formats": [{"url": "u", "cookies": "SID=secret"}]}), encoding="utf-8")
-        return ydl.finish_video(infojson_filename=str(info_file))
-
-    monkeypatch.setattr(FakeYDL, "script", staticmethod(script))
-    options = make_options(tmp_path, write_infojson=True, login=LoginSource(browser="firefox"))
-    download_with_ytdlp("u", options, Progress())
-    saved = info_file.read_text(encoding="utf-8")
-    assert "secret" not in saved
-    assert json.loads(saved)["formats"] == [{"url": "u"}]
-
-
-def test_strip_cookies_keeps_everything_else(tmp_path: Path) -> None:
-    path = tmp_path / "a.info.json"
-    path.write_text(json.dumps({"title": "標題", "cookies": "x", "nested": [{"cookies": "y", "keep": 1}]}), encoding="utf-8")
-    strip_cookies_from_info_json(path)
-    assert json.loads(path.read_text(encoding="utf-8")) == {"title": "標題", "nested": [{"keep": 1}]}
+    # Saved files with the cookies a login or a passed check gave are in tests/test_verification.py.
+    info = {"id": "x", "title": "標題", "cookies": "SID=secret", "formats": [{"url": "u", "cookies": "SID=secret", "height": 360}]}
+    written = writing_no_cookies(yt_dlp.YoutubeDL).sanitize_info(info, True)
+    assert "secret" not in json.dumps(written)
+    assert written["title"] == "標題" and written["formats"] == [{"url": "u", "height": 360}]
+    # Only what is written loses them: the info yt-dlp keeps is its own.
+    assert info["cookies"] == info["formats"][0]["cookies"] == "SID=secret"
 
 
 def test_collector_only_lists_files_that_exist(tmp_path: Path) -> None:

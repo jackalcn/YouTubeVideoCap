@@ -571,7 +571,8 @@ def writes_thumbnail(options: DownloadOptions, ffmpeg_available: bool) -> bool:
 
 
 def embeds_infojson(options: DownloadOptions) -> bool:
-    # Only MKV holds attachments. A logged-in download's info.json carries the session cookies.
+    # Only MKV holds attachments. A logged-in download gets none, as the sidebar says: that was for the session cookies,
+    # which downloader.writing_no_cookies now keeps out of every info.json.
     return options.embed_infojson and options.media_type == "video" and options.container == "mkv" and not options.login.is_used
 
 

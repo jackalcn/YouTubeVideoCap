@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -1038,18 +1039,30 @@ class ProgressTracker:
         self.progress_ui.progress(self.fraction, text=" · ".join(parts))
 
 
-def strip_cookies_from_info_json(path: Path) -> None:
-    """yt-dlp copies session cookies into each format's entry, and people share these files without thinking of that."""
+def without_cookies(value: Any) -> Any:
+    """What yt-dlp writes down of a video, without the cookies it keeps with the video and each of its formats so that
+    --load-info-json could download it again. The app never does, and people share these files without thinking of that."""
+    if isinstance(value, dict):
+        return {key: without_cookies(item) for key, item in value.items() if key != "cookies"}
+    if isinstance(value, list):
+        return [without_cookies(item) for item in value]
+    return value
 
-    def clean(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {key: clean(item) for key, item in value.items() if key != "cookies"}
-        if isinstance(value, list):
-            return [clean(item) for item in value]
-        return value
 
-    data = json.loads(path.read_text(encoding="utf-8"))
-    path.write_text(json.dumps(clean(data), ensure_ascii=False), encoding="utf-8")
+@functools.cache
+def writing_no_cookies(base: Any) -> Any:
+    """yt_dlp.YoutubeDL as a download runs it. yt-dlp writes every info.json through sanitize_info: the one beside the
+    video, a playlist's, and the one it attaches to an MKV. Here that leaves the cookies out, whatever they came from: a
+    login, a check passed in a browser window (videocap.verification), or the site itself during the run. No file ever
+    holds them, then, not even the .info.json that yt-dlp writes before the download and a failed download leaves behind.
+    The info yt-dlp keeps in memory is not changed: its downloaders take their cookies from the cookie jar anyway."""
+
+    class NoCookiesWrittenYoutubeDL(base):  # type: ignore[misc, valid-type]
+        @staticmethod
+        def sanitize_info(info_dict: Any, remove_private_keys: bool = False) -> Any:
+            return without_cookies(base.sanitize_info(info_dict, remove_private_keys))
+
+    return NoCookiesWrittenYoutubeDL
 
 
 def estimate_size(info: Mapping[str, Any]) -> Optional[float]:
@@ -1543,7 +1556,7 @@ def download_once(
     stopped = False
     expired_wait = ""
     watchdog = FfmpegWatchdog(should_stop or (lambda: False), options.max_bytes, logger)
-    with watchdog, impersonation.youtube_dl(yt_dlp.YoutubeDL, ydl_opts, url, options.other_sites, refusals) as ydl:
+    with watchdog, impersonation.youtube_dl(writing_no_cookies(yt_dlp.YoutubeDL), ydl_opts, url, options.other_sites, refusals) as ydl:
         if wait_live:
             watch_live_wait(ydl, progress_ui)
         # With skip_download yt-dlp never reaches post_process, and before_dl is the last step it still runs.
@@ -1792,13 +1805,6 @@ def finish_item_sidecars(item: DownloadedItem, options: DownloadOptions, notes: 
                 continue
             if transcript and str(transcript) not in item["extra_paths"]:
                 item["extra_paths"].append(str(transcript))
-    if options.login.is_used:
-        for extra_path in item["extra_paths"]:
-            if extra_path.endswith(".info.json"):
-                try:
-                    strip_cookies_from_info_json(Path(extra_path))
-                except (OSError, ValueError):
-                    pass
     if options.mtime_upload_date:
         # Last, because every step above writes a file.
         try:

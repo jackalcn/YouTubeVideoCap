@@ -15,11 +15,12 @@ from typing import Any, Callable, Iterator, Optional
 import pytest
 import yt_dlp
 
+import videocap.downloader as downloader_module
 import videocap.verification as verification
 from conftest import needs_ffmpeg
 from fake_browser import browser_fixture, real_handler, recording, stand_in_handler  # noqa: F401
 from offline_web import CLEARANCE_COOKIE, LocalSite, new_site_fixture, web_media_fixture  # noqa: F401
-from offline_youtube import duration_of
+from offline_youtube import duration_of, probe
 from videocap import impersonation
 from videocap.downloader import run_download
 from videocap.errors import HUMAN_CHECK, failure_kind
@@ -44,9 +45,9 @@ class Progress:
         pass
 
 
-def owner_options(url: str, folder: Path, **settings: Any) -> DownloadOptions:
+def owner_options(url: str, folder: Path, cookie_file: Optional[Path] = None, **settings: Any) -> DownloadOptions:
     spec = JobSpec(url=url, settings=DownloadSettings(**settings), output_dir=str(folder))
-    return options_from_spec(spec, AccessLimits())
+    return options_from_spec(spec, AccessLimits(), cookie_file=cookie_file)
 
 
 def passed(host: str, clearance: str = "good", expires: Optional[float] = None, **extra: Any) -> VerifiedSession:
@@ -433,6 +434,59 @@ def test_a_file_behind_a_check_downloads_once_the_check_was_passed(browser: Any,
     # The clip refuses a program, so it was asked for as a browser, and still as the one that passed the check.
     assert site.asked_as_a_browser("browsers-only/verified/clip.mp4") >= 1
     assert all(headers["user-agent"] == AGENT for headers in site.headers_for("browsers-only/verified/clip.mp4"))
+
+
+# What a download writes down
+
+
+SECRET = "clearance-that-stays-in-memory"
+
+
+def cookie_file_with(folder: Path, value: str) -> Path:
+    """A cookies.txt that holds the cookie of the site's check, as a login the owner uploads may."""
+    path = folder / "cookies.txt"
+    path.write_text(f"# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t{int(FAR)}\t{CLEARANCE_COOKIE}\t{value}\n", encoding="utf-8")
+    return path
+
+
+def download_behind_a_check(new_site: NewSite, folder: Path, cookie_file: Optional[Path] = None, **settings: Any) -> Any:
+    """A clip that opens only to a request with the cookie of the site's check, downloaded with that cookie: from a check
+    passed in a browser window, or from a login."""
+    site = new_site()
+    site.require_clearance(SECRET, "" if cookie_file else AGENT)
+    site.add_clip("verified/clip.mp4")
+    url = site.add_page("watch.html", ("verified/clip.mp4",), title="Behind a check")
+    if cookie_file is None:
+        verification.verified_sites.add(passed("127.0.0.1", clearance=SECRET))
+    outcome = run_download(url, owner_options(url, folder, cookie_file=cookie_file, **settings), Progress())
+    # The clip came, so the cookie went with the requests for it.
+    assert outcome["errors"] == [] and len(outcome["items"]) == 1
+    return outcome
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("source", ["a passed check", "a login"])
+def test_a_saved_info_json_keeps_no_cookie(new_site: NewSite, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    # A login spaces its videos across the whole app, and this one is to be the first.
+    monkeypatch.setattr(downloader_module, "LOGIN_PACER", downloader_module.LoginPacer())
+    out = tmp_path / "out"
+    download_behind_a_check(new_site, out, cookie_file_with(tmp_path, SECRET) if source == "a login" else None, write_infojson=True)
+    [info_file] = out.glob("*.info.json")
+    text = info_file.read_text(encoding="utf-8")
+    assert SECRET not in text and '"cookies"' not in text
+    # Everything else is as yt-dlp writes it.
+    assert json.loads(text)["formats"]
+
+
+@needs_ffmpeg
+def test_an_info_json_embedded_in_mkv_keeps_no_cookie_of_a_passed_check(new_site: NewSite, tmp_path: Path) -> None:
+    outcome = download_behind_a_check(new_site, tmp_path, container="mkv", embed_infojson=True)
+    path = Path(outcome["items"][0]["path"])
+    # It is in the file, as its one attachment.
+    attachments = [stream for stream in probe(path)["streams"] if stream.get("codec_type") == "attachment"]
+    assert path.suffix == ".mkv" and [stream["tags"]["mimetype"] for stream in attachments] == ["application/json"]
+    data = path.read_bytes()
+    assert SECRET.encode() not in data and b'"cookies"' not in data
 
 
 def test_a_check_that_was_passed_for_another_site_changes_nothing() -> None:
