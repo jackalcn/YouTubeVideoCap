@@ -16,6 +16,8 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from conftest import has_ffmpeg
+
 
 # Two clips that differ in picture, sound and size, so a test can tell which site's file it has.
 CLIP_VARIANTS = {
@@ -112,7 +114,7 @@ class SiteHandler(http.server.SimpleHTTPRequestHandler):
 class LocalSite:
     """One site: a folder served over HTTP on a port of its own. Two of them are two different sites to yt-dlp."""
 
-    def __init__(self, root: Path, media: dict[str, Path]) -> None:
+    def __init__(self, root: Path, media: WebMedia | dict[str, Path]) -> None:
         self.root = root
         self.media = media
         self.requests: list[str] = []
@@ -251,15 +253,30 @@ def make_clip(target: Path, variant: str) -> Path:
     return target
 
 
+class WebMedia:
+    """The clips every site hands out, each made the first time a site hands it out. A site of pages and playlists
+    only, as most tests of a page's own scripts are, then needs no ffmpeg, which macOS Smoke runs the tests without."""
+
+    def __init__(self, folder: Callable[[], Path]) -> None:
+        self.folder = folder
+        self.clips: dict[str, Path] = {}
+
+    def __getitem__(self, variant: str) -> Path:
+        if variant not in self.clips:
+            if not has_ffmpeg:
+                pytest.skip("ffmpeg is not installed")
+            self.clips[variant] = make_clip(self.folder() / f"{variant}.mp4", variant)
+        return self.clips[variant]
+
+
 @pytest.fixture(name="web_media", scope="session")
-def web_media_fixture(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
-    """The clips every site hands out, made once."""
-    folder = tmp_path_factory.mktemp("web-media")
-    return {variant: make_clip(folder / f"{variant}.mp4", variant) for variant in CLIP_VARIANTS}
+def web_media_fixture(tmp_path_factory: pytest.TempPathFactory) -> WebMedia:
+    """The clips every site hands out, each made once."""
+    return WebMedia(functools.cache(lambda: tmp_path_factory.mktemp("web-media")))
 
 
 @pytest.fixture(name="new_site")
-def new_site_fixture(tmp_path_factory: pytest.TempPathFactory, web_media: dict[str, Path]) -> Iterator[Callable[[], LocalSite]]:
+def new_site_fixture(tmp_path_factory: pytest.TempPathFactory, web_media: WebMedia) -> Iterator[Callable[[], LocalSite]]:
     """Makes a site each time it is called, and closes them all afterwards."""
     sites: list[LocalSite] = []
 
