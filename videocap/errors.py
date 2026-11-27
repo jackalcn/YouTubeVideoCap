@@ -56,7 +56,9 @@ LEADING_TAG_RE = re.compile(r"\[([^\]]+)\]")
 YOUTUBE_PREFIX = "youtube"
 # The two messages that name no extractor, only the link nothing could read.
 UNREADABLE_LINK_RE = re.compile(r"(?:unsupported url: |found for url )(\S+)")
-# A site's name in a hint already given, which is short and holds no sentence's punctuation.
+# A site's name in a hint already given, which is short and holds no sentence's punctuation. A Latin name has a space
+# on either side of it, which counts.
+SITE_NAME_LENGTH = 38
 SITE_IN_HINT = r"[^，。：\n]{1,40}?"
 # Chinese characters, which a Latin name is set off from by spaces.
 CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -451,12 +453,17 @@ def humanize_ytdlp_error(message: str, url: str = "", browser_advice: str = "", 
     return f"{text}{browser_advice if hint.kind == IMPERSONATION else ''}（原始訊息：{cut_at_a_sentence(cleaned)}）"
 
 
-def humanize_human_check(message: str, url: str = "") -> str:
+def humanize_human_check(message: str, url: str = "", host: str = "") -> str:
     """yt-dlp's message for a refusal that the caller knows to be a site's check for a person: the try that passed
-    for a browser was answered with it."""
+    for a browser was answered with it. `host` names the site outright, for a check met somewhere other than at the
+    link the person gave: at a stream of its page, or at a page that it embeds. The message may be empty, when the
+    check was met while the app itself read a page and yt-dlp said nothing."""
     cleaned = message.removeprefix("ERROR: ").strip()
     hint = next(hint for hint in YTDLP_ERROR_HINTS if hint.kind == HUMAN_CHECK)
-    return f"{hint.text_for(site_in_message(cleaned, url) or UNNAMED_SITE)}（原始訊息：{cut_at_a_sentence(cleaned)}）"
+    # A name longer than a hint may hold would no longer be told for this hint: see SITE_IN_HINT.
+    site = host if 0 < len(host) <= SITE_NAME_LENGTH else site_in_message(cleaned, url) or UNNAMED_SITE
+    text = str(hint.text_for(site))
+    return f"{text}（原始訊息：{cut_at_a_sentence(cleaned)}）" if cleaned else text
 
 
 # What a person is told whose Referer is the address of a stream or a file: no page's player sends that, and a site that
@@ -480,6 +487,27 @@ def add_referer_advice(message: str, referer: str) -> str:
     if not referer or not is_media_link(referer) or failure_kind(message) not in (HTTP_403, STREAM_REFUSED, HUMAN_CHECK):
         return message
     advice = referer_advice(referer)
+    return message if advice in message else f"{message}\n\n{advice}"
+
+
+# What a person is told whose Referer took the place of the one a page's player, or a page it embeds, would have sent,
+# when the site then refused. The app's own hint for an HTTP 403 says to fill a Referer in, and the Referer that was
+# right for one link is sent with every other.
+REFERER_OVER_THE_PLAYERS = (
+    "「進階 yt-dlp 參數」的來源網頁（Referer：{owner}）蓋過了 App 照播放器算出來的來源（{computed}）。"
+    "這個網站可能只接受後者；如果這一行是之前照 HTTP 403 的提示填的，可以拿掉再試一次。"
+)
+
+
+def add_overridden_referer_advice(message: str, owner: str, computed: str) -> str:
+    """A site's refusal of what a page's search found, with a word on the owner's Referer when it was sent in place of
+    the one the app had worked out. A Referer that is the address of a stream has advice of its own: see
+    add_referer_advice."""
+    if not owner or not computed or owner == computed or is_media_link(owner):
+        return message
+    if failure_kind(message) not in (HTTP_403, STREAM_REFUSED, HUMAN_CHECK):
+        return message
+    advice = REFERER_OVER_THE_PLAYERS.format(owner=owner, computed=computed)
     return message if advice in message else f"{message}\n\n{advice}"
 
 

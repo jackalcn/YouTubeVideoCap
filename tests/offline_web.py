@@ -86,7 +86,13 @@ class SiteHandler(http.server.SimpleHTTPRequestHandler):
         self.site.seen.append((self.path, {name.lower(): value for name, value in self.headers.items()}))
         unreferred = REFERRED_FOLDER in self.path and not self.site.accepts_referer(self.headers.get("Referer", ""))
         unverified = VERIFIED_FOLDER in self.path and not self.site.accepts_clearance(self.headers.get("Cookie", ""), self.headers.get("User-Agent", ""))
-        if self.path.startswith(REFUSED_PREFIX) or (self.path.startswith(BROWSERS_ONLY_PREFIX) and not as_browser) or unreferred:
+        moved_to = self.site.moved.get(self.path.split("?")[0])
+        if moved_to:
+            self.send_response(302, "Found")
+            self.send_header("Location", moved_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path.startswith(REFUSED_PREFIX) or (self.path.startswith(BROWSERS_ONLY_PREFIX) and not as_browser) or unreferred:
             self.send_error(403, "Forbidden")
         elif self.path.startswith(PERSON_ONLY_PREFIX) or unverified or (self.path.startswith(CHECKED_PREFIX) and not as_browser) or (
             self.path.startswith(FLAKY_PREFIX) and self.site.turns_away_first(self.path)
@@ -130,6 +136,8 @@ class LocalSite:
         self.clearance_agent = ""
         # The addresses under FLAKY_PREFIX that have been asked for once.
         self.asked_once: set[str] = set()
+        # The paths that answer with a redirect, each to its new address.
+        self.moved: dict[str, str] = {}
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(SiteHandler, site=self))
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -181,7 +189,16 @@ class LocalSite:
     def add_iframe_page(self, name: str, frame_src: str, title: str = "Local page") -> str:
         """A page whose only player is in an <iframe> of its own: nothing in the outer page's text says where its
         stream is either."""
-        return self.write_page(name, title, f'<iframe src="{frame_src}"></iframe>')
+        return self.add_framing_page(name, f'src="{frame_src}"', title=title)
+
+    def add_framing_page(self, name: str, *iframes: str, title: str = "Local page") -> str:
+        """A page of nothing but <iframe>s, each given as the attributes of its tag, in this order."""
+        return self.write_page(name, title, "".join(f"<iframe {attributes}></iframe>" for attributes in iframes))
+
+    def add_redirect(self, name: str, target: str) -> str:
+        """An address that sends whoever asks for it on to another."""
+        self.moved[f"/{name.lstrip('/')}"] = target
+        return self.url(name)
 
     def add_embedded_player(self, name: str, stream: str, title: str = "Embedded player") -> str:
         """A small, dedicated player document, as an <iframe> often holds one of its own: writes its stream's address

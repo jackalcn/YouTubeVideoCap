@@ -602,7 +602,8 @@ def render_link_report(ctx: AppContext, report: LinkReport, index: int) -> None:
         if report.get("error"):
             st.error(f"{escape_markdown(report.get('url', ''))}\n\n{escape_markdown(report.get('error', ''))}")
             if asks_for_a_person(report["error"]):
-                render_site_verification(ctx, report.get("url", ""), key=f"report_{index}", next_step=REPORT_NEXT_STEP)
+                # The check is passed where it was met, which a page's stream or a page it embeds may put on another site.
+                render_site_verification(ctx, report.get("verify_url") or report.get("url", ""), key=f"report_{index}", next_step=REPORT_NEXT_STEP)
             return
 
         thumbnail_col, info_col = st.columns([1, 2])

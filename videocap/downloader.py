@@ -68,11 +68,12 @@ from videocap.options import (
     entry_filter_reason,
     expected_final_extension,
     fallback_player_clients,
+    options_for_candidate,
     owner_referer,
     waits_for_live,
     writes_thumbnail,
 )
-from videocap.page_streams import PageStream, find_streams, holds_no_video
+from videocap.page_streams import STREAM, PageStream, StreamSearch, holds_no_video
 from videocap.processes import end_process_tree, remove_when_released, tie_to_app, tied_popen_options
 from videocap.sidecars import release_time, set_file_times, write_comments_csv, write_live_chat_csv, write_music_tags, write_nfo
 from videocap.sites import MEDIA_SNIFF_BYTES, URL_NAMED_EXTRACTORS, host_of, is_youtube_url, media_extension_from_bytes, url_keyed_id
@@ -242,6 +243,9 @@ class DownloadOutcome(TypedDict):
     archived_skips: int
     partial_paths: list[str]
     stopped: bool
+    # With an error that is a site's check for a person: the address that answered with it, where the check is to be
+    # passed. "" when there is none, and missing from an outcome restored from a job saved before it was kept.
+    verify_url: str
 
 
 class StatusUI(Protocol):
@@ -619,8 +623,12 @@ class UrlKeyedIdPP(PostProcessor):
 
 
 class PageStreamPP(PostProcessor):
-    """Gives a stream that a page's packed player script gave away what the page says of it: its address, its title and
-    its picture. yt-dlp saw a playlist called "playlist" and nothing more.
+    """Gives what a page's search led to (see videocap.page_streams) what the page says of it: its address, its title
+    and its picture. yt-dlp saw a playlist called "playlist", or an embedded page called "player", and nothing more.
+
+    Only what yt-dlp names after a file or a page is given the page's name. A video that a site's own extractor read,
+    as when the page embeds a player of YouTube or of another site yt-dlp knows, has that site's title, picture and
+    ID, and keeps them, as it would for a link to it.
 
     Runs at pre_process before UrlKeyedIdPP, which then keys the ID on the page, and before yt-dlp names a file."""
 
@@ -630,7 +638,7 @@ class PageStreamPP(PostProcessor):
 
     def run(self, information: Any) -> tuple[list[str], Any]:
         # A list's flat entries pass through here too, before they are videos.
-        if not information.get("id"):
+        if not information.get("id") or str(information.get("extractor_key") or "").lower() not in URL_NAMED_EXTRACTORS:
             return [], information
         information["webpage_url"] = information["original_url"] = self.page.page_url
         if self.page.title:
@@ -1203,6 +1211,16 @@ def refusal_in(messages: list[str], warnings: list[str]) -> str:
     return next((text for text in [*messages, *warnings] if FORBIDDEN_MARKER in text.lower()), messages[0] if messages else "")
 
 
+def tell_of_human_check(message: str, url: str, options: DownloadOptions, refusals: impersonation.Refusals) -> tuple[str, str]:
+    """What a person is told of a site's check for a person, in yt-dlp's words for the refusal, and the address that
+    answered with the check, which is where it is to be passed. The site is named outright when it is not plainly
+    the one of the link the person gave: when the check was met at another site than the link's, as a stream's may
+    be, or by a run for something a page led to."""
+    met_at = refusals.challenged_at or url
+    elsewhere = bool(options.page_stream) or host_of(met_at) != host_of(url)
+    return humanize_human_check(message, url, host_of(met_at) if elsewhere else ""), met_at
+
+
 def refused_as_a_program(
     url: str, options: DownloadOptions, outcome: DownloadOutcome, failures: list[tuple[str, str]], refusals: impersonation.Refusals
 ) -> bool:
@@ -1233,7 +1251,9 @@ def download_as_a_browser(
     outcome, failures = download_once(url, replace(options, impersonate=True), progress_ui, status_ui, should_stop, on_log, refusals)
     if failures and refusals.challenged and not outcome["items"]:
         # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
-        outcome["errors"] = [humanize_human_check(refusal_in([message for message, _ in failures], outcome["warnings"]), url)]
+        message = refusal_in([message for message, _ in failures], outcome["warnings"])
+        told, outcome["verify_url"] = tell_of_human_check(message, url, options, refusals)
+        outcome["errors"] = [told]
     for key in ("skipped", "warnings", "notes", "partial_paths"):
         outcome[key] = [*first[key], *(entry for entry in outcome[key] if entry not in first[key])]  # type: ignore[literal-required]
     if outcome["items"]:
@@ -1243,8 +1263,21 @@ def download_as_a_browser(
     return outcome
 
 
-PAGE_STREAM_MESSAGE = "這個網頁沒有直接列出影片，改讀它的播放器腳本，找到串流網址再下載。"
+PAGE_STREAM_MESSAGE = "這個網頁沒有直接列出影片，改找它的播放器腳本和內嵌網頁。"
+PAGE_STREAM_TRY_MESSAGE = "這個網頁（{page}）沒有直接列出影片，改試{candidate}。"
 PAGE_STREAM_NOTE = "這個網頁沒有直接列出影片：串流網址取自它的播放器腳本（{host}），下載時以這個網頁當來源網頁（Referer）。"
+# For what was found in a page that the page embeds, or is one, with PageStream.source for where.
+EMBEDDED_STREAM_NOTE = "這個網頁沒有直接列出影片：{source}，下載時以那個內嵌網頁當來源網頁（Referer）。串流在 {host}。"
+EMBEDDED_NOTE = "這個網頁沒有直接列出影片：{source}。"
+
+
+def page_stream_note(candidate: PageStream) -> str:
+    """The note of a download that came by a page's search: where the video was found."""
+    if candidate.kind != STREAM:
+        return EMBEDDED_NOTE.format(source=candidate.source())
+    if candidate.frame:
+        return EMBEDDED_STREAM_NOTE.format(source=candidate.source(), host=host_of(candidate.address))
+    return PAGE_STREAM_NOTE.format(host=host_of(candidate.address))
 
 
 def page_without_a_video(url: str, options: DownloadOptions, outcome: DownloadOutcome) -> bool:
@@ -1266,24 +1299,37 @@ def download_stream_in_page(
     should_stop: Optional[Callable[[], bool]] = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> DownloadOutcome:
-    """A page that holds no video yt-dlp can see, or whose own pick among what it saw was refused: a stream that its
-    player script, or an iframe of its own, gives away instead (see videocap.page_streams) is downloaded in the page's
-    name, asked for as whichever of them really held the player would ask for it. The outcome stands as it is when
-    nothing better is found. Once a stream is found, its outcome replaces the page's own."""
+    """A page that holds no video yt-dlp can see, or whose own pick among what it saw was refused: what a search of the
+    page leads to instead (see videocap.page_streams.StreamSearch) is downloaded, each candidate tried in turn until
+    one works. Its outcome then replaces the page's own, with a note of where the video was found. When none works,
+    the outcome is the one that the search's word is about, or the page's own when nothing better was found."""
     if not page_without_a_video(url, options, outcome) or (should_stop and should_stop()):
         return outcome
-    streams = find_streams(build_read_options(options, impersonation.Silent()), url, options.other_sites)
-    if not streams:
-        return outcome
-    if on_log:
-        on_log(PAGE_STREAM_MESSAGE)
-    progress_ui.progress(0.0, text=PAGE_STREAM_MESSAGE)
-    result = outcome
-    for stream in streams:
-        result = download_with_ytdlp(stream.address, replace(options, page_stream=stream), progress_ui, status_ui, should_stop, on_log)
+    search = StreamSearch(build_read_options(options, impersonation.Silent()), url, options.other_sites, should_stop)
+    partial_paths: list[str] = []
+    for candidate in search.candidates():
+        if not search.tried:
+            progress_ui.progress(0.0, text=PAGE_STREAM_MESSAGE)
+        if on_log:
+            on_log(PAGE_STREAM_TRY_MESSAGE.format(page=url, candidate=candidate.name()))
+        result = download_with_ytdlp(candidate.address, options_for_candidate(options, candidate), progress_ui, status_ui, should_stop, on_log)
+        partial_paths.extend(path for path in result["partial_paths"] if path not in partial_paths)
         if result["items"] or result["stopped"]:
-            break
-    result["notes"].insert(0, PAGE_STREAM_NOTE.format(host=host_of(stream.address)))
+            result["notes"].insert(0, page_stream_note(candidate))
+            result["partial_paths"] = partial_paths
+            return result
+        search.failed(candidate, result["errors"][0] if result["errors"] else "", result.get("verify_url", ""), result)
+    if should_stop and should_stop():
+        outcome["stopped"] = True
+        return outcome
+    failure = search.failure(outcome["errors"][0] if outcome["errors"] else "")
+    result = outcome
+    if failure.tried:
+        result = cast(DownloadOutcome, failure.tried.result)
+        result["notes"].insert(0, page_stream_note(failure.tried.stream))
+    result["errors"] = [failure.error, *result["errors"][1:]]
+    result["verify_url"] = failure.verify_url
+    result["partial_paths"] = [*result["partial_paths"], *(path for path in partial_paths if path not in result["partial_paths"])]
     return result
 
 
@@ -1869,6 +1915,7 @@ def empty_outcome() -> DownloadOutcome:
         "archived_skips": 0,
         "partial_paths": [],
         "stopped": False,
+        "verify_url": "",
     }
 
 

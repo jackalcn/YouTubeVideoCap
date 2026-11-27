@@ -26,8 +26,9 @@ from videocap.downloader import (
     YtDlpLogCollector,
     estimate_size,
     refusal_in,
+    tell_of_human_check,
 )
-from videocap.errors import STREAM_REFUSED, add_referer_advice, failure_kind, humanize_human_check, humanize_ytdlp_error
+from videocap.errors import STREAM_REFUSED, add_referer_advice, failure_kind, humanize_ytdlp_error
 from videocap.options import (
     DownloadOptions,
     LoginSource,
@@ -37,9 +38,10 @@ from videocap.options import (
     build_format_options,
     build_read_options,
     expected_final_extension,
+    options_for_candidate,
     owner_referer,
 )
-from videocap.page_streams import find_streams, holds_no_video
+from videocap.page_streams import StreamSearch, holds_no_video
 from videocap.sidecars import comment_rows, write_csv
 from videocap.tooling import format_bytes, format_duration, get_ffmpeg_status
 from videocap.sites import is_youtube_url, site_label
@@ -53,9 +55,6 @@ DRM_MARKER = "drm protected"
 UNKNOWN = "未知"
 # The extension yt-dlp gives audio it takes out of its container without converting it.
 ORIGINAL_AUDIO_EXTENSIONS = {"opus": "opus", "mp4a": "m4a", "vorbis": "ogg", "mp3": "mp3", "flac": "flac"}
-# What the report of a page says when its video was found in the page's own player script, and when that failed.
-PAGE_STREAM_DETAIL = "串流取自網頁的播放器腳本"
-PAGE_STREAM_FOUND_BUT_FAILED = "這個網頁沒有直接列出影片，它的播放器腳本裡有串流網址，但無法讀取："
 
 SubtitleRow = dict[str, str]
 FormatRow = dict[str, str]
@@ -82,6 +81,9 @@ class ChapterRow(TypedDict):
 class LinkReport(TypedDict, total=False):
     url: str
     error: str
+    # With an error that is a site's check for a person: the address that answered with it, which is where the check
+    # is to be passed. Not always the link's own: a page's stream, or a page that it embeds, may be on another site.
+    verify_url: str
     video_id: str
     # The yt-dlp extractor that read the link, in lower case, and the site's name for the person.
     extractor: str
@@ -423,7 +425,7 @@ def read_link(url: str, options: DownloadOptions) -> LinkReport:
         report, failure = inspect_once(url, options, refusals)
         if failure and refusals.challenged:
             # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
-            report["error"] = humanize_human_check(failure, url)
+            report["error"], report["verify_url"] = tell_of_human_check(failure, url, options, refusals)
             return report
     # A page that gave nothing away, or whose own page was let through while yt-dlp's pick among what it found was
     # refused (see videocap.errors.STREAM_REFUSED): either way, the page's own scripts and iframes may know a better one.
@@ -435,20 +437,23 @@ def read_link(url: str, options: DownloadOptions) -> LinkReport:
 
 
 def inspect_stream_in_page(url: str, options: DownloadOptions, report: LinkReport) -> LinkReport:
-    """A page that holds no video yt-dlp can see, or whose own pick among what it saw was refused: the report of a
-    stream that the page's player script, or an iframe of its own, gives away instead (see videocap.page_streams), in
-    the page's name. The page's own report (or the refusal already given) stands when nothing better is found. When
-    it gives one away that cannot be read either, that is what the report says."""
-    streams = find_streams(build_read_options(options, impersonation.Silent()), url, options.other_sites)
-    failed: LinkReport = report
-    for stream in streams:
-        found = inspect_link(stream.address, replace(options, page_stream=stream))
+    """A page that holds no video yt-dlp can see, or whose own pick among what it saw was refused: the report of what
+    a search of the page leads to instead (see videocap.page_streams.StreamSearch), which is the first of its
+    candidates that can be read. When none can, the report says what the search makes of that, which is the page's own
+    report when nothing better was found."""
+    search = StreamSearch(build_read_options(options, impersonation.Silent()), url, options.other_sites)
+    for candidate in search.candidates():
+        found = inspect_link(candidate.address, options_for_candidate(options, candidate))
         if not found.get("error"):
             found["url"] = url
             found["site"] = site_label(found.get("extractor", ""), url)
-            found["details"] = [PAGE_STREAM_DETAIL, *found.get("details", [])]
+            found["details"] = [candidate.source(), *found.get("details", [])]
             return found
-        failed = {"url": url, "error": f"{PAGE_STREAM_FOUND_BUT_FAILED}{found['error']}"}
+        search.failed(candidate, found["error"], found.get("verify_url", ""))
+    failure = search.failure(report["error"])
+    failed: LinkReport = {"url": url, "error": failure.error}
+    if failure.verify_url:
+        failed["verify_url"] = failure.verify_url
     return failed
 
 

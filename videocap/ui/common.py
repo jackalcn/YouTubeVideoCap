@@ -960,12 +960,14 @@ def render_job_result(job: Job, ctx: AppContext) -> None:
     if job.kind == KIND_TOOL:
         render_tool_result(job, ctx)
     elif job.outcome:
-        render_download_outcome(cast(DownloadOutcome, job.outcome), f"job_{job.id}", ctx, job.state)
+        outcome = cast(DownloadOutcome, job.outcome)
+        render_download_outcome(outcome, f"job_{job.id}", ctx, job.state)
         payload = job.payload
         if isinstance(payload, DownloadPayload) and any(asks_for_a_person(message) for message in outcome_errors(job)):
             # The same try again as the card's, for a job that stopped; one that finished has its own for the videos left.
             retry = partial(retry_job, job, ctx) if job.state in (FAILED, CANCELED) else None
-            render_site_verification(ctx, payload.spec.url, key=f"job_{job.id}", retry=retry)
+            # The check is passed where it was met, which a page's stream or a page it embeds may put on another site.
+            render_site_verification(ctx, outcome.get("verify_url") or payload.spec.url, key=f"job_{job.id}", retry=retry)
     elif job.error:
         st.error(escape_markdown(job.error))
 

@@ -87,6 +87,8 @@ class Refusals:
     forbidden: int = 0
     # One of them with Cloudflare's challenge header: the site wants a person to pass its check.
     challenged: bool = False
+    # The first address that was answered with that check: the site whose check it is, which need not be the link's.
+    challenged_at: str = ""
     # The addresses that were answered so, which tell a refused page from a refused stream.
     addresses: list[str] = field(default_factory=list)
 
@@ -94,8 +96,11 @@ class Refusals:
         if error.status != HTTP_FORBIDDEN:
             return
         self.forbidden += 1
-        self.challenged = self.challenged or is_challenge(error)
-        self.addresses.append(str(error.response.url))
+        address = str(error.response.url)
+        if is_challenge(error):
+            self.challenged = True
+            self.challenged_at = self.challenged_at or address
+        self.addresses.append(address)
 
 
 class Silent:

@@ -47,7 +47,7 @@ from videocap.config import (
 )
 # Imported by everything that builds a YoutubeDL: importing it is what keeps impersonation away from YouTube.
 from videocap import impersonation
-from videocap.page_streams import PageStream
+from videocap.page_streams import PLAIN, PageStream
 from videocap.settings import DownloadSettings, JobSpec
 from videocap.sites import is_youtube_url, merge_http_headers
 from videocap.urls import apply_channel_tab, parse_date_filter, parse_time_ranges, url_identity, validate_playlist_items
@@ -398,10 +398,18 @@ def build_base_options(
         # yt-dlp's option for the whole run, because its generic extractor's own switch covers only the first request
         # and leaves out a stream's playlist and segments. impersonation.youtube_dl drops it again for a YouTube link.
         base_opts["impersonate"] = impersonation.any_browser()
-    if page_stream and other_sites:
-        # Under the owner's own headers, which build_ydl_options and build_read_options put over these.
+    if page_stream and other_sites and not is_youtube_url(page_stream.address):
+        # Under the owner's own headers, which build_ydl_options and build_read_options put over these. Never to
+        # YouTube, which is asked as it is for a link pasted by itself.
         base_opts["http_headers"] = page_stream.headers()
     return base_opts
+
+
+def options_for_candidate(options: DownloadOptions, candidate: PageStream) -> DownloadOptions:
+    """The options of the run that tries one of the candidates a page's search hands out (see videocap.page_streams):
+    the page's own, with the candidate as the stream its requests and its name are those of. A link that is tried as
+    one pasted by itself, as an embedded YouTube player's is, carries nothing of the page."""
+    return replace(options, page_stream=None if candidate.kind == PLAIN else candidate)
 
 
 # What the owner's extra yt-dlp options may still say when nothing is saved: how requests are made, and nothing about

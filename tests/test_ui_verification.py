@@ -39,6 +39,9 @@ from videocap.ui.verify import (
 
 PAGE = "https://site.example/watch/1"
 WANTS_A_PERSON = humanize_human_check("ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden", PAGE)
+# A page that the link's page embeds, on another site, whose check it was.
+EMBEDDED = "https://frame.example/embed/1"
+WANTS_A_PERSON_THERE = humanize_human_check("ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden", EMBEDDED, "frame.example")
 FAR = time.time() + 365 * 24 * 3600
 SERVICES: list[Any] = []
 
@@ -198,6 +201,27 @@ def test_the_result_of_another_sites_window_is_not_said_here(monkeypatch: pytest
     assert "other.example" not in texts(app.success) and OPEN_LABEL in labels(app)
 
 
+def test_a_check_met_at_a_page_that_the_link_embeds_is_passed_at_that_pages_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[str] = []
+    opened = StandInWindow(EMBEDDED)
+    monkeypatch.setattr(verification, "start_window", lambda url, sites=None, proxy="": asked.append(url) or setattr(verification, "_current", opened) or opened)
+    app = download_page({**report(WANTS_A_PERSON_THERE), "verify_url": EMBEDDED})
+    # The report is the link's; the window is for the site that asked for a person.
+    assert "要求真人驗證" in texts(app.error)
+    button(app, OPEN_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert asked == [EMBEDDED] and {FINISH_LABEL, CANCEL_LABEL} <= set(labels(app))
+
+
+def test_a_check_passed_at_an_embedded_pages_site_tells_the_links_report_what_to_do_next(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verification, "_current", StandInWindow(EMBEDDED, state=verification.PASSED, message="已通過驗證：frame.example。"))
+    app = download_page({**report(WANTS_A_PERSON_THERE), "verify_url": EMBEDDED})
+    assert f"已通過驗證：frame.example。{REPORT_NEXT_STEP}" in texts(app.success)
+    # A window for the link's own site says nothing of a check that was met elsewhere.
+    monkeypatch.setattr(verification, "_current", StandInWindow(PAGE, state=verification.PASSED, message="已通過驗證：site.example。"))
+    assert "已通過驗證" not in texts(download_page({**report(WANTS_A_PERSON_THERE), "verify_url": EMBEDDED}).success)
+
+
 def test_a_failure_of_any_other_kind_has_no_button() -> None:
     app = download_page(report("這個網站拒絕了下載請求（HTTP 403）。"))
     assert OPEN_LABEL not in labels(app)
@@ -237,12 +261,13 @@ def test_a_public_visitor_is_offered_nothing(monkeypatch: pytest.MonkeyPatch) ->
 # Under a job's failure
 
 
-def failed_job(error: str) -> Job:
+def failed_job(error: str, verify_url: str = "") -> Job:
     from videocap.ui.context import get_services
 
     spec = JobSpec(url=PAGE, settings=DownloadSettings(), output_dir="out")
     outcome = empty_outcome()
     outcome["errors"] = [error]
+    outcome["verify_url"] = verify_url
     job = Job(id=new_job_id(), owner="local", kind="download", label="x", payload=DownloadPayload(spec, AccessLimits()), state=FAILED, outcome=outcome, finished_at=time.time())
     services = get_services(False)
     SERVICES.append(services)
@@ -277,6 +302,31 @@ def test_a_job_that_failed_on_a_check_has_the_button_for_its_own_link(monkeypatc
     button(app, OPEN_LABEL).click().run()
     assert not app.exception, app.exception
     assert verification.current_window() is opened and FINISH_LABEL in labels(app)
+
+
+def test_a_job_that_failed_on_a_check_met_past_its_link_has_the_button_for_where_it_was_met(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[str] = []
+    monkeypatch.setattr(verification, "start_window", lambda url, sites=None, proxy="": asked.append(url) or None)
+    failed_job(WANTS_A_PERSON_THERE, EMBEDDED)
+    # One saved before the place was kept has only its link to go by.
+    del failed_job(WANTS_A_PERSON).outcome["verify_url"]
+    app = run_results()
+    for position in range(2):
+        [item for item in app.button if str(item.label) == OPEN_LABEL][position].click().run()
+        assert not app.exception, app.exception
+    assert sorted(asked) == sorted([EMBEDDED, PAGE])
+
+
+def test_a_job_whose_check_was_passed_past_its_link_can_be_tried_again_from_its_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verification, "_current", StandInWindow(EMBEDDED, state=verification.PASSED, message="已通過驗證：frame.example。"))
+    job = failed_job(WANTS_A_PERSON_THERE, EMBEDDED)
+    retried: list[str] = []
+    monkeypatch.setattr(common, "retry_job", lambda job, ctx: retried.append(job.id))
+    app = run_results()
+    assert "已通過驗證：frame.example。" in texts(app.success)
+    button(app, RETRY_LABEL).click().run()
+    assert not app.exception, app.exception
+    assert retried == [job.id]
 
 
 def test_a_job_whose_check_was_passed_can_be_tried_again_from_its_result(monkeypatch: pytest.MonkeyPatch) -> None:
