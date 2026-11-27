@@ -49,7 +49,7 @@ from videocap.config import (
 from videocap import impersonation
 from videocap.page_streams import PageStream
 from videocap.settings import DownloadSettings, JobSpec
-from videocap.sites import is_youtube_url
+from videocap.sites import is_youtube_url, merge_http_headers
 from videocap.urls import apply_channel_tab, parse_date_filter, parse_time_ranges, url_identity, validate_playlist_items
 
 
@@ -422,17 +422,6 @@ REQUEST_YTDLP_KEYS = frozenset(
         "sleep_interval_requests",
     }
 )
-
-
-def merge_http_headers(*parts: Mapping[str, str]) -> dict[str, str]:
-    """Headers from several sources, the later ones winning. Names are matched without regard to case, as HTTP does and
-    as yt-dlp does when it adds its own. A value has no spaces around it: --add-headers "Referer: https://..." leaves
-    the one after the colon in the value."""
-    merged: dict[str, str] = {}
-    for part in parts:
-        for name, value in part.items():
-            merged[name.title()] = str(value).strip()
-    return merged
 
 
 def owner_referer(extra: ExtraYtDlpOptions) -> str:

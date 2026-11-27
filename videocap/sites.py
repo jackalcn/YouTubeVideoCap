@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import functools
 import hashlib
-from typing import Any
+import ipaddress
+from typing import Any, Mapping, Optional
 from urllib.parse import urldefrag, urlparse, urlunparse
 
 from videocap.config import YOUTUBE_HOSTS
@@ -21,6 +22,9 @@ STUDIO_HOST = "studio.youtube.com"
 TRACKING_PREFIXES = ("utm_",)
 TRACKING_NAMES = frozenset({"fbclid", "gclid", "dclid", "msclkid", "igshid", "igsh", "yclid", "mc_cid", "mc_eid"})
 
+# Names that only a machine's own network answers to: its own (RFC 6761), those found on the local link (mDNS), and the
+# suffixes that home and office networks give their machines. None is a suffix of the public internet.
+PRIVATE_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa")
 # A link that ends in one of these names a media file or a stream's playlist itself.
 MEDIA_LINK_EXTENSIONS = frozenset(
     {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".flv", ".avi", ".ts", ".m3u8", ".mpd", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wav"}
@@ -80,6 +84,75 @@ def host_of(url: str) -> str:
         return (urlparse(url).hostname or "").lower()
     except ValueError:
         return ""
+
+
+def is_private_address(address: str) -> bool:
+    """Whether this IP address, written the ordinary way, is this machine's own or one of a private network: anything
+    that is not an address of the public internet. Text that is no address at all counts as one too."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    # ::ffff:127.0.0.1 is 127.0.0.1 to whatever connects to it, which not every Python's ipaddress says.
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    parsed = mapped if mapped is not None else parsed
+    return not parsed.is_global or parsed.is_multicast
+
+
+def ipv4_number(part: str) -> Optional[int]:
+    """One part of an IPv4 address as a browser reads it: decimal, octal after a 0, hexadecimal after 0x."""
+    digits, base = (part[2:], 16) if part.startswith("0x") else (part[1:], 8) if len(part) > 1 and part.startswith("0") else (part, 10)
+    if not digits:
+        return 0 if base == 16 else None
+    try:
+        # int() also takes signs, spaces and underscores, which no address has.
+        return int(digits, base) if digits.isascii() and digits.isalnum() else None
+    except ValueError:
+        return None
+
+
+def spelled_ipv4(host: str) -> Optional[str]:
+    """The IPv4 address that a host made of numbers stands for, as the URL standard reads it and as what connects
+    reads it: 127.1, 2130706433, 0x7f.0.0.1 and 0177.0.0.1 are all 127.0.0.1. None for a host that is a name. "" for
+    one that ends in a number and is no address, which no name does."""
+    parts = host.split(".")
+    if ipv4_number(parts[-1]) is None:
+        return None
+    numbers = [ipv4_number(part) for part in parts]
+    if len(parts) > 4 or any(number is None for number in numbers):
+        return ""
+    *leading, last = [number for number in numbers if number is not None]
+    if any(number > 255 for number in leading) or last >= 256 ** (4 - len(leading)):
+        return ""
+    value = last + sum(number << (8 * (3 - position)) for position, number in enumerate(leading))
+    return str(ipaddress.IPv4Address(value))
+
+
+def is_private_host(host: str) -> bool:
+    """Whether a host, by how it is written alone, is this machine or one of its own network: localhost, a name with
+    no dot or with a suffix only a private network gives, or a private address in any of the ways one can be written.
+    Nothing is looked up, so a name that only resolves to such an address is not caught here. A page that leads a
+    reader to such a host would have the app ask this machine's own network on the page's behalf."""
+    name = host.lower().removesuffix(".")
+    if not name:
+        return False
+    if ":" in name:
+        return is_private_address(name)
+    address = spelled_ipv4(name)
+    if address is not None:
+        return not address or is_private_address(address)
+    return name == "localhost" or "." not in name or name.endswith(PRIVATE_SUFFIXES)
+
+
+def merge_http_headers(*parts: Mapping[str, str]) -> dict[str, str]:
+    """Headers from several sources, the later ones winning. Names are matched without regard to case, as HTTP does and
+    as yt-dlp does when it adds its own. A value has no spaces around it: --add-headers "Referer: https://..." leaves
+    the one after the colon in the value."""
+    merged: dict[str, str] = {}
+    for part in parts:
+        for name, value in part.items():
+            merged[name.title()] = str(value).strip()
+    return merged
 
 
 def is_youtube_host(host: str) -> bool:

@@ -26,12 +26,12 @@ from videocap.options import (
     build_read_options,
     build_ydl_options,
     entry_filter_reason,
-    merge_http_headers,
     network_options,
     options_from_spec,
     owner_referer,
 )
 from videocap.page_streams import PageStream
+from videocap.sites import merge_http_headers
 from videocap.settings import BUILTIN_PRESETS, DownloadSettings, JobSpec, job_spec_from_dict, settings_from_dict
 
 
