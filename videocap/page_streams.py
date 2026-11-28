@@ -136,7 +136,14 @@ class PageStream:
     """A candidate that a page's search hands out, with what the page says of its video. `page_url` is what the owner
     gave. `address` is what is tried. `referer` is the document that a browser would name as the Referer of the
     request for it: the one whose script gave a stream away, or the one that embeds a page; left "" for `page_url`
-    itself. `frame` is the embedded page, however deep, that this was found in or that this is; "" for the page."""
+    itself. `frame` is the embedded page, however deep, that this was found in or that this is; "" for the page.
+
+    `route` is how the search came to the document that `address` was found in: the address of each embedded page
+    on the way down from `page_url`, as the page above it gave it; empty for the page itself. The same way leads to
+    the address again when it has stopped being served: see StreamSearch.refreshed.
+
+    `pass_query` has a stream's playlists and fragments asked for with the query of `address`, as the players of
+    some sites ask, whose playlists list them without the token that the address has."""
 
     page_url: str
     address: str
@@ -145,6 +152,8 @@ class PageStream:
     referer: str = ""
     kind: str = STREAM
     frame: str = ""
+    route: tuple[str, ...] = ()
+    pass_query: bool = False
 
     def headers(self) -> dict[str, str]:
         """What a browser sends with every request for the address: the document that asked for it as the Referer,
@@ -183,6 +192,13 @@ class PageStream:
         if not self.frame:
             return PAGE_STREAM_FOUND_BUT_FAILED
         return (FRAME_FOUND_BUT_FAILED if self.kind == FRAME else FRAMED_STREAM_FOUND_BUT_FAILED).format(frame=host_of(self.frame))
+
+
+def same_place(address: str, other: str) -> bool:
+    """Whether two addresses are of one thing on one site, whatever each has after its "?": a stream's address that
+    was given out again differs from the one before by its token alone."""
+    one, two = urlsplit(address), urlsplit(other)
+    return (one.scheme, one.netloc.lower(), one.path) == (two.scheme, two.netloc.lower(), two.path)
 
 
 def holds_no_video(url: str, errors: Iterable[str]) -> bool:
@@ -554,9 +570,11 @@ class StreamSearch:
         document that is inside itself, as a page of the owner's own network is, may point where it likes."""
         return self.inside(address) and not self.inside(document_url)
 
-    def read(self, url: str, document_url: str = "") -> Optional[Reading]:
+    def read(self, url: str, document_url: str = "", again: bool = False) -> Optional[Reading]:
         """The page of the search itself, or with `document_url` a page which that document embeds, asked for as a
-        browser asks for an embedded page. None when it gives no text, or when a redirect took the reading inside."""
+        browser asks for an embedded page. None when it gives no text, or when a redirect took the reading inside.
+        A page read `again`, for an address that stopped being served, is not counted against the search's time:
+        that was for finding the video, and the download that this keeps going has its own limits."""
         headers = PageStream(document_url, url, kind=FRAME).headers() if document_url else None
         began = time.monotonic()
 
@@ -568,8 +586,8 @@ class StreamSearch:
                 self.out_of_time = True
             return self.out_of_time
 
-        reading = read_page(self.ydl_opts, url, self.other_sites, headers, stopped)
-        self.reading_seconds += time.monotonic() - began
+        reading = read_page(self.ydl_opts, url, self.other_sites, headers, self.should_stop if again else stopped)
+        self.reading_seconds += 0 if again else time.monotonic() - began
         if reading.challenged and reading.as_browser:
             self.checks.append(Failure(humanize_human_check("", url, host_of(url) if document_url else ""), url))
         if not reading.text or self.leads_inside(reading.url, document_url or self.url):
@@ -606,8 +624,9 @@ class StreamSearch:
         if not addresses:
             yield from self.frames(page.text, self.url, IFRAME_DEPTH)
 
-    def frames(self, text: str, document_url: str, depth: int) -> Iterator[PageStream]:
-        """The candidates that the <iframe>s of one document lead to, `depth` deep."""
+    def frames(self, text: str, document_url: str, depth: int, route: tuple[str, ...] = ()) -> Iterator[PageStream]:
+        """The candidates that the <iframe>s of one document lead to, `depth` deep. `route` is the way to that
+        document from the page."""
         followed = 0
         for frame_url in ranked_iframes(text, document_url):
             if followed == IFRAME_TRIES or not self.may_hand():
@@ -620,17 +639,50 @@ class StreamSearch:
                 # YouTube's own, to be asked exactly as a link to it is: none of its text is read here.
                 yield self.handing(PageStream(self.url, frame_url, kind=PLAIN, frame=frame_url))
                 continue
-            yield self.handing(PageStream(self.url, frame_url, self.title, self.thumbnail, document_url, FRAME, frame_url))
+            yield self.handing(PageStream(self.url, frame_url, self.title, self.thumbnail, document_url, FRAME, frame_url, route))
             framed = self.read_frame(frame_url, document_url)
             if framed is None:
                 continue
+            down = (*route, frame_url)
             found = [address for address in find_addresses_in_iframe(framed.text, framed.url) if not self.leads_inside(address, framed.url)]
             for address in found[:STREAM_TRIES]:
                 if not self.may_hand():
                     return
-                yield self.handing(PageStream(self.url, address, self.title, self.thumbnail, framed.url, STREAM, framed.url))
+                yield self.handing(PageStream(self.url, address, self.title, self.thumbnail, framed.url, STREAM, framed.url, down))
             if depth > 1:
-                yield from self.frames(framed.text, framed.url, depth - 1)
+                yield from self.frames(framed.text, framed.url, depth - 1, down)
+
+    def refreshed(self, stream: PageStream) -> Optional[PageStream]:
+        """The same candidate with the address that the page gives it now, for one whose address stopped being served:
+        a site may sign a stream's address for a short while only, and its own player then asks for a new one. The
+        way that led to the candidate is gone again, each document read afresh, and what is at the same place as
+        before, whatever comes after its "?", is the candidate. None when the way no longer leads to it, when the job
+        was stopped, and for a link tried as one pasted by itself, which has no page behind it."""
+        if stream.kind == PLAIN or self.should_stop():
+            return None
+        page = self.read(self.url, again=True)
+        if page is None:
+            return None
+        # The page's own text is resolved against the address the owner gave, as when it was first searched.
+        text, document_url = page.text, self.url
+        for expected in stream.route:
+            frame_url = next((address for address in ranked_iframes(text, document_url) if same_place(address, expected)), "")
+            if not frame_url or self.leads_inside(frame_url, document_url):
+                return None
+            framed = self.read(frame_url, document_url, again=True)
+            if framed is None:
+                return None
+            text, document_url = framed.text, framed.url
+        if stream.kind == FRAME:
+            found = ranked_iframes(text, document_url)
+        else:
+            found = find_addresses_in_iframe(text, document_url) if stream.route else find_stream_addresses(text, document_url)
+        fresh = next((address for address in found if same_place(address, stream.address) and not self.leads_inside(address, document_url)), "")
+        if not fresh:
+            return None
+        if stream.kind == FRAME:
+            return replace(stream, address=fresh, frame=fresh, referer=document_url)
+        return replace(stream, address=fresh, frame=document_url, referer=document_url) if stream.route else replace(stream, address=fresh)
 
     def failed(self, stream: PageStream, error: str, verify_url: str = "", result: Any = None) -> None:
         """Told of each candidate that did not work, with what its run said."""

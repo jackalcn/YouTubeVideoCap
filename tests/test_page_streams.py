@@ -65,6 +65,7 @@ from videocap.page_streams import (
     page_title,
     ranked_iframes,
     read_page,
+    same_place,
     unpacked_scripts,
 )
 from videocap.page_streams import resolved_addresses as real_resolved_addresses  # Before conftest's stand-in takes its place.
@@ -495,6 +496,120 @@ def test_a_page_that_a_redirect_took_into_this_network_is_not_read(monkeypatch: 
     search, _ = searching(monkeypatch, pages, moved={FRAMED: "https://deep.example/player/9"})
     last = all_failing(search)[-1]
     assert (last.address, last.frame, last.headers()) == ("https://deep.example/hls/index.m3u8", "https://deep.example/player/9", {"Referer": "https://deep.example/player/9"})
+
+
+# Finding again a stream whose address stopped being served
+
+
+@pytest.mark.parametrize(
+    ("other", "same"),
+    [
+        ("https://cdn.example/id/real.m3u8?token=two&expires=9", True),
+        ("https://CDN.example/id/real.m3u8", True),
+        ("https://cdn.example/id/real.m3u8#later", True),
+        ("https://cdn.example/id/other.m3u8?token=one", False),
+        ("https://other.example/id/real.m3u8?token=one", False),
+        ("http://cdn.example/id/real.m3u8?token=one", False),
+    ],
+)
+def test_two_addresses_are_of_one_thing_whatever_comes_after_the_question_mark(other: str, same: bool) -> None:
+    assert same_place(f"{STREAM_ADDRESS}?token=one", other) is same
+
+
+def test_a_candidate_remembers_the_way_that_led_to_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    search, _ = searching(monkeypatch, {PAGE: iframes(f'src="{FRAMED}"'), FRAMED: iframes(f'src="{DEEP}"'), DEEP: PLAYER_TEXT})
+    outer, inner, stream = all_failing(search)
+    # Each embedded page on the way down, as the page above it gave it; none for what the page itself gave.
+    assert (outer.route, inner.route, stream.route) == ((), (FRAMED,), (FRAMED, DEEP))
+    search, _ = searching(monkeypatch, {PAGE: f"<script>{pack(player_script(STREAM_ADDRESS))}</script>"})
+    assert all_failing(search)[0].route == ()
+
+
+def test_a_stream_whose_address_ran_out_is_found_again_where_it_was_with_what_the_page_gives_it_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    first, second = f"{FRAMED}?payload=1", f"{FRAMED}?payload=2"
+    pages = {PAGE: "<title>Seen</title>" + iframes(f'src="{first}"'), first: f"<script>var source='{STREAM_ADDRESS}?token=one';</script>"}
+    search, asked = searching(monkeypatch, pages)
+    stream = all_failing(search)[-1]
+    assert stream.address == f"{STREAM_ADDRESS}?token=one"
+    # By now the page embeds its player by another address, and the player names the stream with another token.
+    pages.clear()
+    pages[PAGE] = iframes('src="https://ads.example/embed/9" allowfullscreen', f'src="{second}"')
+    pages[second] = f"<script>var other='https://cdn.example/id/else.m3u8?token=x';var source='{STREAM_ADDRESS}?token=two';</script>"
+    del asked[:]
+    fresh = search.refreshed(replace(stream, pass_query=True))
+    assert fresh is not None and fresh.address == f"{STREAM_ADDRESS}?token=two"
+    # The same candidate otherwise: of the same page, named as before, asked for as the player's own page would ask.
+    assert (fresh.kind, fresh.page_url, fresh.title, fresh.pass_query, fresh.route) == (STREAM, PAGE, "Seen", True, stream.route)
+    assert (fresh.frame, fresh.referer) == (second, second) and fresh.headers() == {"Referer": "https://frame.example/", "Origin": "https://frame.example"}
+    # Only the way to it is read again: the page and the page on the way, and none other of the page's iframes.
+    assert asked == [PAGE, second]
+
+
+def test_a_page_whose_own_script_named_the_stream_is_asked_for_it_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages = {PAGE: f"<script>{pack(player_script(STREAM_ADDRESS + '?token=one'))}</script>"}
+    search, _ = searching(monkeypatch, pages)
+    (stream,) = all_failing(search)
+    pages[PAGE] = f"<script>{pack(player_script(STREAM_ADDRESS + '?token=two'))}</script>"
+    assert search.refreshed(stream) == replace(stream, address=f"{STREAM_ADDRESS}?token=two")
+
+
+def test_an_embedded_page_that_ytdlp_read_is_found_again_by_its_place_in_the_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages = {PAGE: iframes(f'src="{FRAMED}?payload=1"')}
+    search, _ = searching(monkeypatch, pages)
+    (frame,) = all_failing(search)
+    pages[PAGE] = iframes(f'src="{FRAMED}?payload=2"')
+    fresh = search.refreshed(frame)
+    assert fresh is not None and (fresh.kind, fresh.address, fresh.frame, fresh.referer) == (FRAME, f"{FRAMED}?payload=2", f"{FRAMED}?payload=2", PAGE)
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        {},
+        {PAGE: "<p>nothing embedded</p>"},
+        {PAGE: iframes(f'src="{FRAMED}"')},
+        {PAGE: iframes(f'src="{FRAMED}"'), FRAMED: "<p>no player</p>"},
+        {PAGE: iframes(f'src="{FRAMED}"'), FRAMED: "<script>var source='https://cdn.example/id/other.m3u8';</script>"},
+    ],
+    ids=["the page cannot be read", "the page embeds nothing", "the embedded page cannot be read", "it names no stream", "it names another stream"],
+)
+def test_a_stream_that_the_page_no_longer_leads_to_is_not_found_again(monkeypatch: pytest.MonkeyPatch, now: dict[str, str]) -> None:
+    pages = {PAGE: iframes(f'src="{FRAMED}"'), FRAMED: PLAYER_TEXT}
+    search, _ = searching(monkeypatch, pages)
+    stream = all_failing(search)[-1]
+    pages.clear()
+    pages.update(now)
+    assert search.refreshed(stream) is None
+
+
+def test_a_way_that_a_redirect_now_takes_into_this_network_is_not_gone_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    moved: dict[str, str] = {}
+    search, _ = searching(monkeypatch, {PAGE: iframes(f'src="{FRAMED}"'), FRAMED: PLAYER_TEXT}, moved=moved)
+    stream = all_failing(search)[-1]
+    assert search.refreshed(stream) == stream
+    moved[FRAMED] = "http://192.168.1.5/player"
+    assert search.refreshed(stream) is None
+
+
+def test_a_link_tried_by_itself_and_a_stopped_job_have_nothing_found_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    stop: list[bool] = []
+    pages = {PAGE: iframes('src="https://www.youtube.com/embed/abcdefghijk"', f'src="{FRAMED}"'), FRAMED: PLAYER_TEXT}
+    search, asked = searching(monkeypatch, pages, should_stop=lambda: bool(stop))
+    plain, _, stream = all_failing(search)
+    del asked[:]
+    assert search.refreshed(plain) is None and asked == []
+    stop.append(True)
+    assert search.refreshed(stream) is None and asked == []
+
+
+def test_finding_a_stream_again_is_not_counted_against_the_time_of_the_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    search, asked = searching(monkeypatch, {PAGE: iframes(f'src="{FRAMED}"'), FRAMED: PLAYER_TEXT})
+    stream = all_failing(search)[-1]
+    spent = search.reading_seconds
+    # A download that this keeps going lasts far longer than a search may.
+    monkeypatch.setattr(page_streams, "SEARCH_TOTAL_SECONDS", 0)
+    monkeypatch.setattr(page_streams, "SEARCH_SECONDS", 0)
+    assert search.refreshed(stream) == stream and search.reading_seconds == spent and asked[-2:] == [PAGE, FRAMED]
 
 
 # How long a search may take, and stopping it

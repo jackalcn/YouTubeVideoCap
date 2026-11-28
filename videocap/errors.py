@@ -41,6 +41,12 @@ UNREADABLE_LINK = "unreadable_link"
 # videocap.downloader.FragmentsKeepFailing, which quote the last failure.
 FRAGMENTS_FAILED = "fragments_failed"
 FRAGMENTS_FAILED_MARKER = "Gave up on the stream's fragments"
+# A download that a site began to refuse the fragments of after it had let some through, in the words of
+# videocap.downloader.StreamAddressExpired: the stream's address was good for a while only. For a stream that a
+# page's search found, the page is asked for the address again (see videocap.downloader.download_candidate), and
+# this is told only when that could not go on.
+STREAM_EXPIRED = "stream_expired"
+STREAM_EXPIRED_MARKER = "The stream's address stopped being served"
 # A site that lets only a browser in. What the person can do about it depends on who they are and on what is
 # installed, so the caller of humanize_ytdlp_error says it.
 IMPERSONATION = "impersonation"
@@ -144,6 +150,12 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
         "請稍後再試；一直失敗時，可以在側邊欄換一個「YouTube 用戶端」。",
         f"{{site}}的串流片段連續 {FRAGMENT_FAILURES_LIMIT} 段下載失敗，已停止這部影片，其餘的片段沒有再試。"
         "常見原因是串流網址已經失效、網站只讓自己的播放器讀取片段，或網站限制了同時連線的數量（同一部影片請只開一個下載工作）。",
+    ),
+    Hint(
+        STREAM_EXPIRED,
+        (STREAM_EXPIRED_MARKER.lower(),),
+        "YouTube 的串流網址在下載途中失效了，後面的片段被拒絕。請重新下載一次。",
+        "{site}的串流網址在下載途中失效了：前面的片段下載得到，後面的被拒絕。這類網址只在一小段時間內有效。",
     ),
     # Before the 403 below: Cloudflare's check is an HTTP 403 too. YouTube's subtitles ask for impersonation without
     # needing it, and their warning is no failure, so this is for other sites only.
@@ -482,7 +494,7 @@ def humanize_human_check(message: str, url: str = "", host: str = "") -> str:
 
 
 # The failures that a site's refusal of a request can be behind, which a word on the owner's Referer may help with.
-REFUSAL_KINDS = (HTTP_403, STREAM_REFUSED, HUMAN_CHECK, FRAGMENTS_FAILED)
+REFUSAL_KINDS = (HTTP_403, STREAM_REFUSED, HUMAN_CHECK, FRAGMENTS_FAILED, STREAM_EXPIRED)
 
 
 # What a person is told whose Referer is the address of a stream or a file: no page's player sends that, and a site that

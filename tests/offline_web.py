@@ -13,7 +13,7 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Callable, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -47,6 +47,11 @@ CLEARANCE_COOKIE = "cf_clearance"
 # Anything in a folder of this name opens only to a request that names a page of one chosen site as its Referer, as
 # the stream of a page whose player checks that does, and anything else gets a bare HTTP 403. See refer_only_from.
 REFERRED_FOLDER = "/referred/"
+# Anything in a folder of this name is served only to a request whose address has, after its "?", a token that the
+# site handed out and that is not used up, and anything else gets a bare HTTP 403: as a stream whose address a site
+# signs for a short while. See add_token_page.
+TOKEN_FOLDER = "/tokened/"
+TOKEN_PARAMETER = "token"
 CHECK_PAGE = b"<!doctype html><html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>"
 # The letters and digits a packer writes its codes with, which a test writes them with by its own hand.
 PACKER_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -87,6 +92,7 @@ class SiteHandler(http.server.SimpleHTTPRequestHandler):
         unreferred = REFERRED_FOLDER in self.path and not self.site.accepts_referer(self.headers.get("Referer", ""))
         unverified = VERIFIED_FOLDER in self.path and not self.site.accepts_clearance(self.headers.get("Cookie", ""), self.headers.get("User-Agent", ""))
         moved_to = self.site.moved.get(self.path.split("?")[0])
+        token_page = self.site.token_pages.get(self.path.split("?")[0])
         if moved_to:
             self.send_response(302, "Found")
             self.send_header("Location", moved_to)
@@ -94,12 +100,26 @@ class SiteHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
         elif self.path.startswith(REFUSED_PREFIX) or (self.path.startswith(BROWSERS_ONLY_PREFIX) and not as_browser) or unreferred:
             self.send_error(403, "Forbidden")
+        elif token_page is not None:
+            self.send_page(self.site.next_text(self.path.split("?")[0]).replace("{token}", self.site.hand_out_token()))
+        elif TOKEN_FOLDER in self.path and not self.site.accepts_token(self.path):
+            self.send_error(403, "Forbidden")
         elif self.path.startswith(PERSON_ONLY_PREFIX) or unverified or (self.path.startswith(CHECKED_PREFIX) and not as_browser) or (
             self.path.startswith(FLAKY_PREFIX) and self.site.turns_away_first(self.path)
         ):
             self.send_check()
         else:
             serve()
+
+    def send_page(self, text: str) -> None:
+        """A page that is no file of the site's folder, made for this one request."""
+        body = text.encode("utf-8")
+        self.send_response(200, "OK")
+        self.send_header("Content-Type", "text/html; charset=UTF-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def send_check(self) -> None:
         """Cloudflare's answer to what it takes for a bot: HTTP 403, this header, and a page that checks the browser."""
@@ -138,6 +158,12 @@ class LocalSite:
         self.asked_once: set[str] = set()
         # The paths that answer with a redirect, each to its new address.
         self.moved: dict[str, str] = {}
+        # The pages made anew at each asking, each with the texts it gives in turn and how often it was asked for;
+        # how many fragments each token handed out is good for, in turn; and what is left of each.
+        self.token_pages: dict[str, tuple[str, ...]] = {}
+        self.token_page_askings: dict[str, int] = {}
+        self.token_uses: tuple[int, ...] = (0,)
+        self.tokens: dict[str, int] = {}
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(SiteHandler, site=self))
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -194,6 +220,50 @@ class LocalSite:
     def add_framing_page(self, name: str, *iframes: str, title: str = "Local page") -> str:
         """A page of nothing but <iframe>s, each given as the attributes of its tag, in this order."""
         return self.write_page(name, title, "".join(f"<iframe {attributes}></iframe>" for attributes in iframes))
+
+    def add_token_page(self, name: str, *texts: str, uses: tuple[int, ...] = (1,)) -> str:
+        """A page made anew each time it is asked for, with a new token wherever its text says {token}. Given
+        several texts, each asking gets the next, and the last from then on. Each token is good for as many fragments
+        (.ts) of what is in a folder named `tokened` as `uses` says, the first token for the first number and the
+        last number from then on; a playlist there is served for as long as its token has a fragment left."""
+        self.token_pages[f"/{name.lstrip('/')}"] = texts
+        self.token_uses = uses
+        return self.url(name)
+
+    def next_text(self, path: str) -> str:
+        asked = self.token_page_askings.get(path, 0)
+        self.token_page_askings[path] = asked + 1
+        texts = self.token_pages[path]
+        return texts[min(asked, len(texts) - 1)]
+
+    def hand_out_token(self) -> str:
+        token = f"t{len(self.tokens) + 1}"
+        self.tokens[token] = self.token_uses[min(len(self.tokens), len(self.token_uses) - 1)]
+        return token
+
+    def accepts_token(self, path: str) -> bool:
+        """Whether a request has a token that still serves. A fragment uses one of the token's uses up."""
+        parts = urlsplit(path)
+        token = parse_qs(parts.query).get(TOKEN_PARAMETER, [""])[0]
+        left = self.tokens.get(token, 0)
+        if left <= 0:
+            return False
+        if parts.path.endswith(".ts"):
+            self.tokens[token] = left - 1
+        return True
+
+    def add_long_stream(self, folder: str = "hls", fragments: int = 6) -> str:
+        """An HLS stream of this many fragments of a second each: a clip's own stream has too few to stop between."""
+        if not has_ffmpeg:
+            pytest.skip("ffmpeg is not installed")
+        target = self.root / folder
+        target.mkdir(parents=True, exist_ok=True)
+        sources = ["-f", "lavfi", "-i", "testsrc=size=160x120:rate=10", "-f", "lavfi", "-i", "sine=frequency=440", "-t", str(fragments)]
+        # A picture to cut at each second, or the whole stream would be one fragment.
+        codecs = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", "-keyint_min", "10", "-sc_threshold", "0", "-c:a", "aac"]
+        output = ["-f", "hls", "-hls_time", "1", "-hls_playlist_type", "vod", str(target / "index.m3u8")]
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *sources, *codecs, *output], check=True)
+        return self.url(f"{folder}/index.m3u8")
 
     def add_redirect(self, name: str, target: str) -> str:
         """An address that sends whoever asks for it on to another."""

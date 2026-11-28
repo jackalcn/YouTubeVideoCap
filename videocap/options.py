@@ -402,6 +402,9 @@ def build_base_options(
         # Under the owner's own headers, which build_ydl_options and build_read_options put over these. Never to
         # YouTube, which is asked as it is for a link pasted by itself.
         base_opts["http_headers"] = page_stream.headers()
+        if page_stream.pass_query:
+            # yt-dlp's own switches for it, each with no value: the query of the address itself is what is passed on.
+            add_extractor_args(base_opts, {"generic": {"variant_query": [""], "fragment_query": [""]}})
     return base_opts
 
 
