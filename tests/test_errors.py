@@ -6,6 +6,7 @@ from videocap.errors import (
     HUMAN_CHECK,
     IMPERSONATION,
     REFERER_IS_A_STREAM,
+    STREAM_REFUSED,
     add_referer_advice,
     cut_at_a_sentence,
     failure_hint,
@@ -454,6 +455,58 @@ def test_a_refusal_from_another_site_says_it_may_want_the_page_it_came_from() ->
     assert "Referer" not in youtube and "referer" not in youtube
 
 
+PAGE_LINK = "https://site.example/watch/1"
+LISTED_STREAM = "https://cdn.example/1a2b/playlist.m3u8"
+# What yt-dlp says when the stream that a page lists is refused: of a "webpage", under the page's name.
+PAGE_403 = "ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)"
+
+
+def test_a_refused_stream_is_not_told_as_the_pages_refusal() -> None:
+    told = humanize_ytdlp_error(PAGE_403, PAGE_LINK, refused=[LISTED_STREAM])
+    assert told.startswith("網頁讀得到，但這個網站拒絕了從網頁找到的串流或影片檔（HTTP 403）")
+    # The server that refused, what yt-dlp's "webpage" means here, and then yt-dlp's own words.
+    assert "被拒絕的主機：cdn.example。" in told and "webpage 指的是這個串流網址" in told
+    assert told.endswith(f"（原始訊息：{PAGE_403.removeprefix('ERROR: ')}）")
+    # A kind of its own, still known when it is read again in the app's own words.
+    assert failure_kind(told) == STREAM_REFUSED and told.startswith(str(failure_hint(told)))
+    # A message that says nothing of a webpage gets no word on that.
+    fetched = humanize_ytdlp_error("ERROR: unable to download video data: HTTP Error 403: Forbidden", PAGE_LINK, refused=[LISTED_STREAM])
+    assert failure_kind(fetched) == STREAM_REFUSED and "webpage 指的是" not in fetched
+    # A site with a name of its own is named.
+    named = humanize_ytdlp_error(
+        "ERROR: [vimeo] 76979871: Unable to download m3u8 information: HTTP Error 403: Forbidden", "https://vimeo.com/76979871", refused=[LISTED_STREAM]
+    )
+    assert named.startswith("網頁讀得到，但 Vimeo 拒絕了從網頁找到的串流") and failure_kind(named) == STREAM_REFUSED
+
+
+@pytest.mark.parametrize(
+    ("url", "refused"),
+    [
+        # Nothing is known of what was refused, as for a message read without its run.
+        (PAGE_LINK, []),
+        # The page itself, alone or besides its stream.
+        (PAGE_LINK, [PAGE_LINK]),
+        (PAGE_LINK, [PAGE_LINK, LISTED_STREAM]),
+        # Something else the page asks for, which is no stream.
+        (PAGE_LINK, ["https://site.example/api/video/1"]),
+        # A link that names a stream itself: what it lists is no page's.
+        (LISTED_STREAM, [LISTED_STREAM]),
+        (LISTED_STREAM, ["https://cdn.example/1a2b/720p/video.m3u8"]),
+    ],
+)
+def test_any_other_refusal_is_told_as_it_was(url: str, refused: list[str]) -> None:
+    assert humanize_ytdlp_error(PAGE_403, url, refused=refused) == humanize_ytdlp_error(PAGE_403, url)
+
+
+def test_what_was_refused_changes_no_other_failure_and_nothing_of_youtubes() -> None:
+    for message, url in (
+        ("ERROR: [generic] 1: Unable to download webpage: HTTP Error 404: Not Found", PAGE_LINK),
+        ("ERROR: [youtube] jNQXAC9IVRw: Unable to download webpage: HTTP Error 403: Forbidden", PAGE_LINK),
+        ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "https://youtu.be/jNQXAC9IVRw"),
+    ):
+        assert humanize_ytdlp_error(message, url, refused=[LISTED_STREAM]) == humanize_ytdlp_error(message, url)
+
+
 STREAM_AS_REFERER = "https://cdn.example/abc/playlist.m3u8"
 
 
@@ -461,7 +514,8 @@ def test_a_refusal_says_so_when_the_owners_referer_is_the_address_of_a_stream() 
     advice = REFERER_IS_A_STREAM.format(site="cdn.example")
     plain = humanize_ytdlp_error("ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden", "https://site.example/watch/1")
     check = humanize_human_check("ERROR: [generic] 1: Unable to download webpage: HTTP Error 403: Forbidden", "https://site.example/watch/1")
-    for refusal in (plain, check):
+    stream = humanize_ytdlp_error(PAGE_403, PAGE_LINK, refused=[LISTED_STREAM])
+    for refusal in (plain, check, stream):
         told = add_referer_advice(refusal, STREAM_AS_REFERER)
         # What was said stays first, and is still the same kind of failure.
         assert told.startswith(refusal) and told.endswith(advice) and failure_kind(told) == failure_kind(refusal)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 import json
 import math
 import os
@@ -14,6 +15,7 @@ from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol, TypedDict, cast
+from urllib.parse import urlsplit
 
 import yt_dlp
 import yt_dlp.downloader.external as ytdlp_external
@@ -37,6 +39,7 @@ from videocap.config import (
     COLLISION_ID_FIELD,
     COLLISION_ID_TEMPLATE,
     EXPIRED_LOGIN_MESSAGE,
+    FRAGMENT_FAILURES_LIMIT,
     JOB_LOG_LINES,
     LIVE_CHAT_TRACK,
     LIVE_WAIT_MAX_SECONDS,
@@ -45,14 +48,21 @@ from videocap.config import (
     SPONSORBLOCK_CATEGORIES,
     SPONSORBLOCK_CHAPTER_PREFIX,
     SPONSORBLOCK_UNPREFIXED_CATEGORIES,
+    STREAM_REFRESHES,
 )
 from videocap.errors import (
+    FRAGMENTS_FAILED_MARKER,
     JS_RUNTIME_HINT,
+    STREAM_EXPIRED,
+    STREAM_EXPIRED_MARKER,
+    STREAM_REFUSED,
     add_referer_advice,
     explain_missing_js_runtime,
     extract_failed_video_id,
+    failure_kind,
     humanize_human_check,
     humanize_ytdlp_error,
+    is_network_loss,
     warns_of_missing_js_runtime,
 )
 from videocap.live import RecordingResult, record_live_stream, remove_if_empty, remove_quietly
@@ -66,11 +76,12 @@ from videocap.options import (
     entry_filter_reason,
     expected_final_extension,
     fallback_player_clients,
+    options_for_candidate,
     owner_referer,
     waits_for_live,
     writes_thumbnail,
 )
-from videocap.page_streams import PageStream, find_streams, holds_no_video
+from videocap.page_streams import STREAM, PageStream, StreamSearch, holds_no_video
 from videocap.processes import end_process_tree, remove_when_released, tie_to_app, tied_popen_options
 from videocap.sidecars import release_time, set_file_times, write_comments_csv, write_live_chat_csv, write_music_tags, write_nfo
 from videocap.sites import MEDIA_SNIFF_BYTES, URL_NAMED_EXTRACTORS, host_of, is_youtube_url, media_extension_from_bytes, url_keyed_id
@@ -186,6 +197,16 @@ UPCOMING_MARKERS = ("will begin in", "premieres in")
 # yt-dlp's wait_for_video logs these; the countdown comes once a second when progress lines are on.
 WAIT_LOG_PREFIX = "[wait]"
 WAIT_COUNTDOWN_PREFIX = "[wait] Remaining time"
+# yt-dlp's downloaders start their lines with this, also each failed try at a fragment and each fragment given up on,
+# which call none of a run's progress hooks: a stream whose every fragment is refused reaches the app through these alone.
+DOWNLOAD_LOG_PREFIX = "[download]"
+# What a stop is noticed at: between waiting for a stream, and between the steps of a download, never inside one of
+# the steps that come after it, which would strand their files.
+STOPPABLE_LOG_PREFIXES = (WAIT_LOG_PREFIX, DOWNLOAD_LOG_PREFIX)
+GOT_ERROR_RE = re.compile(r"^\[download\] Got error: (?P<error>.+?)(?:\. Retrying\b|\. Giving up\b|$)", re.S)
+SKIPPED_FRAGMENT_RE = re.compile(r"^\[download\].*\bSkipping fragment \d+")
+# How a site answers for an address that it serves no more: its token ran out, or was taken back.
+EXPIRED_ANSWER_RE = re.compile(r"\bHTTP Error (?:401|403|410)\b")
 # yt-dlp's YouTube extractor says this whenever 優先使用繁體中文標題與說明 is on, which the person asked for.
 HARMLESS_WARNING_RE = re.compile(r'Preferring "[^"]*" translated fields\.')
 # What a link to another site runs without, said once per job. SponsorBlock looks segments up by YouTube's video IDs,
@@ -240,6 +261,14 @@ class DownloadOutcome(TypedDict):
     archived_skips: int
     partial_paths: list[str]
     stopped: bool
+    # With an error that is a site's check for a person: the address that answered with it, where the check is to be
+    # passed. "" when there is none, and missing from an outcome restored from a job saved before it was kept.
+    verify_url: str
+    # How much of the media came in during the run that this is the outcome of, and how often a site answered that run
+    # HTTP 403: nothing in and a refusal is a run refused from the start, whatever yt-dlp's words for it, which for
+    # a stream whose every fragment was refused are that the downloaded file is empty.
+    received_bytes: int
+    forbidden: int
 
 
 class StatusUI(Protocol):
@@ -254,6 +283,33 @@ class JobStopped(DownloadCancelled):
     """Raised inside yt-dlp's callbacks. yt-dlp re-raises DownloadCancelled even with ignoreerrors, so this ends the job."""
 
     msg = "任務已停止"
+
+
+class FragmentsKeepFailing(yt_dlp.utils.DownloadError):
+    """Raised from the log as yt-dlp gives up on yet another fragment of a stream, once FRAGMENT_FAILURES_LIMIT of them
+    failed in a row: yt-dlp would go on to try each of the rest the same way, for as long as the stream is. With
+    ignoreerrors yt-dlp reports it as the failure of that video alone, as it reports any error of a download. With
+    --concurrent-fragments, yt-dlp still asks once more for each fragment it had queued before it lets this through.
+
+    Fragments that failed because the connection was lost are told in the words of that failure, so the queue tries the
+    job again as it does any download whose connection was lost, from the last fragment that came."""
+
+    def __init__(self, count: int, last_failure: str) -> None:
+        failure = last_failure or "fragment not found"
+        if is_network_loss(failure):
+            super().__init__(f"{failure} ({count} fragments in a row)")
+        else:
+            super().__init__(f"{FRAGMENTS_FAILED_MARKER}: {count} in a row could not be downloaded ({failure}), and the rest were not tried")
+
+
+class StreamAddressExpired(yt_dlp.utils.DownloadError):
+    """Raised from the log at the first fragment that a site refuses after it let others of the same run through, for
+    a stream that a page led to: its address was good for a while only, and the page has another by now. Nothing is
+    tried again or skipped first, so the file holds every fragment up to this one, and the download goes on from here
+    with the new address (see download_candidate)."""
+
+    def __init__(self, failure: str) -> None:
+        super().__init__(f"{STREAM_EXPIRED_MARKER}: {failure}")
 
 
 class LoginPacer:
@@ -404,25 +460,67 @@ class YtDlpLogCollector:
         self.on_debug = on_debug
         # Set when the app already reported a failure that yt-dlp is about to report again in its own words.
         self.drop_next_error = False
-        # Set while waiting for a stream to start, which reaches the app only through these log lines.
+        # The job's word to stop. A run's progress hooks see it only while data comes in, and a stream that is waited
+        # for, or whose fragments keep failing, sends none: those reach the app only through these log lines.
         self.should_stop: Optional[Callable[[], bool]] = None
         # yt-dlp names the video in extraction errors only; a failed download or step of the video being
         # downloaded says nothing of which video it was. Each error's video, or "" when unknown.
         self.current_video = ""
         self.error_videos: list[str] = []
+        # The fragments given up on since the last data came in, and yt-dlp's words for the last failed try.
+        self.fragments_failed = 0
+        self.last_failure = ""
+        # How much of the media yt-dlp said it had when it first said, and has by now: what came in during this run
+        # is the difference, since a download that goes on from an earlier one starts with what that one left.
+        self.bytes_at_first: Optional[int] = None
+        self.bytes_by_now = 0
+        # Set for a stream that a page led to, whose address the page gives anew: a refusal after data came in is
+        # then the address having run out, and ends the run at once. See StreamAddressExpired.
+        self.address_may_expire = False
+        # Set when a download was ended from here, in the middle of a fragment's turn: see release_what_was_cut_short.
+        self.cut_short = False
+
+    @property
+    def bytes_received(self) -> int:
+        return self.bytes_by_now - (self.bytes_at_first or 0)
 
     def debug(self, message: str) -> None:
-        if message.startswith(WAIT_LOG_PREFIX):
-            if self.should_stop and self.should_stop():
-                raise JobStopped()
-            if message.startswith(WAIT_COUNTDOWN_PREFIX):
-                # Once a second for hours would push everything else out of the job's log.
-                return
+        if message.startswith(STOPPABLE_LOG_PREFIXES) and self.should_stop and self.should_stop():
+            self.cut_short = True
+            raise JobStopped()
+        if message.startswith(WAIT_COUNTDOWN_PREFIX):
+            # Once a second for hours would push everything else out of the job's log.
+            return
+        got_error = GOT_ERROR_RE.match(message)
+        if got_error:
+            self.last_failure = got_error.group("error").strip()
+            if self.address_may_expire and self.bytes_received > 0 and EXPIRED_ANSWER_RE.search(self.last_failure):
+                self.lines.append(message)
+                if self.on_debug:
+                    self.on_debug(message)
+                self.cut_short = True
+                raise StreamAddressExpired(self.last_failure)
+        if SKIPPED_FRAGMENT_RE.match(message):
+            self.fragments_failed += 1
+            if self.fragments_failed >= FRAGMENT_FAILURES_LIMIT:
+                self.lines.append(message)
+                if self.on_debug:
+                    self.on_debug(message)
+                self.cut_short = True
+                raise FragmentsKeepFailing(self.fragments_failed, self.last_failure)
         self.lines.append(message)
         if ARCHIVE_SKIP_MARKER in message:
             self.archived_skips += 1
         if self.on_debug:
             self.on_debug(message)
+
+    def data_arrived(self, downloaded: int = 0) -> None:
+        """Data came in for the download, so the fragments that failed before were not all of them. `downloaded` is
+        how much of the media yt-dlp says it has, with what an earlier run left."""
+        self.fragments_failed = 0
+        if self.bytes_at_first is None:
+            self.bytes_at_first = downloaded
+        self.bytes_by_now = max(self.bytes_by_now, downloaded)
 
     def info(self, message: str) -> None:
         self.lines.append(message)
@@ -617,8 +715,12 @@ class UrlKeyedIdPP(PostProcessor):
 
 
 class PageStreamPP(PostProcessor):
-    """Gives a stream that a page's packed player script gave away what the page says of it: its address, its title and
-    its picture. yt-dlp saw a playlist called "playlist" and nothing more.
+    """Gives what a page's search led to (see videocap.page_streams) what the page says of it: its address, its title
+    and its picture. yt-dlp saw a playlist called "playlist", or an embedded page called "player", and nothing more.
+
+    Only what yt-dlp names after a file or a page is given the page's name. A video that a site's own extractor read,
+    as when the page embeds a player of YouTube or of another site yt-dlp knows, has that site's title, picture and
+    ID, and keeps them, as it would for a link to it.
 
     Runs at pre_process before UrlKeyedIdPP, which then keys the ID on the page, and before yt-dlp names a file."""
 
@@ -628,7 +730,7 @@ class PageStreamPP(PostProcessor):
 
     def run(self, information: Any) -> tuple[list[str], Any]:
         # A list's flat entries pass through here too, before they are videos.
-        if not information.get("id"):
+        if not information.get("id") or str(information.get("extractor_key") or "").lower() not in URL_NAMED_EXTRACTORS:
             return [], information
         information["webpage_url"] = information["original_url"] = self.page.page_url
         if self.page.title:
@@ -1065,6 +1167,15 @@ def writing_no_cookies(base: Any) -> Any:
     return NoCookiesWrittenYoutubeDL
 
 
+def release_what_was_cut_short() -> None:
+    """Lets go of the file of a download that was ended in the middle. yt-dlp closes a stream's unfinished file only
+    when the download ends its own way; one ended by an error raised into it is left open, held by objects that hold
+    each other, until Python happens to clear those away. On Windows a file that is open cannot be renamed or
+    removed, so a download that goes on in the same file, as after an address ran out, would fail at its last step,
+    and a stopped job's leftovers would stay."""
+    gc.collect()
+
+
 def estimate_size(info: Mapping[str, Any]) -> Optional[float]:
     """yt-dlp gives a clip the size of the whole video, which would refuse a short clip of a long one."""
     size = info.get("filesize") or info.get("filesize_approx")
@@ -1201,6 +1312,16 @@ def refusal_in(messages: list[str], warnings: list[str]) -> str:
     return next((text for text in [*messages, *warnings] if FORBIDDEN_MARKER in text.lower()), messages[0] if messages else "")
 
 
+def tell_of_human_check(message: str, url: str, options: DownloadOptions, refusals: impersonation.Refusals) -> tuple[str, str]:
+    """What a person is told of a site's check for a person, in yt-dlp's words for the refusal, and the address that
+    answered with the check, which is where it is to be passed. The site is named outright when it is not plainly
+    the one of the link the person gave: when the check was met at another site than the link's, as a stream's may
+    be, or by a run for something a page led to."""
+    met_at = refusals.challenged_at or url
+    elsewhere = bool(options.page_stream) or host_of(met_at) != host_of(url)
+    return humanize_human_check(message, url, host_of(met_at) if elsewhere else ""), met_at
+
+
 def refused_as_a_program(
     url: str, options: DownloadOptions, outcome: DownloadOutcome, failures: list[tuple[str, str]], refusals: impersonation.Refusals
 ) -> bool:
@@ -1209,6 +1330,9 @@ def refused_as_a_program(
     owner's link to another site is tried that way, once. A stopped job is meant to stop, and a list that was partly
     saved is not read all over again."""
     if options.impersonate or outcome["stopped"] or outcome["items"] or not failures:
+        return False
+    if any(STREAM_EXPIRED_MARKER in message for message, _ in failures):
+        # Let through until its address ran out, which no way of connecting brings back.
         return False
     return impersonation.offered_to(url, options.other_sites) and refusals.forbidden > 0
 
@@ -1231,7 +1355,9 @@ def download_as_a_browser(
     outcome, failures = download_once(url, replace(options, impersonate=True), progress_ui, status_ui, should_stop, on_log, refusals)
     if failures and refusals.challenged and not outcome["items"]:
         # yt-dlp calls it one more HTTP 403. The site's own answer said it wants a person, which no retry gets past.
-        outcome["errors"] = [humanize_human_check(refusal_in([message for message, _ in failures], outcome["warnings"]), url)]
+        message = refusal_in([message for message, _ in failures], outcome["warnings"])
+        told, outcome["verify_url"] = tell_of_human_check(message, url, options, refusals)
+        outcome["errors"] = [told]
     for key in ("skipped", "warnings", "notes", "partial_paths"):
         outcome[key] = [*first[key], *(entry for entry in outcome[key] if entry not in first[key])]  # type: ignore[literal-required]
     if outcome["items"]:
@@ -1241,17 +1367,118 @@ def download_as_a_browser(
     return outcome
 
 
-PAGE_STREAM_MESSAGE = "這個網頁沒有直接列出影片，改讀它的播放器腳本，找到串流網址再下載。"
+PAGE_STREAM_MESSAGE = "這個網頁沒有直接列出影片，改找它的播放器腳本和內嵌網頁。"
+PAGE_STREAM_TRY_MESSAGE = "這個網頁（{page}）沒有直接列出影片，改試{candidate}。"
 PAGE_STREAM_NOTE = "這個網頁沒有直接列出影片：串流網址取自它的播放器腳本（{host}），下載時以這個網頁當來源網頁（Referer）。"
+# For what was found in a page that the page embeds, or is one, with PageStream.source for where.
+EMBEDDED_STREAM_NOTE = "這個網頁沒有直接列出影片：{source}，下載時以那個內嵌網頁當來源網頁（Referer）。串流在 {host}。"
+EMBEDDED_NOTE = "這個網頁沒有直接列出影片：{source}。"
+
+
+def page_stream_note(candidate: PageStream) -> str:
+    """The note of a download that came by a page's search: where the video was found."""
+    if candidate.kind != STREAM:
+        return EMBEDDED_NOTE.format(source=candidate.source())
+    if candidate.frame:
+        return EMBEDDED_STREAM_NOTE.format(source=candidate.source(), host=host_of(candidate.address))
+    return PAGE_STREAM_NOTE.format(host=host_of(candidate.address))
+
+
+# A stream whose address ran out while it was downloaded, and was asked of its page again.
+STREAM_REFRESH_MESSAGE = "串流網址失效，已重新取得（第 {count} 次），接著下載。"
+STREAM_REFRESHED_NOTE = "串流網址在下載途中失效了 {count} 次，App 每次都回網頁重新取得，再接著下載。"
+STREAM_LOST = "App 回網頁重新讀取時，找不到同一個串流，無法接著下載。已下載的部分還在，稍後按「重試」會接著抓。"
+STREAM_REFRESH_LIMIT = "已重新取得 {count} 次，達到上限。已下載的部分還在，按「重試」會接著抓。"
+STREAM_REFRESH_IN_VAIN = "串流網址失效過 {count} 次；最後一次重新取得之後，沒有再收到任何資料。"
+# A stream whose playlists and fragments are served only with the token of its own address.
+QUERY_PASSED_MESSAGE = "串流被拒絕，改成把串流網址的參數也帶到播放清單和片段上，再試一次。"
+QUERY_PASSED_NOTE = "這個串流的播放清單和片段要帶著串流網址的參數才拿得到，App 已自動帶上。"
+
+
+def first_error(outcome: DownloadOutcome) -> str:
+    return outcome["errors"][0] if outcome["errors"] else ""
+
+
+def download_candidate(
+    search: StreamSearch,
+    candidate: PageStream,
+    options: DownloadOptions,
+    progress_ui: ProgressUI,
+    status_ui: Optional[StatusUI] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> tuple[DownloadOutcome, PageStream]:
+    """One candidate of a page's search, downloaded for as long as it can be kept going. Also returns the candidate
+    as it was last asked for.
+
+    A stream that is refused before anything of it came, and whose address has a query, is tried once more with that
+    query passed on to its playlists and fragments: some sites list those without the token that the address has, and
+    their own players add it. Not from the start, since a playlist whose entries are signed each for itself would
+    lose those signatures to it.
+
+    A stream whose address runs out while it is downloaded (see StreamAddressExpired) is asked of its page again, and
+    the download goes on in the same file from the fragment where it stopped, as often as that brings more of the
+    video, up to STREAM_REFRESHES times."""
+
+    def announce(message: str) -> None:
+        # The status of a job is also a line of its log.
+        if status_ui:
+            status_ui.info(message)
+        elif on_log:
+            on_log(message)
+
+    def download(stream: PageStream) -> DownloadOutcome:
+        outcome = download_with_ytdlp(stream.address, options_for_candidate(options, stream), progress_ui, status_ui, should_stop, on_log)
+        partial_paths.extend(path for path in outcome["partial_paths"] if path not in partial_paths)
+        return outcome
+
+    partial_paths: list[str] = []
+    result = download(candidate)
+    refused = not result["items"] and not result["stopped"] and not result["received_bytes"] and result["forbidden"] > 0
+    if refused and candidate.kind == STREAM and urlsplit(candidate.address).query and not (should_stop and should_stop()):
+        announce(QUERY_PASSED_MESSAGE)
+        with_query = replace(candidate, pass_query=True)
+        again = download(with_query)
+        if again["items"] or again["stopped"] or again["received_bytes"]:
+            candidate, result = with_query, again
+            result["notes"].insert(0, QUERY_PASSED_NOTE)
+
+    refreshes = 0
+    reason = ""
+    while failure_kind(first_error(result)) == STREAM_EXPIRED and not result["items"] and not result["stopped"]:
+        if refreshes == STREAM_REFRESHES:
+            reason = STREAM_REFRESH_LIMIT.format(count=refreshes)
+            break
+        fresh = search.refreshed(candidate)
+        if fresh is None:
+            if should_stop and should_stop():
+                result["stopped"] = True
+            else:
+                reason = STREAM_LOST
+            break
+        refreshes += 1
+        announce(STREAM_REFRESH_MESSAGE.format(count=refreshes))
+        notes = [note for note in result["notes"] if note == QUERY_PASSED_NOTE]
+        candidate, result = fresh, download(fresh)
+        result["notes"] = [*notes, *(note for note in result["notes"] if note not in notes)]
+    if reason:
+        result["errors"] = [f"{first_error(result)}\n\n{reason}", *result["errors"][1:]]
+    elif refreshes and result["items"]:
+        result["notes"].insert(0, STREAM_REFRESHED_NOTE.format(count=refreshes))
+    elif refreshes and not result["stopped"]:
+        result["notes"].insert(0, STREAM_REFRESH_IN_VAIN.format(count=refreshes))
+    result["partial_paths"] = partial_paths
+    return result, candidate
 
 
 def page_without_a_video(url: str, options: DownloadOptions, outcome: DownloadOutcome) -> bool:
-    """Whether the owner's link to an ordinary page came back with nothing, and with yt-dlp's word that it saw no video
-    in it as the only failure: the one that a look at the page's own scripts can mend. A stream that was found this way
-    is not searched for again."""
+    """Whether the owner's link to an ordinary page came back with nothing, as yt-dlp's word that it saw no video in
+    it, or with its own pick among what it saw refused (see videocap.errors.STREAM_REFUSED): either way, a look at the
+    page's own scripts and iframes may know a better one. A stream that was found this way is not searched for again."""
     if not options.other_sites or options.page_stream or outcome["items"] or outcome["stopped"]:
         return False
-    return holds_no_video(url, outcome["errors"])
+    errors = outcome["errors"]
+    return holds_no_video(url, errors) or any(failure_kind(error) == STREAM_REFUSED for error in errors)
 
 
 def download_stream_in_page(
@@ -1263,24 +1490,37 @@ def download_stream_in_page(
     should_stop: Optional[Callable[[], bool]] = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> DownloadOutcome:
-    """A page that holds no video yt-dlp can see, but whose player script keeps a stream's address packed (see
-    videocap.page_streams): that stream is downloaded in the page's name, asked for as the page's player would ask for
-    it. The outcome stands as it is when the page gives no stream away. Once the stream is found, its outcome replaces
-    the page's, which only said that the page held no video."""
+    """A page that holds no video yt-dlp can see, or whose own pick among what it saw was refused: what a search of the
+    page leads to instead (see videocap.page_streams.StreamSearch) is downloaded, each candidate tried in turn until
+    one works. Its outcome then replaces the page's own, with a note of where the video was found. When none works,
+    the outcome is the one that the search's word is about, or the page's own when nothing better was found."""
     if not page_without_a_video(url, options, outcome) or (should_stop and should_stop()):
         return outcome
-    streams = find_streams(build_read_options(options, impersonation.Silent()), url, options.other_sites)
-    if not streams:
-        return outcome
-    if on_log:
-        on_log(PAGE_STREAM_MESSAGE)
-    progress_ui.progress(0.0, text=PAGE_STREAM_MESSAGE)
-    result = outcome
-    for stream in streams:
-        result = download_with_ytdlp(stream.address, replace(options, page_stream=stream), progress_ui, status_ui, should_stop, on_log)
+    search = StreamSearch(build_read_options(options, impersonation.Silent()), url, options.other_sites, should_stop)
+    partial_paths: list[str] = []
+    for candidate in search.candidates():
+        if not search.tried:
+            progress_ui.progress(0.0, text=PAGE_STREAM_MESSAGE)
+        if on_log:
+            on_log(PAGE_STREAM_TRY_MESSAGE.format(page=url, candidate=candidate.name()))
+        result, candidate = download_candidate(search, candidate, options, progress_ui, status_ui, should_stop, on_log)
+        partial_paths.extend(path for path in result["partial_paths"] if path not in partial_paths)
         if result["items"] or result["stopped"]:
-            break
-    result["notes"].insert(0, PAGE_STREAM_NOTE.format(host=host_of(stream.address)))
+            result["notes"].insert(0, page_stream_note(candidate))
+            result["partial_paths"] = partial_paths
+            return result
+        search.failed(candidate, result["errors"][0] if result["errors"] else "", result.get("verify_url", ""), result)
+    if should_stop and should_stop():
+        outcome["stopped"] = True
+        return outcome
+    failure = search.failure(outcome["errors"][0] if outcome["errors"] else "")
+    result = outcome
+    if failure.tried:
+        result = cast(DownloadOutcome, failure.tried.result)
+        result["notes"].insert(0, page_stream_note(failure.tried.stream))
+    result["errors"] = [failure.error, *result["errors"][1:]]
+    result["verify_url"] = failure.verify_url
+    result["partial_paths"] = [*result["partial_paths"], *(path for path in partial_paths if path not in result["partial_paths"])]
     return result
 
 
@@ -1371,7 +1611,7 @@ def download_once(
     refusals: Optional[impersonation.Refusals] = None,
 ) -> tuple[DownloadOutcome, list[tuple[str, str]]]:
     """One yt-dlp run. Also returns yt-dlp's own error messages with their videos, in the order of the outcome's
-    translated ones. `refusals` is where a run that can pass for a browser notes what the site refused it with."""
+    translated ones. `refusals` is where a run for another site's link notes what the site refused it with."""
     options, notes = without_youtube_only_options(options, url)
     options.output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_available, _ = get_ffmpeg_status()
@@ -1392,6 +1632,22 @@ def download_once(
     def stop_if_requested() -> None:
         if should_stop and should_stop():
             raise JobStopped()
+
+    def waiting_for_a_retry(delay_for: Any) -> Callable[..., float]:
+        """yt-dlp's pause before it tries a request or a fragment again, waited out here a step at a time, so that a
+        stop is seen during it: yt-dlp's own sleep cannot be interrupted. yt-dlp is then told to wait no more."""
+
+        def wait(n: int = 0) -> float:
+            delay = delay_for(n=n) if callable(delay_for) else delay_for
+            deadline = time.monotonic() + max(float(delay or 0), 0.0)
+            while True:
+                stop_if_requested()
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return 0.0
+                time.sleep(min(WAIT_STEP_SECONDS, left))
+
+        return wait
 
     # Each started video's own link by its ID, so a failed one can be tried again by itself, from any site.
     started_videos: dict[str, str] = {}
@@ -1509,6 +1765,9 @@ def download_once(
 
     def progress_hook(data: dict[str, Any]) -> None:
         nonlocal job_bytes
+        if data.get("status") == "downloading":
+            # yt-dlp calls this as data comes in, which a fragment that failed never does.
+            logger.data_arrived(int(data.get("downloaded_bytes") or 0))
         if logged_in:
             LOGIN_PACER.mark()
         # Recorded before checking for a stop, so the file this call is about gets cleaned up too.
@@ -1545,6 +1804,12 @@ def download_once(
     ydl_opts["match_filter"] = filter_entry
     ydl_opts["progress_hooks"] = [progress_hook]
     ydl_opts["postprocessor_hooks"] = [postprocessor_hook]
+    # Also the owner's own, from --retry-sleep, which build_ydl_options has put in by now.
+    sleeps = ydl_opts.get("retry_sleep_functions") or {}
+    ydl_opts["retry_sleep_functions"] = {kind: waiting_for_a_retry(delay_for) for kind, delay_for in sleeps.items()}
+    # Between the steps of a download, and between failed fragments, which send no progress for the hooks to see a stop.
+    logger.should_stop = should_stop
+    logger.address_may_expire = bool(options.page_stream and options.other_sites)
     def finished_video(path: str) -> None:
         check_final_file(path)
         # What fails after this, such as reading the rest of a list, is not this video's failure.
@@ -1553,7 +1818,6 @@ def download_once(
     ydl_opts["post_hooks"] = [finished_video]
     if wait_live:
         ydl_opts["wait_for_video"] = LIVE_WAIT_RETRY_SECONDS
-        logger.should_stop = should_stop
 
     has_media = options.media_type != "none"
     collector = CollectDownloadedItemsPP(items, keep_thumbnails=options.write_thumbnail, has_media=has_media)
@@ -1613,6 +1877,8 @@ def download_once(
             expired_wait = exc.msg
 
     stopped = stopped or watchdog.stopped
+    if logger.cut_short or stopped:
+        release_what_was_cut_short()
     # The same message for two videos is two failures.
     failures = list(dict.fromkeys(watchdog.failures()))
     if expired_wait:
@@ -1634,7 +1900,8 @@ def download_once(
         finish_item_sidecars(item, options, notes)
 
     browser_advice = impersonation.advice(options.other_sites) if errors else ""
-    humanized = [humanize_ytdlp_error(message, url, browser_advice) for message in errors]
+    refused = refusals.addresses if refusals else []
+    humanized = [humanize_ytdlp_error(message, url, browser_advice, refused) for message in errors]
     if wanted_wait and not wait_live and any(marker in message.lower() for message in errors for marker in UPCOMING_MARKERS):
         notes.append(LIVE_WAIT_NEEDS_FFMPEG_NOTE)
     if any(WHOLE_VIDEO_CUT_MARKER in warning for warning in logger.warnings):
@@ -1655,6 +1922,9 @@ def download_once(
         "archived_skips": logger.archived_skips,
         "partial_paths": partial_paths,
         "stopped": stopped,
+        "verify_url": "",
+        "received_bytes": logger.bytes_received,
+        "forbidden": refusals.forbidden if refusals else 0,
     }
     return outcome, failures
 
@@ -1865,6 +2135,9 @@ def empty_outcome() -> DownloadOutcome:
         "archived_skips": 0,
         "partial_paths": [],
         "stopped": False,
+        "verify_url": "",
+        "received_bytes": 0,
+        "forbidden": 0,
     }
 
 

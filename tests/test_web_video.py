@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -12,6 +13,7 @@ from conftest import needs_ffmpeg
 from offline_web import LocalSite, new_site_fixture, web_media_fixture  # noqa: F401
 from offline_youtube import duration_of, probe
 from videocap.downloader import UrlKeyedIdPP, run_download
+from videocap.errors import STREAM_REFUSED, failure_kind, referer_advice
 from videocap.inspector import inspect_link
 from videocap.options import AccessLimits, DownloadOptions, options_from_spec
 from videocap.settings import DownloadSettings, JobSpec
@@ -335,8 +337,63 @@ def test_a_refusal_while_fetching_the_file_is_the_sites_too(new_site: NewSite, t
     url = site.add_page("watch.html", ("forbidden/clip.mp4",))
     (error,) = download(url, tmp_path)["errors"]
     assert "[" not in error.partition("（原始訊息：")[2][:1]
-    assert error.startswith("這個網站拒絕了下載請求（HTTP 403）")
+    # Said of the file, since the page came through, and of the server that refused it.
+    assert failure_kind(error) == STREAM_REFUSED and error.startswith("網頁讀得到，但這個網站拒絕了")
+    assert "被拒絕的主機：127.0.0.1。" in error
     assert "YouTube" not in error.partition("（原始訊息：")[0]
+
+
+def test_a_stream_that_a_page_lists_and_refuses_is_not_told_as_the_pages_refusal(new_site: NewSite, tmp_path: Path) -> None:
+    page_site, stream_site = new_site(), new_site()
+    url = page_site.add_listing_page("watch.html", stream_site.add_playlist("forbidden/index.m3u8"))
+    for error in (inspect(url, tmp_path)["error"], *download(url, tmp_path)["errors"]):
+        assert failure_kind(error) == STREAM_REFUSED and error.startswith("網頁讀得到，但這個網站拒絕了")
+        # yt-dlp's own words speak of a webpage under the page's name, though the page came through.
+        assert "[generic] watch: Unable to download webpage" in error and "webpage 指的是這個串流網址" in error
+    # Once for the inspection and once for the download: the page was never what was refused.
+    assert stream_site.asked_for("forbidden/index.m3u8") == 2
+    # Each of those also opens the page once more, looking for a better stream in its own scripts or an iframe of its
+    # own; this page has neither, so nothing else is asked for.
+    assert page_site.asked_for("watch.html") == 4
+
+
+def test_a_decoy_the_page_lists_is_not_the_end_of_it_when_its_iframe_has_the_real_stream(new_site: NewSite, tmp_path: Path) -> None:
+    page_site, stream_site = new_site(), new_site()
+    stream_site.refer_only_from(page_site)
+    decoy = stream_site.add_playlist("forbidden/decoy.m3u8")
+    real = stream_site.add_stream("referred/hls")
+    page_site.add_embedded_player("player.html", real)
+    # What search engines are told of the video (schema.org), as add_listing_page writes it, next to the iframe that
+    # actually holds the player: yt-dlp's own generic extractor only ever reads the former.
+    data = {"@context": "https://schema.org", "@type": "VideoObject", "name": "x", "contentUrl": decoy}
+    head = f'<script type="application/ld+json">{json.dumps(data)}</script>'
+    url = page_site.write_page("watch.html", "Real behind an iframe", '<iframe src="player.html"></iframe>', head)
+
+    assert inspect(url, tmp_path)["error"] == ""
+    outcome = download(url, tmp_path)
+    assert outcome["errors"] == []
+    saved = Path(outcome["items"][0]["path"])
+    assert saved.stem.startswith("Real behind an iframe") and duration_of(saved) == pytest.approx(2, abs=0.5)
+    # The decoy yt-dlp itself found was tried and refused; the iframe's own stream is what was actually fetched.
+    assert stream_site.asked_for("forbidden/decoy.m3u8") >= 1 and stream_site.segments("referred/hls")
+
+
+def test_a_refused_page_is_still_told_as_a_refused_page(new_site: NewSite, tmp_path: Path) -> None:
+    site = new_site()
+    url = site.add_listing_page("forbidden/watch.html", site.add_playlist("hls/index.m3u8"))
+    for error in (inspect(url, tmp_path)["error"], *download(url, tmp_path)["errors"]):
+        assert error.startswith("這個網站拒絕了下載請求（HTTP 403）")
+    assert site.asked_for("hls/index.m3u8") == 0
+
+
+def test_a_refused_stream_still_gets_the_word_on_a_referer_that_is_a_streams_address(new_site: NewSite, tmp_path: Path) -> None:
+    page_site, stream_site = new_site(), new_site()
+    url = page_site.add_listing_page("watch.html", stream_site.add_playlist("forbidden/index.m3u8"))
+    # One saved from another link, which the owner is to be told of at any refusal.
+    leftover = stream_site.url("old/playlist.m3u8")
+    extra = f"--referer {leftover}"
+    for error in (inspect(url, tmp_path, ytdlp_extra_args=extra)["error"], *download(url, tmp_path, ytdlp_extra_args=extra)["errors"]):
+        assert failure_kind(error) == STREAM_REFUSED and error.endswith(referer_advice(leftover))
 
 
 def test_a_missing_file_on_another_site_says_the_link_is_gone(new_site: NewSite, tmp_path: Path) -> None:

@@ -55,6 +55,16 @@ def no_passed_checks(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def no_name_lookups(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page's search looks up the names of the hosts the page leads to, to see whether one is of this machine's own
+    network (videocap.page_streams.StreamSearch.inside). No test asks a real resolver: every name resolves to nothing
+    unless a test says what it resolves to."""
+    import videocap.page_streams as page_streams
+
+    monkeypatch.setattr(page_streams, "resolved_addresses", lambda host: ())
+
+
+@pytest.fixture(autouse=True)
 def no_real_recycle_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests delete only their own temp files, which the library already removes for good; this keeps the real
     recycle bin out of it even when pytest's temp folder is moved somewhere else."""

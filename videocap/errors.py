@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import functools
 import re
-from typing import Iterable, NamedTuple, Optional
+from typing import Iterable, NamedTuple, Optional, Sequence
 
+from videocap.config import FRAGMENT_FAILURES_LIMIT
 from videocap.sites import SITE_NAMES, extractor_for, host_of, is_media_link, is_youtube_url, site_label
 
 
@@ -29,9 +30,23 @@ RATE_LIMIT = "rate_limit"
 HUMAN_CHECK = "human_check"
 # What yt-dlp says when a site refuses a request, in any of the ways below that are not a check for a person.
 HTTP_403 = "http_403"
+# An HTTP 403 for a stream or a media file that a link led to, while the link's own page was let through. yt-dlp words
+# it as any other, even calling the stream's address a "webpage" and naming the page beside it, so only the addresses
+# that the run was refused at can tell: see refused_past_the_link.
+STREAM_REFUSED = "stream_refused"
 # yt-dlp's word that it saw no video in a page, or could not read the link at all. The player of a page may still keep
 # its stream's address in a script yt-dlp does not read: see videocap.page_streams.
 UNREADABLE_LINK = "unreadable_link"
+# A download given up on because its stream's fragments kept failing, in the words of
+# videocap.downloader.FragmentsKeepFailing, which quote the last failure.
+FRAGMENTS_FAILED = "fragments_failed"
+FRAGMENTS_FAILED_MARKER = "Gave up on the stream's fragments"
+# A download that a site began to refuse the fragments of after it had let some through, in the words of
+# videocap.downloader.StreamAddressExpired: the stream's address was good for a while only. For a stream that a
+# page's search found, the page is asked for the address again (see videocap.downloader.download_candidate), and
+# this is told only when that could not go on.
+STREAM_EXPIRED = "stream_expired"
+STREAM_EXPIRED_MARKER = "The stream's address stopped being served"
 # A site that lets only a browser in. What the person can do about it depends on who they are and on what is
 # installed, so the caller of humanize_ytdlp_error says it.
 IMPERSONATION = "impersonation"
@@ -52,7 +67,9 @@ LEADING_TAG_RE = re.compile(r"\[([^\]]+)\]")
 YOUTUBE_PREFIX = "youtube"
 # The two messages that name no extractor, only the link nothing could read.
 UNREADABLE_LINK_RE = re.compile(r"(?:unsupported url: |found for url )(\S+)")
-# A site's name in a hint already given, which is short and holds no sentence's punctuation.
+# A site's name in a hint already given, which is short and holds no sentence's punctuation. A Latin name has a space
+# on either side of it, which counts.
+SITE_NAME_LENGTH = 38
 SITE_IN_HINT = r"[^，。：\n]{1,40}?"
 # Chinese characters, which a Latin name is set off from by spaces.
 CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -124,6 +141,22 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
     # yt-dlp's own lists of sites it refuses. Their words also say "will NOT be supported" and "DRM protected".
     Hint("drm_site", ("known to use drm protection",), "這個網站的影片都受 DRM 版權保護，無法下載。"),
     Hint("refused_site", ("primarily used for piracy", "this website is not supported"), "yt-dlp 不支援這個網站，所以無法下載。"),
+    # Before every hint of a refusal below: it quotes the last fragment's failure, an HTTP 403 or 429 among them, and
+    # would then be told as a refusal of the link itself.
+    Hint(
+        FRAGMENTS_FAILED,
+        (FRAGMENTS_FAILED_MARKER.lower(),),
+        f"YouTube 的串流片段連續 {FRAGMENT_FAILURES_LIMIT} 段下載失敗，已停止這部影片，其餘的片段沒有再試。"
+        "請稍後再試；一直失敗時，可以在側邊欄換一個「YouTube 用戶端」。",
+        f"{{site}}的串流片段連續 {FRAGMENT_FAILURES_LIMIT} 段下載失敗，已停止這部影片，其餘的片段沒有再試。"
+        "常見原因是串流網址已經失效、網站只讓自己的播放器讀取片段，或網站限制了同時連線的數量（同一部影片請只開一個下載工作）。",
+    ),
+    Hint(
+        STREAM_EXPIRED,
+        (STREAM_EXPIRED_MARKER.lower(),),
+        "YouTube 的串流網址在下載途中失效了，後面的片段被拒絕。請重新下載一次。",
+        "{site}的串流網址在下載途中失效了：前面的片段下載得到，後面的被拒絕。這類網址只在一小段時間內有效。",
+    ),
     # Before the 403 below: Cloudflare's check is an HTTP 403 too. YouTube's subtitles ask for impersonation without
     # needing it, and their warning is no failure, so this is for other sites only.
     Hint(
@@ -140,6 +173,14 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
         None,
         "{site}要求真人驗證（例如勾選「我不是機器人」），用模擬瀏覽器連線也過不了。App 不會代為通過驗證，不過你可以自己通過："
         "按這則訊息下方（或「系統」頁「網站驗證」）的按鈕開啟瀏覽器視窗，通過後再試一次。",
+    ),
+    # Found in no message either: humanize_ytdlp_error tells it from the 403 below by what the run was refused.
+    Hint(
+        STREAM_REFUSED,
+        (),
+        None,
+        "網頁讀得到，但{site}拒絕了從網頁找到的串流或影片檔（HTTP 403），被擋下的不是你貼的網頁。常見原因是網頁列出的串流網址已經失效或不完整，"
+        "或網站只讓自己的播放器讀取串流，這時填 Referer 不一定有用。如果這部影片要登入才能看，" + OTHER_SITE_LOGIN + " 後再試。",
     ),
     Hint(
         BOT_CHECK,
@@ -408,24 +449,52 @@ def cut_at_a_sentence(text: str, limit: int = QUOTE_LENGTH) -> str:
     return (words if len(words) >= limit // 3 else start).rstrip(",;:，；：") + "…"
 
 
-def humanize_ytdlp_error(message: str, url: str = "", browser_advice: str = "") -> str:
+def refused_past_the_link(url: str, refused: Sequence[str]) -> bool:
+    """Whether all that a run was refused (HTTP 403), at these addresses, were streams and media files that the link led
+    to, so its own page was let through. A page, an API or a picture among them, or a link that itself names a file,
+    leaves nothing to conclude."""
+    return bool(refused) and not is_media_link(url) and all(is_media_link(address) for address in refused)
+
+
+def stream_refusal(cleaned: str, site: str, address: str) -> str:
+    """What a person is told, ahead of yt-dlp's message, of a stream or a file refused at this address."""
+    hint = next(hint for hint in YTDLP_ERROR_HINTS if hint.kind == STREAM_REFUSED)
+    # yt-dlp may read such an address the way it reads a page, and then says "webpage" of it.
+    webpage = "原始訊息裡的 webpage 指的是這個串流網址。" if "download webpage" in cleaned.lower() else ""
+    return f"{hint.text_for(site)}被拒絕的主機：{host_of(address)}。{webpage}"
+
+
+def humanize_ytdlp_error(message: str, url: str = "", browser_advice: str = "", refused: Sequence[str] = ()) -> str:
     """yt-dlp's message with what to do about it in front. The link the message came from says which site it is
     about when the message itself does not. `browser_advice` is added for a site that lets only a browser in: what
-    this person can do about that, from videocap.impersonation.advice, and nothing for a visitor."""
+    this person can do about that, from videocap.impersonation.advice, and nothing for a visitor. `refused` is the
+    addresses the run was answered HTTP 403 at, which can tell a refused stream from a refused page."""
     cleaned = message.removeprefix("ERROR: ").strip()
     matched = matching_hint(cleaned, url)
     if not matched:
         return cleaned
     hint, text = matched
+    site = site_in_message(cleaned, url)
+    if hint.kind == HTTP_403 and site and refused_past_the_link(url, refused):
+        text = stream_refusal(cleaned, site, refused[0])
     return f"{text}{browser_advice if hint.kind == IMPERSONATION else ''}（原始訊息：{cut_at_a_sentence(cleaned)}）"
 
 
-def humanize_human_check(message: str, url: str = "") -> str:
+def humanize_human_check(message: str, url: str = "", host: str = "") -> str:
     """yt-dlp's message for a refusal that the caller knows to be a site's check for a person: the try that passed
-    for a browser was answered with it."""
+    for a browser was answered with it. `host` names the site outright, for a check met somewhere other than at the
+    link the person gave: at a stream of its page, or at a page that it embeds. The message may be empty, when the
+    check was met while the app itself read a page and yt-dlp said nothing."""
     cleaned = message.removeprefix("ERROR: ").strip()
     hint = next(hint for hint in YTDLP_ERROR_HINTS if hint.kind == HUMAN_CHECK)
-    return f"{hint.text_for(site_in_message(cleaned, url) or UNNAMED_SITE)}（原始訊息：{cut_at_a_sentence(cleaned)}）"
+    # A name longer than a hint may hold would no longer be told for this hint: see SITE_IN_HINT.
+    site = host if 0 < len(host) <= SITE_NAME_LENGTH else site_in_message(cleaned, url) or UNNAMED_SITE
+    text = str(hint.text_for(site))
+    return f"{text}（原始訊息：{cut_at_a_sentence(cleaned)}）" if cleaned else text
+
+
+# The failures that a site's refusal of a request can be behind, which a word on the owner's Referer may help with.
+REFUSAL_KINDS = (HTTP_403, STREAM_REFUSED, HUMAN_CHECK, FRAGMENTS_FAILED, STREAM_EXPIRED)
 
 
 # What a person is told whose Referer is the address of a stream or a file: no page's player sends that, and a site that
@@ -443,11 +512,33 @@ def referer_advice(referer: str) -> str:
 
 
 def add_referer_advice(message: str, referer: str) -> str:
-    """A site's refusal (HTTP 403, or its check for a person) with a word on the owner's Referer when that is the address
-    of a stream or a file, which may be why the site refused. Any other failure, and any other Referer, leaves it as it is."""
-    if not referer or not is_media_link(referer) or failure_kind(message) not in (HTTP_403, HUMAN_CHECK):
+    """A site's refusal (HTTP 403, of a page or of its stream, or its check for a person) with a word on the owner's Referer
+    when that is the address of a stream or a file, which may be why the site refused. Any other failure, and any other
+    Referer, leaves it as it is."""
+    if not referer or not is_media_link(referer) or failure_kind(message) not in REFUSAL_KINDS:
         return message
     advice = referer_advice(referer)
+    return message if advice in message else f"{message}\n\n{advice}"
+
+
+# What a person is told whose Referer took the place of the one a page's player, or a page it embeds, would have sent,
+# when the site then refused. The app's own hint for an HTTP 403 says to fill a Referer in, and the Referer that was
+# right for one link is sent with every other.
+REFERER_OVER_THE_PLAYERS = (
+    "「進階 yt-dlp 參數」的來源網頁（Referer：{owner}）蓋過了 App 照播放器算出來的來源（{computed}）。"
+    "這個網站可能只接受後者；如果這一行是之前照 HTTP 403 的提示填的，可以拿掉再試一次。"
+)
+
+
+def add_overridden_referer_advice(message: str, owner: str, computed: str) -> str:
+    """A site's refusal of what a page's search found, with a word on the owner's Referer when it was sent in place of
+    the one the app had worked out. A Referer that is the address of a stream has advice of its own: see
+    add_referer_advice."""
+    if not owner or not computed or owner == computed or is_media_link(owner):
+        return message
+    if failure_kind(message) not in REFUSAL_KINDS:
+        return message
+    advice = REFERER_OVER_THE_PLAYERS.format(owner=owner, computed=computed)
     return message if advice in message else f"{message}\n\n{advice}"
 
 
