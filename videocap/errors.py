@@ -4,6 +4,7 @@ import functools
 import re
 from typing import Iterable, NamedTuple, Optional, Sequence
 
+from videocap.config import FRAGMENT_FAILURES_LIMIT
 from videocap.sites import SITE_NAMES, extractor_for, host_of, is_media_link, is_youtube_url, site_label
 
 
@@ -36,6 +37,10 @@ STREAM_REFUSED = "stream_refused"
 # yt-dlp's word that it saw no video in a page, or could not read the link at all. The player of a page may still keep
 # its stream's address in a script yt-dlp does not read: see videocap.page_streams.
 UNREADABLE_LINK = "unreadable_link"
+# A download given up on because its stream's fragments kept failing, in the words of
+# videocap.downloader.FragmentsKeepFailing, which quote the last failure.
+FRAGMENTS_FAILED = "fragments_failed"
+FRAGMENTS_FAILED_MARKER = "Gave up on the stream's fragments"
 # A site that lets only a browser in. What the person can do about it depends on who they are and on what is
 # installed, so the caller of humanize_ytdlp_error says it.
 IMPERSONATION = "impersonation"
@@ -130,6 +135,16 @@ YTDLP_ERROR_HINTS: tuple[Hint, ...] = (
     # yt-dlp's own lists of sites it refuses. Their words also say "will NOT be supported" and "DRM protected".
     Hint("drm_site", ("known to use drm protection",), "這個網站的影片都受 DRM 版權保護，無法下載。"),
     Hint("refused_site", ("primarily used for piracy", "this website is not supported"), "yt-dlp 不支援這個網站，所以無法下載。"),
+    # Before every hint of a refusal below: it quotes the last fragment's failure, an HTTP 403 or 429 among them, and
+    # would then be told as a refusal of the link itself.
+    Hint(
+        FRAGMENTS_FAILED,
+        (FRAGMENTS_FAILED_MARKER.lower(),),
+        f"YouTube 的串流片段連續 {FRAGMENT_FAILURES_LIMIT} 段下載失敗，已停止這部影片，其餘的片段沒有再試。"
+        "請稍後再試；一直失敗時，可以在側邊欄換一個「YouTube 用戶端」。",
+        f"{{site}}的串流片段連續 {FRAGMENT_FAILURES_LIMIT} 段下載失敗，已停止這部影片，其餘的片段沒有再試。"
+        "常見原因是串流網址已經失效、網站只讓自己的播放器讀取片段，或網站限制了同時連線的數量（同一部影片請只開一個下載工作）。",
+    ),
     # Before the 403 below: Cloudflare's check is an HTTP 403 too. YouTube's subtitles ask for impersonation without
     # needing it, and their warning is no failure, so this is for other sites only.
     Hint(
@@ -466,6 +481,10 @@ def humanize_human_check(message: str, url: str = "", host: str = "") -> str:
     return f"{text}（原始訊息：{cut_at_a_sentence(cleaned)}）" if cleaned else text
 
 
+# The failures that a site's refusal of a request can be behind, which a word on the owner's Referer may help with.
+REFUSAL_KINDS = (HTTP_403, STREAM_REFUSED, HUMAN_CHECK, FRAGMENTS_FAILED)
+
+
 # What a person is told whose Referer is the address of a stream or a file: no page's player sends that, and a site that
 # checks where a request came from refuses it. The Referer is the owner's own, saved with the settings and sent with every
 # request of every link, so it may be a leftover from another link.
@@ -484,7 +503,7 @@ def add_referer_advice(message: str, referer: str) -> str:
     """A site's refusal (HTTP 403, of a page or of its stream, or its check for a person) with a word on the owner's Referer
     when that is the address of a stream or a file, which may be why the site refused. Any other failure, and any other
     Referer, leaves it as it is."""
-    if not referer or not is_media_link(referer) or failure_kind(message) not in (HTTP_403, STREAM_REFUSED, HUMAN_CHECK):
+    if not referer or not is_media_link(referer) or failure_kind(message) not in REFUSAL_KINDS:
         return message
     advice = referer_advice(referer)
     return message if advice in message else f"{message}\n\n{advice}"
@@ -505,7 +524,7 @@ def add_overridden_referer_advice(message: str, owner: str, computed: str) -> st
     add_referer_advice."""
     if not owner or not computed or owner == computed or is_media_link(owner):
         return message
-    if failure_kind(message) not in (HTTP_403, STREAM_REFUSED, HUMAN_CHECK):
+    if failure_kind(message) not in REFUSAL_KINDS:
         return message
     advice = REFERER_OVER_THE_PLAYERS.format(owner=owner, computed=computed)
     return message if advice in message else f"{message}\n\n{advice}"

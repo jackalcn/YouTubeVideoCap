@@ -189,6 +189,9 @@ CLOUD_ABANDON_AFTER_SECONDS = 5 * 60
 LOCAL_DEFAULT_CONCURRENT_JOBS = 2
 LOCAL_MAX_CONCURRENT_JOBS = 5
 JOB_LOG_LINES = 300
+# How many fragments of a stream may fail in a row before its download is given up. yt-dlp skips each that fails and
+# goes on to the next, so a stream whose every fragment is refused would otherwise run through thousands of them.
+FRAGMENT_FAILURES_LIMIT = 10
 # Per visitor, so one visitor's many jobs cannot push out, and delete, another visitor's results.
 MAX_FINISHED_JOBS_KEPT = 100
 LOCAL_MAX_INSPECT_LINKS = 100

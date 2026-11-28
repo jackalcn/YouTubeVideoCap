@@ -37,6 +37,7 @@ from videocap.config import (
     COLLISION_ID_FIELD,
     COLLISION_ID_TEMPLATE,
     EXPIRED_LOGIN_MESSAGE,
+    FRAGMENT_FAILURES_LIMIT,
     JOB_LOG_LINES,
     LIVE_CHAT_TRACK,
     LIVE_WAIT_MAX_SECONDS,
@@ -47,6 +48,7 @@ from videocap.config import (
     SPONSORBLOCK_UNPREFIXED_CATEGORIES,
 )
 from videocap.errors import (
+    FRAGMENTS_FAILED_MARKER,
     JS_RUNTIME_HINT,
     STREAM_REFUSED,
     add_referer_advice,
@@ -55,6 +57,7 @@ from videocap.errors import (
     failure_kind,
     humanize_human_check,
     humanize_ytdlp_error,
+    is_network_loss,
     warns_of_missing_js_runtime,
 )
 from videocap.live import RecordingResult, record_live_stream, remove_if_empty, remove_quietly
@@ -189,6 +192,14 @@ UPCOMING_MARKERS = ("will begin in", "premieres in")
 # yt-dlp's wait_for_video logs these; the countdown comes once a second when progress lines are on.
 WAIT_LOG_PREFIX = "[wait]"
 WAIT_COUNTDOWN_PREFIX = "[wait] Remaining time"
+# yt-dlp's downloaders start their lines with this, also each failed try at a fragment and each fragment given up on,
+# which call none of a run's progress hooks: a stream whose every fragment is refused reaches the app through these alone.
+DOWNLOAD_LOG_PREFIX = "[download]"
+# What a stop is noticed at: between waiting for a stream, and between the steps of a download, never inside one of
+# the steps that come after it, which would strand their files.
+STOPPABLE_LOG_PREFIXES = (WAIT_LOG_PREFIX, DOWNLOAD_LOG_PREFIX)
+GOT_ERROR_RE = re.compile(r"^\[download\] Got error: (?P<error>.+?)(?:\. Retrying\b|\. Giving up\b|$)", re.S)
+SKIPPED_FRAGMENT_RE = re.compile(r"^\[download\].*\bSkipping fragment \d+")
 # yt-dlp's YouTube extractor says this whenever 優先使用繁體中文標題與說明 is on, which the person asked for.
 HARMLESS_WARNING_RE = re.compile(r'Preferring "[^"]*" translated fields\.')
 # What a link to another site runs without, said once per job. SponsorBlock looks segments up by YouTube's video IDs,
@@ -260,6 +271,23 @@ class JobStopped(DownloadCancelled):
     """Raised inside yt-dlp's callbacks. yt-dlp re-raises DownloadCancelled even with ignoreerrors, so this ends the job."""
 
     msg = "任務已停止"
+
+
+class FragmentsKeepFailing(yt_dlp.utils.DownloadError):
+    """Raised from the log as yt-dlp gives up on yet another fragment of a stream, once FRAGMENT_FAILURES_LIMIT of them
+    failed in a row: yt-dlp would go on to try each of the rest the same way, for as long as the stream is. With
+    ignoreerrors yt-dlp reports it as the failure of that video alone, as it reports any error of a download. With
+    --concurrent-fragments, yt-dlp still asks once more for each fragment it had queued before it lets this through.
+
+    Fragments that failed because the connection was lost are told in the words of that failure, so the queue tries the
+    job again as it does any download whose connection was lost, from the last fragment that came."""
+
+    def __init__(self, count: int, last_failure: str) -> None:
+        failure = last_failure or "fragment not found"
+        if is_network_loss(failure):
+            super().__init__(f"{failure} ({count} fragments in a row)")
+        else:
+            super().__init__(f"{FRAGMENTS_FAILED_MARKER}: {count} in a row could not be downloaded ({failure}), and the rest were not tried")
 
 
 class LoginPacer:
@@ -410,25 +438,42 @@ class YtDlpLogCollector:
         self.on_debug = on_debug
         # Set when the app already reported a failure that yt-dlp is about to report again in its own words.
         self.drop_next_error = False
-        # Set while waiting for a stream to start, which reaches the app only through these log lines.
+        # The job's word to stop. A run's progress hooks see it only while data comes in, and a stream that is waited
+        # for, or whose fragments keep failing, sends none: those reach the app only through these log lines.
         self.should_stop: Optional[Callable[[], bool]] = None
         # yt-dlp names the video in extraction errors only; a failed download or step of the video being
         # downloaded says nothing of which video it was. Each error's video, or "" when unknown.
         self.current_video = ""
         self.error_videos: list[str] = []
+        # The fragments given up on since the last data came in, and yt-dlp's words for the last failed try.
+        self.fragments_failed = 0
+        self.last_failure = ""
 
     def debug(self, message: str) -> None:
-        if message.startswith(WAIT_LOG_PREFIX):
-            if self.should_stop and self.should_stop():
-                raise JobStopped()
-            if message.startswith(WAIT_COUNTDOWN_PREFIX):
-                # Once a second for hours would push everything else out of the job's log.
-                return
+        if message.startswith(STOPPABLE_LOG_PREFIXES) and self.should_stop and self.should_stop():
+            raise JobStopped()
+        if message.startswith(WAIT_COUNTDOWN_PREFIX):
+            # Once a second for hours would push everything else out of the job's log.
+            return
+        got_error = GOT_ERROR_RE.match(message)
+        if got_error:
+            self.last_failure = got_error.group("error").strip()
+        if SKIPPED_FRAGMENT_RE.match(message):
+            self.fragments_failed += 1
+            if self.fragments_failed >= FRAGMENT_FAILURES_LIMIT:
+                self.lines.append(message)
+                if self.on_debug:
+                    self.on_debug(message)
+                raise FragmentsKeepFailing(self.fragments_failed, self.last_failure)
         self.lines.append(message)
         if ARCHIVE_SKIP_MARKER in message:
             self.archived_skips += 1
         if self.on_debug:
             self.on_debug(message)
+
+    def data_arrived(self) -> None:
+        """Data came in for the download, so the fragments that failed before were not all of them."""
+        self.fragments_failed = 0
 
     def info(self, message: str) -> None:
         self.lines.append(message)
@@ -1442,6 +1487,22 @@ def download_once(
         if should_stop and should_stop():
             raise JobStopped()
 
+    def waiting_for_a_retry(delay_for: Any) -> Callable[..., float]:
+        """yt-dlp's pause before it tries a request or a fragment again, waited out here a step at a time, so that a
+        stop is seen during it: yt-dlp's own sleep cannot be interrupted. yt-dlp is then told to wait no more."""
+
+        def wait(n: int = 0) -> float:
+            delay = delay_for(n=n) if callable(delay_for) else delay_for
+            deadline = time.monotonic() + max(float(delay or 0), 0.0)
+            while True:
+                stop_if_requested()
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return 0.0
+                time.sleep(min(WAIT_STEP_SECONDS, left))
+
+        return wait
+
     # Each started video's own link by its ID, so a failed one can be tried again by itself, from any site.
     started_videos: dict[str, str] = {}
     lower_quality: list[str] = []
@@ -1558,6 +1619,9 @@ def download_once(
 
     def progress_hook(data: dict[str, Any]) -> None:
         nonlocal job_bytes
+        if data.get("status") == "downloading":
+            # yt-dlp calls this as data comes in, which a fragment that failed never does.
+            logger.data_arrived()
         if logged_in:
             LOGIN_PACER.mark()
         # Recorded before checking for a stop, so the file this call is about gets cleaned up too.
@@ -1594,6 +1658,11 @@ def download_once(
     ydl_opts["match_filter"] = filter_entry
     ydl_opts["progress_hooks"] = [progress_hook]
     ydl_opts["postprocessor_hooks"] = [postprocessor_hook]
+    # Also the owner's own, from --retry-sleep, which build_ydl_options has put in by now.
+    sleeps = ydl_opts.get("retry_sleep_functions") or {}
+    ydl_opts["retry_sleep_functions"] = {kind: waiting_for_a_retry(delay_for) for kind, delay_for in sleeps.items()}
+    # Between the steps of a download, and between failed fragments, which send no progress for the hooks to see a stop.
+    logger.should_stop = should_stop
     def finished_video(path: str) -> None:
         check_final_file(path)
         # What fails after this, such as reading the rest of a list, is not this video's failure.
@@ -1602,7 +1671,6 @@ def download_once(
     ydl_opts["post_hooks"] = [finished_video]
     if wait_live:
         ydl_opts["wait_for_video"] = LIVE_WAIT_RETRY_SECONDS
-        logger.should_stop = should_stop
 
     has_media = options.media_type != "none"
     collector = CollectDownloadedItemsPP(items, keep_thumbnails=options.write_thumbnail, has_media=has_media)
